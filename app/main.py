@@ -9,6 +9,8 @@ from groq import Groq
 # Core PocketMunim Imports
 from app.security.auth import authenticate_telegram_request
 from app.ai.schemas import AITransactionExtraction
+from app.ai.category_pull_service import CategoryPullService
+from app.cache.category_cache import CategoryCacheManager
 
 app = FastAPI()
 
@@ -24,6 +26,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and
 # Initialize Groq Client
 active_groq_key = GROQ_API_KEYS[0].strip() if GROQ_API_KEYS and GROQ_API_KEYS[0] else os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=active_groq_key) if active_groq_key else None
+
+# Initialize Phase 4 Category Services
+category_pull_service = CategoryPullService(groq_client)
 
 # =====================================================================
 # FOUNDER FROZEN SYSTEM PROMPT (STRICTLY UNMODIFIED)
@@ -282,7 +287,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 {"role": "user", "content": text}
             ]
 
-            # ARCHITECTURAL FIX: Forcing strict LLM determinism
             completion = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
@@ -290,7 +294,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 temperature=0.0
             )
 
-            # RULE 39: Strict Pydantic Validation mapped to your Frozen Schema
             raw_json = json.loads(completion.choices[0].message.content)
             validated_data = AITransactionExtraction(**raw_json)
 
@@ -300,22 +303,74 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             committed_items = []
 
             if supabase and transactions_list:
+                cache_manager = CategoryCacheManager(supabase, user_id)
+
                 for tx in transactions_list:
-                    # RULE 17.1: Deterministic Decimal safe calculations
                     amount = tx.amount if tx.amount else Decimal('0.00')
                     description = tx.item or tx.merchant or text
 
                     if amount > Decimal('0.00'):
-                        # ==========================================
-                        # FOUNDER RULE: STRICT CLARIFICATION
-                        # ==========================================
+
+                        # Future Transaction Interceptor
+                        if tx.future and tx.future.is_future:
+                            response_sections.append(
+                                f"🗓️ '{description}' identified as a future plan. Budget intelligence will activate in Phase 9.")
+                            continue
+
+                        # Clarification Rule
                         if not tx.intent or tx.needs_clarification:
                             clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
                             response_sections.append(clarification_msg)
-                            continue  # Skip database insertion entirely
+                            continue
 
-                        # If intent is understood, proceed to commit
-                        category = tx.category or "General"
+                        # =========================================================
+                        # PHASE 4: CATEGORY SOURCING & SOURCE AUDIT LOGGING
+                        # =========================================================
+                        category = tx.category
+                        search_item_name = tx.item or description
+                        source_origin = "AI Prompt Extracted"
+
+                        if not category:
+                            # Tier 1: Check In-Memory JSONB Cache
+                            cached_match = cache_manager.search_item(search_item_name)
+                            if cached_match and cached_match.get("category"):
+                                category = cached_match["category"]
+                                source_origin = "In-Memory JSONB Cache"
+                            else:
+                                # Tier 2: Check Relational Database (`categories` table)
+                                try:
+                                    db_res = supabase.table('categories').select('*').eq('user_id', user_id).ilike(
+                                        'name', search_item_name).execute()
+                                    if db_res.data:
+                                        category = db_res.data[0].get('category') or "General"
+                                        source_origin = "Relational Database Table"
+                                    else:
+                                        # Tier 3: AI Fallback (CategoryPullService)
+                                        ai_classified = category_pull_service.classify_item(search_item_name)
+                                        category = ai_classified.get("category") or "General"
+                                        source_origin = "AI Fallback (CategoryPullService)"
+
+                                        # Auto-persist newly discovered category to DB and rebuild cache
+                                        try:
+                                            new_cat_payload = {
+                                                "user_id": user_id,
+                                                "name": search_item_name,
+                                                "level": "ITEM",
+                                                "category": category
+                                            }
+                                            supabase.table('categories').insert(new_cat_payload).execute()
+                                            cache_manager.rebuild_cache()
+                                        except Exception:
+                                            pass  # Prevent insertion failure if already exists
+                                except Exception:
+                                    category = "General"
+                                    source_origin = "Default Fallback"
+
+                        # Log source to Vercel runtime console
+                        print(
+                            f"[CATEGORY SOURCE] Item: '{search_item_name}' | Resolved Category: '{category}' | Loaded From: {source_origin}")
+
+                        category = category or "General"
 
                         db_payload = {
                             "user_id": user_id,
@@ -332,7 +387,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             if committed_items:
                 response_sections.append("Committed to Ledger:\n" + "\n".join(committed_items))
 
-            # Optional: Catch non-transaction intents (loans, queries, etc.) based on new schema
             if validated_data.loan and validated_data.loan.intent:
                 response_sections.append(
                     f"Loan intent detected: {validated_data.loan.intent} for {validated_data.loan.lender}")
@@ -345,7 +399,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         except Exception as e:
             reply_text = f"Error processing intent through NLP engine: {str(e)}"
 
-    # Send Outbound Reply via Telegram Bot API (Fully Restored)
+    # Send Outbound Reply via Telegram Bot API
     if TELEGRAM_BOT_TOKEN:
         telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         async with httpx.AsyncClient() as client:
