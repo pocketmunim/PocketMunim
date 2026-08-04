@@ -7,30 +7,29 @@ class CategoryPullService:
     def __init__(self, ai_client: Groq, db_client=None, admin_db_client=None):
         self.ai = ai_client
         self.db = db_client
-        self.admin_db = admin_db_client or db_client # Falls back to standard client if admin not provided
+        self.admin_db = admin_db_client or db_client
 
     def seed_common_categories(self, user_id: str) -> None:
         """
-        Proactively fetches common day-to-day categories, subcategories,
-        and items from Groq when the system is idle.
-        Bypasses user auth/RLS using the admin service role client.
+        Proactively fetches common day-to-day life categories (Groceries, Medicines, etc.)
+        from Groq when the system is idle. Bypasses RLS using the admin client.
         """
         if not self.ai or not self.admin_db:
             return
 
-        seed_prompt = """You are the PocketMunim Enterprise Taxonomy Generator.
-Your sole responsibility is to generate a comprehensive JSON list of common, everyday personal finance categories, their specific subcategories, and typical day-to-day items.
+        seed_prompt = """You are the PocketMunim Day-to-Day Life Category Generator.
+Your sole responsibility is to generate a comprehensive JSON list of common, everyday life categories, their subcategories, and typical day-to-day items (e.g., Groceries, Medicines, Household Supplies, Dining, Transport, Utilities).
 
 RULES:
 1. Output ONLY valid JSON matching the exact schema below.
 2. Do not wrap in markdown code fences.
-3. Provide at least 15-20 common day-to-day items across various categories (e.g., Food & Dining, Transportation, Utilities, Shopping).
+3. Provide at least 15-20 common day-to-day items across practical daily categories.
 
 OUTPUT FORMAT:
 {
   "categories": [
-    {"category": "Food & Dining", "subcategory": "Groceries", "item": "Milk"},
-    {"category": "Food & Dining", "subcategory": "Groceries", "item": "Rice"}
+    {"category": "Groceries", "subcategory": "Vegetables", "item": "Tomato"},
+    {"category": "Medicines", "subcategory": "Pharmacy", "item": "Paracetamol"}
   ]
 }"""
 
@@ -39,7 +38,7 @@ OUTPUT FORMAT:
                 model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": seed_prompt},
-                    {"role": "user", "content": "Generate common day-to-day category seed list."}
+                    {"role": "user", "content": "Generate day-to-day life category seed list."}
                 ],
                 temperature=0.3
             )
@@ -65,21 +64,33 @@ OUTPUT FORMAT:
                             "level": "ITEM",
                             "category": cat
                         }
-                        # Bypasses RLS / User Auth check via Admin Client
                         self.admin_db.table('categories').insert(payload).execute()
                     except Exception:
-                        pass # Ignore duplicate inserts
+                        pass
         except Exception:
             pass
 
     def classify_item(self, item_name: str, user_id: str = None) -> dict:
+        """
+        Classifies an item into practical day-to-day categories (Groceries, Medicines, etc.)
+        """
         if not self.ai:
             return {"category": None, "subcategory": None, "item": item_name}
 
-        system_prompt = f"""You are the PocketMunim Category Classification Engine.
-Classify the given item into a standard Category and Subcategory.
-Output STRICT JSON matching: {{"category": "string or null", "subcategory": "string or null", "item": "original item"}}
-If unknown, return null for category and subcategory. Return ONLY valid JSON."""
+        system_prompt = """You are the PocketMunim Day-to-Day Category Classification Engine.
+Your sole responsibility is to classify a given transaction item into practical, everyday life categories (e.g., Groceries, Medicines, Household Supplies, Dining, Transport, Utilities).
+
+RULES:
+1. Select the most appropriate everyday Category and Subcategory.
+2. If unknown or ambiguous, return null for category and subcategory.
+3. Return ONLY valid JSON matching the exact output format without markdown wrappers.
+
+OUTPUT FORMAT:
+{
+  "category": "string or null",
+  "subcategory": "string or null",
+  "item": "original item exactly as provided"
+}"""
 
         try:
             completion = self.ai.chat.completions.create(
