@@ -12,6 +12,6 @@
     }
   ],
   "crons": [
-    {"path": "/api/crons/daily-digest", "schedule": "30 5 * * *"}
+    {"path": "/api/crons/daily-digest", "schedule": "30 6 * * *"}
   ]
 }

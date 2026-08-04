@@ -85,17 +85,17 @@ async def telegram_webhook(request: Request):
         except Exception as e:
             reply_text = f"❌ Error processing intent through NLP engine: {str(e)}"
 
-    # Send Outbound Reply via Telegram Bot API
-    if TELEGRAM_BOT_TOKEN:
-        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                telegram_url,
-                json={
-                    "chat_id": chat_id,
-                    "text": reply_text,
-                    "parse_mode": "Markdown"
-                }
-            )
+        # Send Outbound Reply via Telegram Bot API (Plain Text to prevent 400 Bad Requests)
+        if TELEGRAM_BOT_TOKEN:
+            telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    telegram_url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": reply_text
+                        # parse_mode removed to guarantee delivery regardless of special characters
+                    }
+                )
 
     return {"ok": True}
