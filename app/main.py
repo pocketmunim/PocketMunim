@@ -165,7 +165,7 @@ async def telegram_webhook(request: Request):
     elif text.startswith("/report"):
         reply_text = "📊 Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)"
 
-    # 2. Handle Financial NLP Extraction & Ledger Commit
+    # 2. Handle Financial NLP Extraction & Multi-Intent Routing
     else:
         try:
             if not groq_client:
@@ -183,9 +183,16 @@ async def telegram_webhook(request: Request):
             )
 
             tx_data = json.loads(completion.choices[0].message.content)
-            transactions_list = tx_data.get("transactions", [])
-            user_id = str(chat_id)
 
+            transactions_list = tx_data.get("transactions", [])
+            loan_info = tx_data.get("loan", {})
+            query_info = tx_data.get("query", {})
+            report_info = tx_data.get("report", {})
+
+            user_id = str(chat_id)
+            response_sections = []
+
+            # Process Transactions
             committed_items = []
             if supabase and transactions_list:
                 for tx in transactions_list:
@@ -209,9 +216,30 @@ async def telegram_webhook(request: Request):
                         committed_items.append(f"• {description}: ₹{amount} [{category}]")
 
             if committed_items:
-                reply_text = "✅ Committed to Ledger:\n\n" + "\n".join(committed_items)
+                response_sections.append("✅ Committed to Ledger:\n" + "\n".join(committed_items))
+
+            # Process Loan Intent
+            if loan_info and loan_info.get("intent"):
+                l_intent = loan_info.get("intent")
+                lender = loan_info.get("lender")
+                l_amount = loan_info.get("amount")
+                response_sections.append(
+                    f"🏦 Loan Intelligence:\n• Intent: {l_intent}\n• Lender: {lender or 'Unspecified'}\n• Amount: {l_amount or 'Unspecified'}")
+
+            # Process Query Intent
+            if query_info and query_info.get("is_query"):
+                q_type = query_info.get("query_type")
+                response_sections.append(f"🔍 Financial Query:\n• Type: {q_type}")
+
+            # Process Report Intent
+            if report_info and report_info.get("intent"):
+                r_intent = report_info.get("intent")
+                response_sections.append(f"📊 Report Intelligence:\n• Intent: {r_intent}")
+
+            if response_sections:
+                reply_text = "\n\n".join(response_sections)
             else:
-                reply_text = f"⚠️ Processed text, but no valid transaction amounts detected for ledger commit."
+                reply_text = f"ℹ️ Processed command/text: '{text}'. No transactional or financial intents detected."
 
         except Exception as e:
             reply_text = f"❌ Error processing intent through NLP engine: {str(e)}"
