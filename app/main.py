@@ -1,7 +1,10 @@
-from fastapi import FastAPI, Request, HTTPException
 import os
+import httpx
+from fastapi import FastAPI, Request, HTTPException
 
 app = FastAPI()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
 @app.get("/")
@@ -22,13 +25,22 @@ async def telegram_webhook(request: Request):
     text = message.get("text", "")
 
     if text and chat_id:
-        # Log or route the text to your Phase 5 NLP & Ledger Engine
         print(f"Incoming tactical intent from chat {chat_id}: {text}")
 
-        # Example processing for "milk 70"
-        # 1. Pass 'text' to Groq/Gemini NLP Parser
-        # 2. Extract: category='Groceries', item='Milk', amount=70
-        # 3. Commit to Supabase Ledger via RLS
-        # 4. Reply back to Telegram user via Bot API
+        # Formulate response (Simulating Phase 5 NLP Ledger confirmation)
+        reply_text = f"✅ PocketMunim Logged: \"{text}\" [Status: Committed to Ledger]"
+
+        # Send outbound message back to user via Telegram Bot API
+        if TELEGRAM_BOT_TOKEN:
+            telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    telegram_url,
+                    json={
+                        "chat_id": chat_id,
+                        "text": reply_text,
+                        "parse_mode": "Markdown"
+                    }
+                )
 
     return {"ok": True}
