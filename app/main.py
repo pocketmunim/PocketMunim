@@ -1,9 +1,14 @@
 import os
 import json
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from decimal import Decimal
+from fastapi import FastAPI, Request, HTTPException, Depends
 from supabase import create_client, Client
 from groq import Groq
+
+# Core PocketMunim Imports
+from app.security.auth import authenticate_telegram_request
+from app.ai.schemas import AITransactionExtraction
 
 app = FastAPI()
 
@@ -20,18 +25,19 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and
 active_groq_key = GROQ_API_KEYS[0].strip() if GROQ_API_KEYS and GROQ_API_KEYS[0] else os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=active_groq_key) if active_groq_key else None
 
-# Finalized Enterprise NLP Extraction System Prompt
-SYSTEM_PROMPT = """
-SYSTEM ROLE:
+# =====================================================================
+# FOUNDER FROZEN SYSTEM PROMPT (DO NOT MODIFY)
+# =====================================================================
+SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
 
 CRITICAL RULES (NON-NEGOTIABLE):
 1. NO MATHEMATICS: You are strictly forbidden from calculating totals, EMIs, or balances.
 2. NO HALLUCINATION: If a field is missing, return `null`. Never guess or assume default values.
 3. MULTI-INTENT & SEQUENCING: A single message may contain multiple operations. Extract each as a separate object in the `transactions` array. Assign a chronological `execution_order` (1, 2, 3).
-4. BULK DETECTION: If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
-5. UNKNOWN CATEGORIES: If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
-6. LOAN PAYMENTS: A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
+4. BULK DETECTION (BUG #1 & #2 FIXED): If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
+5. UNKNOWN CATEGORIES (BUG #5 FIXED): If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
+6. LOAN PAYMENTS (BUG #3 FIXED): A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
 7. EXACT DATES & CURRENCY: Preserve the exact date expression. Default `normalized_currency` to "INR".
 8. CLARIFICATION: If a transaction is missing a critical component, set `needs_clarification = true` and list missing keys in `clarification_fields`.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers, no conversational text.
@@ -48,11 +54,12 @@ JSON OUTPUT SCHEMA:
     "unsupported_chat": "boolean",
     "account_required": "boolean"
   },
+
   "transactions": [
     {
-      "client_transaction_id": "string or null",
-      "transaction_sequence": "integer",
-      "execution_order": "integer",
+      "client_transaction_id": "string (generate random UUID) or null",
+      "transaction_sequence": "integer (e.g., 1)",
+      "execution_order": "integer (e.g., 1)",
       "intent": "enum: [expense, income, transfer_own, transfer_other]",
       "amount": "float or null",
       "original_currency": "string",
@@ -104,39 +111,135 @@ JSON OUTPUT SCHEMA:
       }
     }
   ],
+
   "query": {
     "is_query": "boolean",
     "query_type": "enum: [Balance, Expense History, Income History, Top Expense, Top Income, Cashflow, Net Worth, Loan Summary, Salary History, Category Summary, Merchant Summary, Budget Status, Investment Summary, null]",
     "target": "string or null"
   },
+
   "loan": {
     "intent": "enum: [loan_add, loan_update, loan_payment, loan_query, loan_close, null]",
     "lender": "string or null",
     "amount": "float or null"
   },
+
   "salary": {
     "intent": "enum: [salary_add, salary_update, salary_delete, salary_query, null]",
     "month": "string or null",
     "amount": "float or null"
   },
+
   "account": {
     "intent": "enum: [account_add, account_update, account_delete, account_query, null]",
     "account_name": "string or null",
     "account_type": "string or null"
   },
+
   "delete": {
     "intent": "enum: [delete_transaction, delete_all_period, null]",
     "selection_mode": "enum: [single, multiple, last5, date, range, null]",
     "target_date": "string or null"
   },
+
   "report": {
     "intent": "enum: [report, statistics, summary, chart, budget, export, null]",
     "format": "enum: [PDF, CSV, Excel, JSON, null]",
     "period": "string or null"
   }
 }
-"""
 
+FEW-SHOT EXAMPLES:
+
+User: "Salary 85000 credited and paid 15000 EMI for Sushma"
+Output: 
+{
+  "metadata": {
+    "raw_user_text": "Salary 85000 credited and paid 15000 EMI for Sushma",
+    "operation_type": "mixed", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 85000, 
+      "normalized_currency": "INR", "item": "Salary", "category": "Income", "subcategory": "Salary",
+      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.99}
+    },
+    {
+      "transaction_sequence": 2, "execution_order": 2, "intent": "expense", "amount": 15000, 
+      "normalized_currency": "INR", "item": "EMI for Sushma", "category": "Loans", "subcategory": "EMI Payment",
+      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.99}
+    }
+  ],
+  "loan": {"intent": "loan_payment", "lender": "Sushma", "amount": 15000}
+}
+
+User: "Added 50k to Upstox via UPI"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "Added 50k to Upstox via UPI", "operation_type": "single", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "transfer_other", "amount": 50000, 
+      "normalized_currency": "INR", "merchant": "Upstox", "payment_method": "UPI", "destination_account": "Upstox",
+      "category": "Investments", "subcategory": "Trading Account",
+      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": true},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.98}
+    }
+  ]
+}
+
+User: "Milk 50, Bread 40, Eggs 60, Paneer 120, Curd 40, Butter 90"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "Milk 50, Bread 40, Eggs 60, Paneer 120, Curd 40, Butter 90",
+    "operation_type": "bulk", "language": "English", "entry_source": "telegram",
+    "bulk_operation": true, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
+  },
+  "transactions": [
+    {"transaction_sequence": 1, "execution_order": 1, "intent": "expense", "amount": 50, "item": "Milk"},
+    {"transaction_sequence": 2, "execution_order": 2, "intent": "expense", "amount": 40, "item": "Bread"},
+    {"transaction_sequence": 3, "execution_order": 3, "intent": "expense", "amount": 60, "item": "Eggs"},
+    {"transaction_sequence": 4, "execution_order": 4, "intent": "expense", "amount": 120, "item": "Paneer"},
+    {"transaction_sequence": 5, "execution_order": 5, "intent": "expense", "amount": 40, "item": "Curd"},
+    {"transaction_sequence": 6, "execution_order": 6, "intent": "expense", "amount": 90, "item": "Butter"}
+  ]
+}
+
+User: "Bought dragon fruit for 150"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "Bought dragon fruit for 150",
+    "operation_type": "single", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": true, "unsupported_chat": false, "account_required": true
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "expense", "amount": 150, 
+      "normalized_currency": "INR", "item": "dragon fruit", "category": null, "subcategory": null,
+      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.95}
+    }
+  ]
+}"""
+
+
+# =====================================================================
 
 @app.get("/")
 def health_check():
@@ -144,26 +247,29 @@ def health_check():
 
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, authorized: bool = Depends(authenticate_telegram_request)):
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     message = payload.get("message", {})
+    if not message:
+        message = payload.get("edited_message", {})
+
     chat_id = message.get("chat", {}).get("id")
     text = message.get("text", "").strip()
 
     if not text or not chat_id:
         return {"ok": True}
 
-    reply_text = "⚠️ System processing error."
+    reply_text = "System processing error."
 
     # 1. Handle System Commands
     if text.startswith("/start"):
-        reply_text = "👋 Welcome to PocketMunim.\n\nYour automated financial intelligence system is active. Send your expenses naturally (e.g., *milk 40* or *dinner 450*)."
+        reply_text = "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active. Send your expenses naturally (e.g., *milk 40* or *dinner 450*)."
     elif text.startswith("/report"):
-        reply_text = "📊 Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)"
+        reply_text = "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)"
 
     # 2. Handle Financial NLP Extraction & Multi-Intent Routing
     else:
@@ -175,74 +281,58 @@ async def telegram_webhook(request: Request):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": text}
             ]
-
             completion = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
                 response_format={"type": "json_object"}
             )
 
-            tx_data = json.loads(completion.choices[0].message.content)
+            # RULE 39: Strict Pydantic Validation mapped to your Frozen Schema
+            raw_json = json.loads(completion.choices[0].message.content)
+            validated_data = AITransactionExtraction(**raw_json)
 
-            transactions_list = tx_data.get("transactions", [])
-            loan_info = tx_data.get("loan", {})
-            query_info = tx_data.get("query", {})
-            report_info = tx_data.get("report", {})
-
-            user_id = str(chat_id)
+            transactions_list = validated_data.transactions
+            user_id = request.state.telegram_id
             response_sections = []
-
-            # Process Transactions
             committed_items = []
+
             if supabase and transactions_list:
                 for tx in transactions_list:
-                    amount = float(tx.get("amount") or 0.0)
-                    if amount > 0:
-                        intent = str(tx.get("intent") or "expense")
-                        category = str(tx.get("category") or "General")
-                        description = str(tx.get("item") or tx.get("merchant") or text)
+                    # RULE 17.1: Deterministic Decimal safe calculations
+                    amount = tx.amount if tx.amount else Decimal('0.00')
+
+                    if amount > Decimal('0.00'):
+                        intent = tx.intent
+                        category = tx.category or "General"
+                        description = tx.item or tx.merchant or text
 
                         db_payload = {
                             "user_id": user_id,
-                            "amount": amount,
+                            "amount": float(amount),
                             "txn_type": intent,
                             "description": description,
                             "intent": intent,
                             "category": category,
                             "soft_deleted": False
                         }
-
                         supabase.table("transactions").insert(db_payload).execute()
-                        committed_items.append(f"• {description}: ₹{amount} [{category}]")
+                        committed_items.append(f"{description}: ₹{amount} [{category}]")
 
             if committed_items:
-                response_sections.append("✅ Committed to Ledger:\n" + "\n".join(committed_items))
+                response_sections.append("Committed to Ledger:\n" + "\n".join(committed_items))
 
-            # Process Loan Intent
-            if loan_info and loan_info.get("intent"):
-                l_intent = loan_info.get("intent")
-                lender = loan_info.get("lender")
-                l_amount = loan_info.get("amount")
+            # Optional: Catch non-transaction intents (loans, queries, etc.) based on new schema
+            if validated_data.loan and validated_data.loan.intent:
                 response_sections.append(
-                    f"🏦 Loan Intelligence:\n• Intent: {l_intent}\n• Lender: {lender or 'Unspecified'}\n• Amount: {l_amount or 'Unspecified'}")
+                    f"Loan intent detected: {validated_data.loan.intent} for {validated_data.loan.lender}")
 
-            # Process Query Intent
-            if query_info and query_info.get("is_query"):
-                q_type = query_info.get("query_type")
-                response_sections.append(f"🔍 Financial Query:\n• Type: {q_type}")
-
-            # Process Report Intent
-            if report_info and report_info.get("intent"):
-                r_intent = report_info.get("intent")
-                response_sections.append(f"📊 Report Intelligence:\n• Intent: {r_intent}")
-
-            if response_sections:
-                reply_text = "\n\n".join(response_sections)
+            if not response_sections:
+                reply_text = f"Processed command/text: '{text}'. No transactional intents committed to DB."
             else:
-                reply_text = f"ℹ️ Processed command/text: '{text}'. No transactional or financial intents detected."
+                reply_text = "\n\n".join(response_sections)
 
         except Exception as e:
-            reply_text = f"❌ Error processing intent through NLP engine: {str(e)}"
+            reply_text = f"Error processing intent through NLP engine: {str(e)}"
 
     # Send Outbound Reply via Telegram Bot API
     if TELEGRAM_BOT_TOKEN:
