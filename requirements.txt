@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+supabase
+groq
+google-generativeai
+python-dateutil
+pandas
