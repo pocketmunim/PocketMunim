@@ -26,7 +26,7 @@ active_groq_key = GROQ_API_KEYS[0].strip() if GROQ_API_KEYS and GROQ_API_KEYS[0]
 groq_client = Groq(api_key=active_groq_key) if active_groq_key else None
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (DO NOT MODIFY)
+# FOUNDER FROZEN SYSTEM PROMPT (STRICTLY UNMODIFIED)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -281,10 +281,13 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": text}
             ]
+
+            # ARCHITECTURAL FIX: Forcing strict LLM determinism
             completion = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=messages,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                temperature=0.0
             )
 
             # RULE 39: Strict Pydantic Validation mapped to your Frozen Schema
@@ -300,18 +303,26 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 for tx in transactions_list:
                     # RULE 17.1: Deterministic Decimal safe calculations
                     amount = tx.amount if tx.amount else Decimal('0.00')
+                    description = tx.item or tx.merchant or text
 
                     if amount > Decimal('0.00'):
-                        intent = tx.intent
+                        # ==========================================
+                        # FOUNDER RULE: STRICT CLARIFICATION
+                        # ==========================================
+                        if not tx.intent or tx.needs_clarification:
+                            clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
+                            response_sections.append(clarification_msg)
+                            continue  # Skip database insertion entirely
+
+                        # If intent is understood, proceed to commit
                         category = tx.category or "General"
-                        description = tx.item or tx.merchant or text
 
                         db_payload = {
                             "user_id": user_id,
                             "amount": float(amount),
-                            "txn_type": intent,
+                            "txn_type": tx.intent,
                             "description": description,
-                            "intent": intent,
+                            "intent": tx.intent,
                             "category": category,
                             "soft_deleted": False
                         }
@@ -334,7 +345,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         except Exception as e:
             reply_text = f"Error processing intent through NLP engine: {str(e)}"
 
-    # Send Outbound Reply via Telegram Bot API
+    # Send Outbound Reply via Telegram Bot API (Fully Restored)
     if TELEGRAM_BOT_TOKEN:
         telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         async with httpx.AsyncClient() as client:
