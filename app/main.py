@@ -54,7 +54,7 @@ async def telegram_webhook(request: Request):
             """
 
             completion = groq_client.chat.completions.create(
-                model="llama3-70b-8192",
+                model="llama3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"}
             )
