@@ -324,53 +324,51 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             continue
 
                         # =========================================================
-                        # PHASE 4: CATEGORY SOURCING & SOURCE AUDIT LOGGING
+                        # PHASE 4: PURE DYNAMIC CATEGORY SOURCING (ZERO HARDCODING)
                         # =========================================================
-                        category = tx.category
                         search_item_name = tx.item or description
-                        source_origin = "AI Prompt Extracted"
+                        category = None
+                        source_origin = "Unresolved"
 
+                        # Tier 1: Check In-Memory JSONB Cache
+                        cached_match = cache_manager.search_item(search_item_name)
+                        if cached_match and cached_match.get("category"):
+                            category = cached_match["category"]
+                            source_origin = "In-Memory JSONB Cache"
+                        else:
+                            # Tier 2: Check Relational Database (`categories` table)
+                            try:
+                                db_res = supabase.table('categories').select('*').eq('user_id', user_id).ilike('name',
+                                                                                                               search_item_name).execute()
+                                if db_res.data and db_res.data[0].get('category'):
+                                    category = db_res.data[0].get('category')
+                                    source_origin = "Relational Database Table"
+                            except Exception:
+                                pass
+
+                        # Tier 3: AI Fallback (CategoryPullService) if still not found
                         if not category:
-                            # Tier 1: Check In-Memory JSONB Cache
-                            cached_match = cache_manager.search_item(search_item_name)
-                            if cached_match and cached_match.get("category"):
-                                category = cached_match["category"]
-                                source_origin = "In-Memory JSONB Cache"
-                            else:
-                                # Tier 2: Check Relational Database (`categories` table)
-                                try:
-                                    db_res = supabase.table('categories').select('*').eq('user_id', user_id).ilike(
-                                        'name', search_item_name).execute()
-                                    if db_res.data:
-                                        category = db_res.data[0].get('category') or "General"
-                                        source_origin = "Relational Database Table"
-                                    else:
-                                        # Tier 3: AI Fallback (CategoryPullService)
-                                        ai_classified = category_pull_service.classify_item(search_item_name)
-                                        category = ai_classified.get("category") or "General"
-                                        source_origin = "AI Fallback (CategoryPullService)"
+                            ai_classified = category_pull_service.classify_item(search_item_name)
+                            category = ai_classified.get("category")
+                            source_origin = "AI Fallback (CategoryPullService)"
 
-                                        # Auto-persist newly discovered category to DB and rebuild cache
-                                        try:
-                                            new_cat_payload = {
-                                                "user_id": user_id,
-                                                "name": search_item_name,
-                                                "level": "ITEM",
-                                                "category": category
-                                            }
-                                            supabase.table('categories').insert(new_cat_payload).execute()
-                                            cache_manager.rebuild_cache()
-                                        except Exception:
-                                            pass  # Prevent insertion failure if already exists
+                            # Auto-persist newly discovered category to DB and rebuild cache if valid
+                            if category:
+                                try:
+                                    new_cat_payload = {
+                                        "user_id": user_id,
+                                        "name": search_item_name,
+                                        "level": "ITEM",
+                                        "category": category
+                                    }
+                                    supabase.table('categories').insert(new_cat_payload).execute()
+                                    cache_manager.rebuild_cache()
                                 except Exception:
-                                    category = "General"
-                                    source_origin = "Default Fallback"
+                                    pass
 
                         # Log source to Vercel runtime console
                         print(
                             f"[CATEGORY SOURCE] Item: '{search_item_name}' | Resolved Category: '{category}' | Loaded From: {source_origin}")
-
-                        category = category or "General"
 
                         db_payload = {
                             "user_id": user_id,
@@ -382,7 +380,8 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             "soft_deleted": False
                         }
                         supabase.table("transactions").insert(db_payload).execute()
-                        committed_items.append(f"{description}: ₹{amount} [{category}]")
+                        cat_display = category if category else "Unassigned"
+                        committed_items.append(f"{description}: ₹{amount} [{cat_display}]")
 
             if committed_items:
                 response_sections.append("Committed to Ledger:\n" + "\n".join(committed_items))
