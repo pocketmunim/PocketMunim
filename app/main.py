@@ -18,6 +18,10 @@ from app.ai.category_pull_service import CategoryPullService
 from app.cache.category_cache import CategoryCacheManager
 from app.ai.ai_provider import execute_resilient_ai
 
+# Bulk Transaction Imports
+from app.services.bulk_transaction_service import BulkTransactionService
+from app.dao.bulk_transaction_dao import BulkTransactionDAO
+
 # Environment Configurations
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -34,6 +38,9 @@ category_pull_service = CategoryPullService(None, supabase_admin)
 
 # In-memory secure report token store (Token -> {user_id, expires_at})
 REPORT_TOKENS = {}
+
+# IN-MEMORY DUPLICATE MANAGER
+PENDING_BATCHES = {}
 
 # Timezone Helper
 TZ_IST = timezone(timedelta(hours=5, minutes=30))
@@ -79,12 +86,46 @@ app = FastAPI(lifespan=lifespan)
 # =====================================================================
 # HELPER: SEND TELEGRAM MESSAGE IMMEDIATELY
 # =====================================================================
-async def send_telegram_reply(chat_id: int, text: str):
+async def send_telegram_reply(chat_id: int, text: str, reply_markup: dict = None):
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        await client.post(url, json=payload)
+
+
+# =====================================================================
+# INTERACTIVE UI HELPERS (CHECKBOXES)
+# =====================================================================
+def generate_duplicate_keyboard(batch_id: str, items: list) -> dict:
+    keyboard = []
+    for i, item in enumerate(items):
+        icon = "☑️" if item["selected"] else "⬜️"
+        text = f"{icon} {item['desc']} (₹{item['amount']:,.2f})"
+        keyboard.append([{"text": text, "callback_data": f"btog_{batch_id}_{i}"}])
+    keyboard.append([
+        {"text": "✅ Confirm Selected", "callback_data": f"bconf_{batch_id}"},
+        {"text": "❌ Cancel All", "callback_data": f"bcanc_{batch_id}"}
+    ])
+    return {"inline_keyboard": keyboard}
+
+
+async def edit_telegram_message(chat_id: int, message_id: int, text: str = None, reply_markup: dict = None):
+    if not TELEGRAM_BOT_TOKEN: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    if reply_markup: payload["reply_markup"] = reply_markup
+    if text:
+        url += "editMessageText"
+        payload["text"] = text
+        payload["parse_mode"] = "Markdown"
+    else:
+        url += "editMessageReplyMarkup"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json=payload)
 
 
 # =====================================================================
@@ -536,6 +577,69 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # =====================================================================
+    # CALLBACK QUERY HANDLER (INTERACTIVE DUPLICATE CHECKBOXES)
+    # =====================================================================
+    if "callback_query" in payload:
+        cb = payload["callback_query"]
+        chat_id = cb["message"]["chat"]["id"]
+        message_id = cb["message"]["message_id"]
+        user_id = str(cb["from"]["id"])
+        data = cb["data"]
+
+        # Acknowledge tap to remove loading icon
+        async with httpx.AsyncClient() as client:
+            await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                              json={"callback_query_id": cb["id"]})
+
+        if data.startswith("btog_"):
+            parts = data.split("_")
+            batch_id, item_id = parts[1], int(parts[2])
+            if batch_id in PENDING_BATCHES:
+                current_state = PENDING_BATCHES[batch_id]["items"][item_id]["selected"]
+                PENDING_BATCHES[batch_id]["items"][item_id]["selected"] = not current_state
+                kb = generate_duplicate_keyboard(batch_id, PENDING_BATCHES[batch_id]["items"])
+                await edit_telegram_message(chat_id, message_id, reply_markup=kb)
+
+        elif data.startswith("bconf_"):
+            batch_id = data.split("_")[1]
+            if batch_id in PENDING_BATCHES:
+                batch = PENDING_BATCHES[batch_id]
+                selected_items = [item for item in batch["items"] if item["selected"]]
+
+                if not selected_items:
+                    await edit_telegram_message(chat_id, message_id, text="❌ No duplicates selected. Batch discarded.")
+                else:
+                    dao = BulkTransactionDAO(supabase_admin, user_id)
+                    selected_payloads = [i["payload"] for i in selected_items]
+
+                    acc_res = supabase_admin.table('accounts').select('*').eq('id', batch["account_id"]).execute()
+                    if acc_res.data:
+                        default_acc_name = acc_res.data[0]['account_name']
+                        current_bal = float(acc_res.data[0]['balance'])
+
+                        total_deduction = sum(
+                            p["amount"] for p in selected_payloads if p["source_account"] == default_acc_name)
+                        total_addition = sum(
+                            p["amount"] for p in selected_payloads if p["destination_account"] == default_acc_name)
+
+                        if (current_bal - total_deduction + total_addition) < 0:
+                            await edit_telegram_message(chat_id, message_id,
+                                                        text="❌ Insufficient balance to save selected duplicates.")
+                        else:
+                            dao.execute_bulk_commit(batch["account_id"], selected_payloads, total_deduction,
+                                                    total_addition, current_bal)
+                            await edit_telegram_message(chat_id, message_id,
+                                                        text=f"✅ {len(selected_payloads)} duplicate transactions confirmed and saved.")
+                del PENDING_BATCHES[batch_id]
+
+        elif data.startswith("bcanc_"):
+            batch_id = data.split("_")[1]
+            if batch_id in PENDING_BATCHES:
+                del PENDING_BATCHES[batch_id]
+            await edit_telegram_message(chat_id, message_id, text="❌ All duplicate transactions discarded.")
+        return {"ok": True}
 
     message = payload.get("message", {})
     if not message:
@@ -1083,6 +1187,64 @@ Electricity for Jan 2025 was 2000 paid from SBI
             if supabase and transactions_list:
                 cache_manager = CategoryCacheManager(supabase, user_id)
 
+                # =====================================================================
+                # BULK TRANSACTION PIPELINE (If more than 1 item)
+                # =====================================================================
+                if len(transactions_list) > 1:
+                    default_acc = get_account_from_list(user_accounts)
+                    bulk_service = BulkTransactionService(supabase_admin, user_id, cache_manager, category_pull_service)
+
+                    result = bulk_service.process_bulk_payload(transactions_list, default_acc)
+
+                    if result["unique"]:
+                        current_bal = float(default_acc['balance'])
+                        total_deduction = sum(
+                            p["amount"] for p in result["unique"] if p["source_account"] == default_acc['account_name'])
+                        total_addition = sum(p["amount"] for p in result["unique"] if
+                                             p["destination_account"] == default_acc['account_name'])
+
+                        if (current_bal - total_deduction + total_addition) < 0:
+                            await send_telegram_reply(chat_id,
+                                                      f"❌ *Insufficient Balance*\nAccount **'{default_acc['account_name']}'** has ₹{current_bal:,.2f}, but unique items require more funds.")
+                            return {"ok": True}
+
+                        bulk_service.dao.execute_bulk_commit(default_acc['id'], result["unique"], total_deduction,
+                                                             total_addition, current_bal)
+
+                        bd_text = "\n".join(result["breakdown"]) if result["breakdown"] else "No unique items."
+                        receipt = (
+                            f"🧾 *BULK TRANSACTION SAVED*\n"
+                            f"🔴 *EXPENSE* | 🟢 *INCOME* | 🔵 *TRANSFER*\n\n"
+                            f"🔹 *Total Expenses:* ₹{result['totals']['expenses']:,.2f}\n"
+                            f"🔹 *Total Income:* ₹{result['totals']['income']:,.2f}\n"
+                            f"🔹 *Total Transfers:* ₹{result['totals']['transfers']:,.2f}\n\n"
+                            f"🔹 *Items Processed:* {len(result['unique'])}\n"
+                            f"🔹 *Primary Account:* {default_acc['account_name']}\n"
+                            f"🔹 *Date:* Today\n\n"
+                            f"🛒 *Receipt Breakdown:*\n{bd_text}\n\n"
+                            f"✅ *All unique items categorized and synced to ledger.*"
+                        )
+                        await send_telegram_reply(chat_id, receipt)
+
+                    if result["duplicates"]:
+                        batch_id = uuid.uuid4().hex[:8]
+                        PENDING_BATCHES[batch_id] = {
+                            "user_id": user_id,
+                            "account_id": default_acc['id'],
+                            "items": result["duplicates"]
+                        }
+                        dup_msg = (
+                            f"⚠️ *Duplicate Entries Found ({len(result['duplicates'])} items)*\n"
+                            f"The items below already exist in your ledger. Tap the boxes to select the ones you want to save, then confirm."
+                        )
+                        keyboard = generate_duplicate_keyboard(batch_id, result["duplicates"])
+                        await send_telegram_reply(chat_id, dup_msg, reply_markup=keyboard)
+
+                    return {"ok": True}
+
+                # =====================================================================
+                # SINGLE TRANSACTION PIPELINE
+                # =====================================================================
                 for tx in transactions_list:
                     amount = tx.amount if tx.amount else Decimal('0.00')
                     description = str(tx.item or tx.merchant or text).title()
@@ -1187,7 +1349,7 @@ Electricity for Jan 2025 was 2000 paid from SBI
                             supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
                             try:
                                 log_desc = f"{description} ({int(num_occurrences)} Occurrences)" if (
-                                            is_recurring_past and num_occurrences > 1) else description
+                                        is_recurring_past and num_occurrences > 1) else description
                                 supabase_admin.table('account_logs').insert({
                                     "account_id": acc_id,
                                     "user_id": user_id,
