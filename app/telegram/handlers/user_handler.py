@@ -4,8 +4,9 @@ from datetime import datetime
 from app.utils.constants import TZ_IST
 from app.telegram.telegram_utils import send_telegram_reply
 
+# FIXED: Wrapped in single quotes (r'...') to safely contain internal double quotes
 MALICIOUS_PATTERN = re.compile(
-    r"(DROP\s+TABLE|SELECT\s+\*|OR\s+1=1|<script>|<img|jndi:ldap|rm\s+-rf|;/|{{.*}}|\.\./\.\./|\"\s*OR\s*\"")",
+    r'(DROP\s+TABLE|SELECT\s+\*|OR\s+1=1|<script>|<img|jndi:ldap|rm\s+-rf|;/|{{.*}}|\.\./\.\./|"\s*OR\s*")',
     re.IGNORECASE
 )
 
