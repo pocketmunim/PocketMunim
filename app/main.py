@@ -310,8 +310,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         else:
             await send_telegram_reply(chat_id, f"⏳ Pulling categories for '{query}' using AI...")
 
-        # Trigger pull and save to DB via CategoryPullService
-        added_count = category_pull_service.manual_category_pull(query, user_id)
+        # Trigger pull and save to DB
+        pull_result = category_pull_service.manual_category_pull(query, user_id)
+        added_count = pull_result.get("added", 0)
 
         if added_count > 0:
             # Refresh In-Memory RAM Cache immediately
@@ -320,7 +321,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             success_msg = f"✅ Successfully pulled and saved {added_count} items to the database and refreshed In-Memory Cache."
             await send_telegram_reply(chat_id, success_msg)
         else:
-            await send_telegram_reply(chat_id, f"❌ Failed to find or parse categories.")
+            # THIS WILL PRINT THE EXACT ERROR TO YOUR TELEGRAM
+            error_reason = pull_result.get("error", "Unknown logic failure")
+            await send_telegram_reply(chat_id, f"❌ Failed to pull categories.\n\nReason: {error_reason}")
 
         return {"ok": True}
 

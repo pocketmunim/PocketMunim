@@ -8,11 +8,17 @@ class CategoryPullService:
         self.ai = ai_client
         self.admin_db = admin_db_client
 
-    def manual_category_pull(self, query: str, user_id: str) -> int:
-        if not self.ai or not self.admin_db:
-            return 0
+    def manual_category_pull(self, query: str, user_id: str) -> dict:
+        """
+        Returns a dictionary with execution results:
+        {"added": int, "error": str or None}
+        """
+        result = {"added": 0, "error": None}
 
-        # FOUNDER's STRICT TAXONOMY PROMPT
+        if not self.ai or not self.admin_db:
+            result["error"] = "System configuration missing (AI or DB client is None)."
+            return result
+
         base_rules_and_format = """
 RULES:
 1. Generate exactly 15-20 items.
@@ -40,46 +46,21 @@ OUTPUT FORMAT:
       "category": "Medicines & Healthcare",
       "subcategory": "Pharmacy",
       "item": "Paracetamol"
-    },
-    {
-      "category": "Household",
-      "subcategory": "Cleaning",
-      "item": "Dishwash Liquid"
     }
   ]
 }
 
 FINAL REQUIREMENT:
 Return exactly one JSON object containing a "categories" array with 15-20 objects.
-Every object MUST contain exactly these three fields:
-- category
-- subcategory
-- item"""
+Every object MUST contain exactly these three fields: category, subcategory, item."""
 
-        # If empty query, pull random day-to-day categories using Founder's exact prompt
         if not query:
             system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-
 Your task is to generate 15-20 common, realistic, practical day-to-day financial items that people may commonly purchase or spend money on.
-
-FOCUS AREAS:
-- Household
-- Medicines & Healthcare
-- Groceries
-- Food & Dining
-- Transportation
-- Utilities
-- Personal Care
-- Education
-- Entertainment
-- Shopping
-- Other common everyday personal expenses
+FOCUS AREAS: Household, Medicines & Healthcare, Groceries, Food & Dining, Transportation, Utilities, Personal Care, Education, Entertainment.
 {base_rules_and_format}"""
-
-        # If specific query provided, adapt the Founder's prompt to focus on the query
         else:
             system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-
 Your task is to generate 15-20 common, realistic, practical day-to-day financial items STRICTLY RELATED TO THE DOMAIN: "{query}".
 {base_rules_and_format}"""
 
@@ -90,33 +71,48 @@ Your task is to generate 15-20 common, realistic, practical day-to-day financial
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": "Generate the JSON category list now. Output ONLY valid JSON."}
                 ],
-                response_format={"type": "json_object"},  # CRITICAL: Enforces strict JSON physical output
+                response_format={"type": "json_object"},
                 temperature=0.4
             )
 
             raw_content = completion.choices[0].message.content.strip()
+
+            # Safeguard just in case Groq ignores JSON mode
+            if raw_content.startswith("```"):
+                raw_content = raw_content.split("```")[1]
+                if raw_content.startswith("json"):
+                    raw_content = raw_content[4:]
+                raw_content = raw_content.strip()
+
             parsed = json.loads(raw_content)
             items_list = parsed.get("categories", [])
-            added_count = 0
 
+            if not items_list:
+                result["error"] = "AI returned an empty list or invalid JSON structure."
+                return result
+
+            db_errors = []
             for entry in items_list:
                 cat = entry.get("category")
                 itm = entry.get("item")
 
                 if cat and itm:
                     try:
-                        # Insert flat item payload
                         payload = {"user_id": user_id, "name": itm, "level": "ITEM", "category": cat}
                         self.admin_db.table('categories').insert(payload).execute()
-                        added_count += 1
+                        result["added"] += 1
                     except Exception as e:
-                        print(f"Insert skipped for {itm} (possible duplicate): {str(e)}")
+                        db_errors.append(str(e))
 
-            return added_count
+            # If nothing was added, the database rejected all insertions (e.g. RLS Violation)
+            if result["added"] == 0 and db_errors:
+                result["error"] = f"Supabase DB Insert Error: {db_errors[0]}"
+
+            return result
 
         except Exception as e:
-            print(f"[CATEGORY PULL ERROR] AI or Parsing failed: {str(e)}")
-            return 0
+            result["error"] = f"Execution Exception: {str(e)}"
+            return result
 
     def classify_item(self, item_name: str) -> dict:
         if not self.ai:
@@ -154,5 +150,4 @@ OUTPUT FORMAT MUST BE STRICT JSON:
                 "item": parsed.get("item") or item_name
             }
         except Exception as e:
-            print(f"[CLASSIFICATION ERROR] {str(e)}")
             return {"category": None, "subcategory": None, "item": item_name}
