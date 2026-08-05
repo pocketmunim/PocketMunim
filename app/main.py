@@ -72,7 +72,7 @@ async def send_telegram_reply(chat_id: int, text: str):
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (WITH DYNAMIC TIME INJECTION)
+# FOUNDER FROZEN SYSTEM PROMPT (WITH INBOUND PHRASING RULE)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -84,10 +84,11 @@ CRITICAL RULES (NON-NEGOTIABLE):
 4. BULK DETECTION (BUG #1 & #2 FIXED): If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
 5. UNKNOWN CATEGORIES (BUG #5 FIXED): If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
 6. LOAN PAYMENTS (BUG #3 FIXED): A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
-7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR.
+7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day, "day before yesterday" = minus 2 days). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR.
 8. CLARIFICATION: If a transaction is missing a critical component, set `needs_clarification = true` and list missing keys in `clarification_fields`.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers, no conversational text.
 10. PEER-TO-PEER TRANSFERS (NO CASH HALLUCINATION): If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]", and DO NOT assume or hallucinate the word "Cash" unless explicitly stated.
+11. INBOUND VS OUTBOUND PHRASING: If a person sends money to the user (e.g., "John sent 4k", "got 5k from Ram"), intent is strictly "income" (money received), and item must be formatted as "Received from [Name]". Never classify it as an outgoing expense.
 
 JSON OUTPUT SCHEMA:
 {
@@ -197,6 +198,27 @@ JSON OUTPUT SCHEMA:
 }
 
 FEW-SHOT EXAMPLES:
+
+User: "John sent 4k day before yesterday"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "John sent 4k day before yesterday",
+    "operation_type": "single", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": true, "unsupported_chat": false, "account_required": false
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 4000, 
+      "normalized_currency": "INR", "item": "Received from John", "payment_method": null,
+      "category": null, "subcategory": null,
+      "date": {"raw_expression": "day before yesterday", "relative_date": "2026-08-03", "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.99}
+    }
+  ]
+}
 
 User: "got 10k from raj yesterday"
 Output:
