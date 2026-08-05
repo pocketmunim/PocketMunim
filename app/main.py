@@ -283,33 +283,8 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
-    # =====================================================================
-    # CRITICAL FIX: RESOLVE SUPABASE UUID INSTEAD OF TELEGRAM ID
-    # =====================================================================
-    # 1. Attempt to grab the standard 'user_id' UUID set by your Auth Middleware
-    user_id = getattr(request.state, "user_id", None)
-
-    # 2. If it's stored inside a 'user' object instead, extract it
-    if not user_id and hasattr(request.state, "user"):
-        user_id = request.state.user.get("id")
-
-    # 3. If it's still missing or is just the Telegram ID, try a DB fallback lookup
-    if not user_id or str(user_id) == str(chat_id):
-        try:
-            # Assumes a typical 'users' table linking telegram_id to UUID
-            res = supabase_admin.table('users').select('id').eq('telegram_id', chat_id).execute()
-            if res.data:
-                user_id = res.data[0]['id']
-        except Exception:
-            pass
-
-    # 4. Final safety halt: If we still don't have a UUID, stop processing to prevent DB crash
-    if not user_id or "-" not in str(user_id):
-        await send_telegram_reply(chat_id,
-                                  f"❌ Database UUID Error: The system requires a Supabase UUID but received '{user_id}'. Please verify your auth middleware properly passes the UUID.")
-        return {"ok": True}
-    # =====================================================================
-
+    # Standard mapping (assuming user_id in DB is set to TEXT to handle Telegram IDs)
+    user_id = str(request.state.telegram_id)
     reply_text = "System processing error."
 
     # 1. Handle System Commands
@@ -346,7 +321,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             success_msg = f"✅ Successfully pulled and saved {added_count} items to the database and refreshed In-Memory Cache."
             await send_telegram_reply(chat_id, success_msg)
         else:
-            # PRINTS THE EXACT ERROR TO YOUR TELEGRAM (e.g., Database Hierarchy Issues)
+            # PRINTS THE EXACT ERROR TO YOUR TELEGRAM
             error_reason = pull_result.get("error", "Unknown logic failure")
             await send_telegram_reply(chat_id, f"❌ Failed to pull categories.\n\nReason: {error_reason}")
 
@@ -433,14 +408,12 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             # IF FOUND BY AI -> Persist Hierarchically to DB -> REBUILD RAM CACHE
                             if category:
                                 try:
-                                    # Use the new hierarchical helper to prevent schema errors (PGRST204)
                                     category_pull_service.add_single_item_to_taxonomy(
                                         cat_name=category,
                                         sub_name=subcategory,
                                         item_name=search_item_name,
                                         user_id=user_id
                                     )
-                                    # Refresh Cache dynamically so subsequent identical items hit RAM
                                     cache_manager.rebuild_cache()
                                 except Exception as e:
                                     print(f"Failed to persist AI fallback: {str(e)}")

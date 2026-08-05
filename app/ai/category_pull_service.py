@@ -17,9 +17,22 @@ class CategoryPullService:
         base_rules_and_format = """
 RULES:
 1. Generate exactly 15-20 items.
-2. Items must represent realistic day-to-day purchases.
-3. Keep categories broad and reusable.
-4. Return ONLY valid JSON.
+2. Items must represent realistic, commonly occurring day-to-day purchases or expenses.
+3. Each item must have a meaningful Category and Subcategory.
+4. Keep categories broad and reusable.
+5. Keep subcategories specific enough to be useful for transaction classification.
+6. Do not create overly specific, obscure, rare, luxury, or unusual items.
+7. Do not generate duplicate items.
+8. Avoid generating multiple items that are effectively the same thing.
+9. Do not use brand names unless the brand itself is commonly used as the generic description of the expense.
+10. Categories and subcategories must be logically consistent.
+11. Each item should be something a user could realistically enter into a personal finance app.
+12. Items should be suitable for future AI transaction classification.
+13. Use simple, commonly understood English names.
+14. Do not include prices, currency, descriptions, explanations, IDs, or additional fields.
+15. Return ONLY valid JSON.
+16. Do not wrap the response in Markdown code fences.
+17. Do not include any text before or after the JSON.
 
 OUTPUT FORMAT:
 {
@@ -33,16 +46,17 @@ OUTPUT FORMAT:
 }
 
 FINAL REQUIREMENT:
-Return exactly one JSON object. Every object MUST contain exactly these three fields: category, subcategory, item."""
+Return exactly one JSON object containing a "categories" array with 15-20 objects.
+Every object MUST contain exactly these three fields: category, subcategory, item."""
 
         if not query:
             system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-Your task is to generate 15-20 common, realistic, practical day-to-day financial items that people may commonly purchase.
-FOCUS AREAS: Household, Medicines & Healthcare, Groceries, Food & Dining, Transportation, Utilities, Personal Care.
+Your task is to generate 15-20 common, realistic, practical day-to-day financial items that people may commonly purchase or spend money on.
+FOCUS AREAS: Household, Medicines & Healthcare, Groceries, Food & Dining, Transportation, Utilities, Personal Care, Education, Entertainment, Shopping.
 {base_rules_and_format}"""
         else:
             system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-Your task is to generate 15-20 common, realistic day-to-day financial items STRICTLY RELATED TO THE DOMAIN: "{query}".
+Your task is to generate 15-20 common, realistic, practical day-to-day financial items STRICTLY RELATED TO THE DOMAIN: "{query}".
 {base_rules_and_format}"""
 
         try:
@@ -64,12 +78,8 @@ Your task is to generate 15-20 common, realistic day-to-day financial items STRI
                 result["error"] = "AI returned an empty list."
                 return result
 
-            # ==============================================================
-            # NEW: RELATIONAL HIERARCHY INSERTION LOGIC (FIX FOR PGRST204)
-            # ==============================================================
-            # 1. Fetch existing taxonomy to prevent duplicates and get IDs
+            # Fetch existing taxonomy to prevent duplicates and link hierarchical IDs correctly
             existing = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute().data or []
-
             cats_map = {r['name'].lower(): r['id'] for r in existing if r.get('level') == 'CATEGORY'}
             subcats_map = {f"{r.get('parent_id')}_{r['name'].lower()}": r['id'] for r in existing if
                            r.get('level') == 'SUBCATEGORY'}
@@ -87,7 +97,7 @@ Your task is to generate 15-20 common, realistic day-to-day financial items STRI
                     continue
 
                 try:
-                    # 2. Get or Create CATEGORY Node
+                    # Get or Create CATEGORY
                     cat_key = cat_name.lower()
                     if cat_key not in cats_map:
                         res = self.admin_db.table('categories').insert(
@@ -95,7 +105,7 @@ Your task is to generate 15-20 common, realistic day-to-day financial items STRI
                         cats_map[cat_key] = res.data[0]['id']
                     cat_id = cats_map[cat_key]
 
-                    # 3. Get or Create SUBCATEGORY Node
+                    # Get or Create SUBCATEGORY
                     sub_key = f"{cat_id}_{sub_name.lower()}"
                     if sub_key not in subcats_map:
                         res = self.admin_db.table('categories').insert(
@@ -104,7 +114,7 @@ Your task is to generate 15-20 common, realistic day-to-day financial items STRI
                         subcats_map[sub_key] = res.data[0]['id']
                     sub_id = subcats_map[sub_key]
 
-                    # 4. Get or Create ITEM Node
+                    # Get or Create ITEM
                     itm_key = f"{sub_id}_{itm_name.lower()}"
                     if itm_key not in items_map:
                         self.admin_db.table('categories').insert(
@@ -116,7 +126,7 @@ Your task is to generate 15-20 common, realistic day-to-day financial items STRI
                     db_errors.append(str(e))
 
             if result["added"] == 0 and db_errors:
-                result["error"] = f"DB Hierarchy Insert Error: {db_errors[0]}"
+                result["error"] = f"DB Insert Error (Check Supabase Columns): {db_errors[0]}"
 
             return result
 
