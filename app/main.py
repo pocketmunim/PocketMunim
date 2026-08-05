@@ -200,7 +200,7 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (DATE FIX APPLIED)
+# FOUNDER FROZEN SYSTEM PROMPT
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -222,6 +222,7 @@ CRITICAL RULES (NON-NEGOTIABLE):
     - If transfer between OWN accounts ("send 10k from SBI to Axis"), intent is `transfer_own`, `source_account` is "SBI", `destination_account` is "Axis".
 12. GENERIC NAMES: If a transaction involves a person but uses a generic term (e.g., "friend", "brother", "mitra", "dost", "vendor") instead of a specific name, you MUST set `needs_clarification = true` and ask for the specific name.
 13. PAST RECURRING: For inputs like "every month on 17th from jun 2025", set recurrence.enabled = true, extract frequency (e.g. 'monthly'), and set start_date strictly in YYYY-MM-DD.
+14. FULL PROCESSING MANDATE (ANTI-LAZINESS): You MUST extract and process EVERY SINGLE ITEM provided in the user's input. Do NOT truncate, skip, stop early, or group items. If the user lists 50 items, your `transactions` array MUST contain exactly 50 objects.
 
 JSON OUTPUT SCHEMA:
 {
