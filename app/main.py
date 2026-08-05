@@ -6,32 +6,27 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends
 from contextlib import asynccontextmanager
 from supabase import create_client, Client
-from groq import Groq
 
 # Core PocketMunim Imports
 from app.security.auth import authenticate_telegram_request
 from app.ai.schemas import AITransactionExtraction
 from app.ai.category_pull_service import CategoryPullService
 from app.cache.category_cache import CategoryCacheManager
+from app.ai.ai_provider import execute_resilient_ai
 
 # Environment Configurations
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-GROQ_API_KEYS = os.getenv("GROQ_API_KEYS", "").split(",")
 
 # Initialize Supabase Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 supabase_admin: Client = create_client(SUPABASE_URL,
                                        SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else supabase
 
-# Initialize Groq Client
-active_groq_key = GROQ_API_KEYS[0].strip() if GROQ_API_KEYS and GROQ_API_KEYS[0] else os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=active_groq_key) if active_groq_key else None
-
 # Initialize Phase 4 Category Services
-category_pull_service = CategoryPullService(groq_client, supabase_admin)
+category_pull_service = CategoryPullService(None, supabase_admin)
 
 
 # =====================================================================
@@ -269,9 +264,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
     user_id = str(request.state.telegram_id)
 
-    # =====================================================================
-    # BUSINESS LOGIC: MANDATORY USER REGISTRATION GATEWAY
-    # =====================================================================
+    # MANDATORY USER REGISTRATION GATEWAY
     user_res = supabase_admin.table('users').select('*').eq('telegram_id', chat_id).execute()
     user_exists = bool(user_res.data)
 
@@ -279,7 +272,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         reg_parts = text.replace("/register", "").strip()
         name = "PocketMunim User"
         currency = "INR"
-
         if reg_parts:
             name = reg_parts.split(",")[0].replace("Name:", "").strip() if "Name:" in reg_parts else reg_parts
             if "Currency:" in reg_parts:
@@ -287,7 +279,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                     currency = reg_parts.split("Currency:")[1].strip()
                 except Exception:
                     pass
-
         if not user_exists:
             try:
                 supabase_admin.table('users').insert({
@@ -297,7 +288,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                     "currency": currency
                 }).execute()
                 await send_telegram_reply(chat_id,
-                                          f"✅ *Registration Successful!*\n\nWelcome to PocketMunim, *{name}*! Your account is now active and ready for financial tracking.")
+                                          f"✅ *Registration Successful!*\n\nWelcome to PocketMunim, *{name}*! Your account is active.")
             except Exception as e:
                 await send_telegram_reply(chat_id, f"❌ Registration failed: {str(e)}")
         else:
@@ -314,10 +305,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         )
         await send_telegram_reply(chat_id, reg_msg)
         return {"ok": True}
-    # =====================================================================
 
     if text.startswith("/start"):
-        reply_text = "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active. Send your expenses naturally (e.g., *milk 40* or *dinner 450*)."
+        reply_text = "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active."
         await send_telegram_reply(chat_id, reply_text)
         return {"ok": True}
 
@@ -328,7 +318,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
     elif text.startswith("/categorypull"):
         query = text.replace("/categorypull", "").strip()
-
         if not query:
             await send_telegram_reply(chat_id, "⏳ Seeding random day-to-day life categories using AI...")
         else:
@@ -345,14 +334,10 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         else:
             error_reason = pull_result.get("error", "Unknown logic failure")
             await send_telegram_reply(chat_id, f"❌ Failed to pull categories.\n\nReason: {error_reason}")
-
         return {"ok": True}
 
     else:
         try:
-            if not groq_client:
-                raise Exception("Groq API client is not configured.")
-
             tz_ist = timezone(timedelta(hours=5, minutes=30))
             current_dt = datetime.now(tz_ist)
             current_date_str = current_dt.strftime("%Y-%m-%d")
@@ -363,28 +348,20 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 f"{current_date_str} ({current_day_str})"
             )
 
-            messages = [
-                {"role": "system", "content": dynamic_system_prompt},
-                {"role": "user", "content": text}
-            ]
-
-            completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.0
+            raw_response_text = execute_resilient_ai(
+                system_prompt=dynamic_system_prompt,
+                user_prompt=text,
+                db_client=supabase_admin,
+                is_json=True
             )
 
-            raw_json = json.loads(completion.choices[0].message.content)
+            raw_json = json.loads(raw_response_text)
             validated_data = AITransactionExtraction(**raw_json)
 
             transactions_list = validated_data.transactions
             response_sections = []
             committed_items = []
 
-            # =====================================================================
-            # BUSINESS LOGIC: LOAN EXISTENCE VERIFICATION FOR EMIS
-            # =====================================================================
             if validated_data.loan and validated_data.loan.intent == "loan_payment":
                 lender_name = validated_data.loan.lender
                 if lender_name:
@@ -392,9 +369,8 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                                                                                         lender_name).execute()
                     if not loan_check.data:
                         await send_telegram_reply(chat_id,
-                                                  f"❌ *Loan Verification Failed*\n\nNo active loan record found for lender **'{lender_name}'**. Please register the loan in the system before logging an EMI payment.")
+                                                  f"❌ *Loan Verification Failed*\n\nNo active loan record found for lender **'{lender_name}'**.")
                         return {"ok": True}
-            # =====================================================================
 
             if supabase and transactions_list:
                 cache_manager = CategoryCacheManager(supabase, user_id)
@@ -404,20 +380,14 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                     description = tx.item or tx.merchant or text
 
                     if amount > Decimal('0.00'):
-
                         if tx.future and tx.future.is_future:
-                            response_sections.append(
-                                f"🗓️ '{description}' identified as a future plan. Budget intelligence will activate in Phase 9.")
+                            response_sections.append(f"🗓️ '{description}' identified as a future plan.")
                             continue
 
                         if not tx.intent or tx.needs_clarification:
-                            clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
-                            response_sections.append(clarification_msg)
+                            response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
                             continue
 
-                        # =========================================================
-                        # BUSINESS LOGIC: SUFFICIENT BALANCE VALIDATION
-                        # =========================================================
                         if tx.intent == "expense":
                             source_acc = tx.source_account or "Default"
                             acc_res = supabase_admin.table('accounts').select('balance').eq('user_id', user_id).ilike(
@@ -425,58 +395,45 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             if acc_res.data:
                                 current_bal = Decimal(str(acc_res.data[0]['balance']))
                                 if current_bal < amount:
-                                    response_sections.append(
-                                        f"❌ *Insufficient Balance*\nAccount **'{source_acc}'** has ₹{current_bal:,.2f}, but required amount is ₹{amount:,.2f}.")
+                                    response_sections.append(f"❌ *Insufficient Balance* in '{source_acc}'.")
                                     continue
-                        # =========================================================
 
                         search_item_name = tx.item or description
                         category = None
                         subcategory = None
 
-                        # TIER 1: Check In-Memory JSONB RAM Cache
                         cached_match = cache_manager.search_item(search_item_name)
                         if cached_match and cached_match.get("category"):
                             category = cached_match["category"]
                             subcategory = cached_match.get("subcategory")
 
-                        # TIER 3: Dynamic AI Fallback (Passing Intent for Universal Type Coverage)
                         if not category:
                             ai_classified = category_pull_service.classify_item(search_item_name, intent=tx.intent)
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
-
                             normalized_taxonomy_item = ai_classified.get("normalized_item") or search_item_name
 
                             if category:
                                 try:
                                     category_pull_service.add_single_item_to_taxonomy(
-                                        cat_name=category,
-                                        sub_name=subcategory,
-                                        item_name=normalized_taxonomy_item,
+                                        cat_name=category, sub_name=subcategory, item_name=normalized_taxonomy_item,
                                         user_id=user_id
                                     )
                                     cache_manager.rebuild_cache()
                                 except Exception as e:
-                                    print(f"Failed to persist AI fallback: {str(e)}")
+                                    print(f"Failed persistence: {e}")
 
                         db_date = current_dt.isoformat()
                         display_date_raw = "Today"
-
                         if tx.date:
                             if tx.date.raw_expression:
                                 display_date_raw = str(tx.date.raw_expression).title()
-
                             if tx.date.relative_date:
                                 try:
                                     date_part = tx.date.relative_date.split("T")[0]
                                     parsed_date = datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=tz_ist)
                                     db_date = parsed_date.isoformat()
-                                    formatted_display = parsed_date.strftime("%d %b %Y")
-                                    if display_date_raw.lower() != "today":
-                                        display_date_raw = f"{formatted_display} ({display_date_raw})"
-                                    else:
-                                        display_date_raw = formatted_display
+                                    display_date_raw = parsed_date.strftime("%d %b %Y")
                                 except Exception:
                                     pass
 
@@ -504,16 +461,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             color_badge = "🟠 *TRANSACTION*"
 
                         cat_display = f"{category} -> {subcategory}" if subcategory else (category or "Unassigned")
-
-                        commit_msg = (
-                            f"✅ *Transaction Saved Successfully*\n"
-                            f"{color_badge}\n"
-                            f"🔹 *Item:* {description}\n"
-                            f"🔹 *Amount:* ₹{float(amount):,.2f}\n"
-                            f"🔹 *Date:* {display_date_raw}\n"
-                            f"🔹 *Category:* {cat_display}"
+                        committed_items.append(
+                            f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* ₹{float(amount):,.2f}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
                         )
-                        committed_items.append(commit_msg)
 
             if committed_items:
                 response_sections.append("\n\n".join(committed_items))
@@ -522,15 +472,12 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 response_sections.append(
                     f"🏦 *Loan Alert:* {validated_data.loan.intent} for {validated_data.loan.lender}")
 
-            if not response_sections:
-                reply_text = f"Processed command/text: '{text}'. No transactional intents committed to DB."
-            else:
-                reply_text = "\n\n".join(response_sections)
-
+            reply_text = "\n\n".join(
+                response_sections) if response_sections else f"Processed text: '{text}'. No commitments made."
             await send_telegram_reply(chat_id, reply_text)
 
         except Exception as e:
-            reply_text = f"Error processing intent through NLP engine: {str(e)}"
-            await send_telegram_reply(chat_id, reply_text)
+            error_msg = f"Error processing intent through NLP engine: {str(e)}"
+            await send_telegram_reply(chat_id, error_msg)
 
     return {"ok": True}

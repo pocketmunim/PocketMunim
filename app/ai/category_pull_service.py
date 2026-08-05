@@ -1,17 +1,16 @@
 import json
-from groq import Groq
 from typing import List, Optional
+from app.ai.ai_provider import execute_resilient_ai
 
 
 class CategoryPullService:
-    def __init__(self, ai_client: Groq, admin_db_client=None):
-        self.ai = ai_client
+    def __init__(self, ai_client=None, admin_db_client=None):
         self.admin_db = admin_db_client
 
     def manual_category_pull(self, query: str, user_id: str) -> dict:
         result = {"added": 0, "error": None}
-        if not self.ai or not self.admin_db:
-            result["error"] = "System configuration missing."
+        if not self.admin_db:
+            result["error"] = "System database missing."
             return result
 
         existing_res = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute()
@@ -63,17 +62,8 @@ OUTPUT FORMAT:
             system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate 15-20 items STRICTLY RELATED TO: '{query}'.\n{base_rules_and_format}"
 
         try:
-            completion = self.ai.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Generate the taxonomy JSON now. Output ONLY valid JSON."}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.4
-            )
-
-            raw_content = completion.choices[0].message.content.strip()
+            raw_content = execute_resilient_ai(system_prompt, "Generate the taxonomy JSON now. Output ONLY valid JSON.",
+                                               self.admin_db, is_json=True)
             parsed = json.loads(raw_content)
             taxonomy_list = parsed.get("taxonomy", [])
 
@@ -82,7 +72,6 @@ OUTPUT FORMAT:
                 return result
 
             db_errors = []
-
             for cat_obj in taxonomy_list:
                 raw_cat_name = cat_obj.get("category_name", "").strip()
                 new_subs = cat_obj.get("subcategories", [])
@@ -131,7 +120,6 @@ OUTPUT FORMAT:
                         for ns in new_subs:
                             raw_s_name = ns.get('subcategory_name', 'General').strip()
                             i_list = ns.get('items', [])
-
                             unique_items = list({i.strip().lower(): i.strip() for i in i_list}.values())
                             clean_subs.append({"subcategory_name": raw_s_name, "items": unique_items})
 
@@ -140,34 +128,29 @@ OUTPUT FORMAT:
                             "category_name": raw_cat_name,
                             "subcategories": clean_subs
                         }).execute()
-
                         db_map[cat_key] = {"category_name": raw_cat_name, "subcategories": clean_subs}
 
                     result["added"] += sum(len(sub.get("items", [])) for sub in new_subs)
-
                 except Exception as e:
                     db_errors.append(str(e))
 
             if result["added"] == 0 and db_errors:
                 result["error"] = f"DB Upsert Error: {db_errors[0]}"
-
             return result
-
         except Exception as e:
             result["error"] = f"Execution Exception: {str(e)}"
             return result
 
     def add_single_item_to_taxonomy(self, cat_name: str, sub_name: str, item_name: str, user_id: str) -> None:
-        if not self.admin_db or not cat_name or not sub_name or not item_name: return
+        if not self.admin_db or not cat_name or not sub_name or not item_name:
+            return
         try:
             res = self.admin_db.table('categories').select('*').eq('user_id', user_id).ilike('category_name',
                                                                                              cat_name.strip()).execute()
-
             if res.data:
                 existing_row = res.data[0]
                 actual_cat_name = existing_row['category_name']
                 existing_subs = existing_row.get('subcategories', [])
-
                 found_sub = False
                 for sub in existing_subs:
                     if sub.get('subcategory_name', '').strip().lower() == sub_name.strip().lower():
@@ -176,10 +159,8 @@ OUTPUT FORMAT:
                             sub['items'].append(item_name.strip())
                         found_sub = True
                         break
-
                 if not found_sub:
                     existing_subs.append({"subcategory_name": sub_name.strip(), "items": [item_name.strip()]})
-
                 self.admin_db.table('categories').update({"subcategories": existing_subs}).eq('user_id', user_id).eq(
                     'category_name', actual_cat_name).execute()
             else:
@@ -190,15 +171,12 @@ OUTPUT FORMAT:
             print(f"Failed fallback insert: {e}")
 
     def classify_item(self, item_name: str, intent: Optional[str] = None) -> dict:
-        if not self.ai:
-            return {"category": "General", "subcategory": "Miscellaneous", "normalized_item": item_name}
-
         system_prompt = f"""You are the PocketMunim Category Classification Engine.
 Classify the given input and transaction intent ('{intent}') into a proper financial Category and Subcategory.
 
 CRITICAL RULES:
-1. Normalization: If the input contains specific amounts, personal names, or hardcoded details (e.g., "John sent 4k"), generalize it into a clean, reusable item name (e.g., "Personal Transfer Received"). Never hallucinate "Cash".
-2. Universal Coverage: Handle all transaction types (expense, income, transfer_own, transfer_other) logically. For income/transfers, categorize appropriately (e.g., Transfers, Income). For expenses, categorize into standard spending buckets (e.g., Food & Dining, Utilities, Shopping).
+1. Normalization: If input has specific amounts or names (e.g., "John sent 4k"), generalize it (e.g., "Personal Transfer Received"). Never hallucinate "Cash".
+2. Universal Coverage: Handle all transaction types logically.
 
 OUTPUT FORMAT MUST BE STRICT JSON:
 {{
@@ -207,16 +185,8 @@ OUTPUT FORMAT MUST BE STRICT JSON:
   "normalized_item": "clean generic string"
 }}"""
         try:
-            completion = self.ai.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"item: \"{item_name}\", intent: \"{intent}\""}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0
-            )
-            raw_content = completion.choices[0].message.content.strip()
+            raw_content = execute_resilient_ai(system_prompt, f"item: \"{item_name}\", intent: \"{intent}\"",
+                                               self.admin_db, is_json=True)
             parsed = json.loads(raw_content)
             return {
                 "category": parsed.get("category") or "General",
@@ -224,4 +194,4 @@ OUTPUT FORMAT MUST BE STRICT JSON:
                 "normalized_item": parsed.get("normalized_item") or item_name
             }
         except Exception:
-            return {"category": "General", "subcategory": "Miscellaneous", "normalized_item": item_name}    
+            return {"category": "General", "subcategory": "Miscellaneous", "normalized_item": item_name}
