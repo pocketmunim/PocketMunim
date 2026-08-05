@@ -51,9 +51,11 @@ async def lifespan(app: FastAPI):
                     "commands": [
                         {"command": "start", "description": "Start PocketMunim"},
                         {"command": "register", "description": "Register your account"},
-                        {"command": "addaccount", "description": "Add a bank account (e.g. /addaccount HDFC 5000)"},
+                        {"command": "addaccount", "description": "Add a bank account"},
                         {"command": "categorypull", "description": "Seed or refresh categories"},
-                        {"command": "report", "description": "Get financial dashboard link"}
+                        {"command": "report", "description": "Get financial dashboard"},
+                        {"command": "monthly", "description": "Get monthly P&L (e.g. /monthly Jan 2025)"},
+                        {"command": "history", "description": "Get template for bulk past entries"}
                     ]
                 }
                 await client.post(url, json=commands)
@@ -74,6 +76,78 @@ async def send_telegram_reply(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+
+
+# =====================================================================
+# HELPER: RECURRENCE EXPANSION ENGINE
+# =====================================================================
+def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: datetime) -> list:
+    """Calculates all past occurrences of a recurring transaction up to today."""
+    try:
+        start_dt = datetime.strptime(start_date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=current_dt.tzinfo)
+    except Exception:
+        return []
+
+    dates = []
+    curr_iter = start_dt
+    freq = frequency.lower() if frequency else ""
+
+    while curr_iter <= current_dt:
+        dates.append(curr_iter)
+        if freq == 'daily':
+            curr_iter += timedelta(days=1)
+        elif freq == 'weekly':
+            curr_iter += timedelta(weeks=1)
+        elif freq == 'monthly':
+            month = curr_iter.month
+            year = curr_iter.year
+            day = curr_iter.day
+            if month == 12:
+                month = 1
+                year += 1
+            else:
+                month += 1
+            while True:
+                try:
+                    curr_iter = curr_iter.replace(year=year, month=month, day=day)
+                    break
+                except ValueError:
+                    day -= 1
+        elif freq == 'quarterly':
+            month = curr_iter.month + 3
+            year = curr_iter.year
+            day = curr_iter.day
+            if month > 12:
+                month -= 12
+                year += 1
+            while True:
+                try:
+                    curr_iter = curr_iter.replace(year=year, month=month, day=day)
+                    break
+                except ValueError:
+                    day -= 1
+        elif freq == 'half_yearly':
+            month = curr_iter.month + 6
+            year = curr_iter.year
+            day = curr_iter.day
+            if month > 12:
+                month -= 12
+                year += 1
+            while True:
+                try:
+                    curr_iter = curr_iter.replace(year=year, month=month, day=day)
+                    break
+                except ValueError:
+                    day -= 1
+        elif freq == 'yearly':
+            try:
+                curr_iter = curr_iter.replace(year=curr_iter.year + 1)
+            except ValueError:
+                curr_iter = curr_iter.replace(year=curr_iter.year + 1, month=2, day=28)
+        else:
+            break
+
+    return dates
 
 
 # =====================================================================
@@ -98,7 +172,7 @@ CRITICAL RULES (NON-NEGOTIABLE):
     - If user specifies an account received INTO, set `destination_account`.
     - If transfer between OWN accounts ("send 10k from SBI to Axis"), intent is `transfer_own`, `source_account` is "SBI", `destination_account` is "Axis".
 12. GENERIC NAMES: If a transaction involves a person but uses a generic term (e.g., "friend", "brother", "mitra", "dost", "vendor") instead of a specific name, you MUST set `needs_clarification = true` and ask for the specific name.
-13. PAST RECURRING: Do NOT mark `future.is_future = true` for recurring transactions that started in the past (e.g., "daily milk from 1st jan"). Only mark future for one-time explicit future dates.
+13. PAST RECURRING: For inputs like "every month on 17th from jun 2025", set recurrence.enabled = true, extract frequency (e.g. 'monthly'), and set start_date strictly in YYYY-MM-DD (e.g. '2025-06-17'). Do NOT mark future.is_future = true if the start date is in the past.
 
 JSON OUTPUT SCHEMA:
 {
@@ -139,7 +213,7 @@ JSON OUTPUT SCHEMA:
       },
       "recurrence": {
         "enabled": "boolean",
-        "frequency": "enum: [daily, weekly, monthly, yearly, null]",
+        "frequency": "enum: [daily, weekly, monthly, quarterly, half_yearly, yearly, null]",
         "start_date": "string or null",
         "end_date": "string or null"
       },
@@ -336,7 +410,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                       f"⚠️ *SECURITY WARNING ({new_strikes}/3)*\n\nMalicious input detected. Please refrain from sending injection scripts. Your account will be blocked after 3 strikes.")
         return {"ok": True}
 
-    # Check if user is already blocked
     user_res = supabase_admin.table('users').select('*').eq('telegram_id', chat_id).execute()
     user_exists = bool(user_res.data)
 
@@ -360,7 +433,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 except Exception:
                     pass
 
-        name = name.title()  # <--- Title Casing applied to Username
+        name = name.title()
 
         if not user_exists:
             try:
@@ -391,7 +464,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                       "⚠️ Invalid format. Use: `/addaccount [BankName] [InitialBalance]`\nExample: `/addaccount HDFC 5000`")
             return {"ok": True}
 
-        acc_name = " ".join(parts[:-1]).title()  # <--- Title Casing applied to Account Name
+        acc_name = " ".join(parts[:-1]).title()
 
         try:
             acc_bal = float(parts[-1])
@@ -413,7 +486,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     if text.startswith("/setdefault"):
-        acc_name = text.replace("/setdefault", "").strip().title()  # <--- Title Casing applied to Account Name
+        acc_name = text.replace("/setdefault", "").strip().title()
 
         if not acc_name:
             await send_telegram_reply(chat_id, "⚠️ Please provide an account name. Example: `/setdefault HDFC`")
@@ -435,10 +508,12 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         await send_telegram_reply(chat_id,
                                   "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
         return {"ok": True}
+
     elif text.startswith("/report"):
         await send_telegram_reply(chat_id,
                                   "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)")
         return {"ok": True}
+
     elif text.startswith("/categorypull"):
         query = text.replace("/categorypull", "").strip()
         await send_telegram_reply(chat_id, f"⏳ Pulling categories...")
@@ -448,6 +523,71 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id, f"✅ Successfully pulled {pull_result['added']} items.")
         else:
             await send_telegram_reply(chat_id, f"❌ Failed to pull categories: {pull_result.get('error')}")
+        return {"ok": True}
+
+    # =====================================================================
+    # NEW COMMAND: HISTORICAL DATA TEMPLATE (UX Solution)
+    # =====================================================================
+    elif text.startswith("/history"):
+        template = """📋 *Historical Data Auto-Template*
+Copy this block, fill in your past numbers, and send it back. The system will automatically log them accurately while safely bypassing your live current balance:
+
+```text
+Salary for Jan 2025 was 50000 received in SBI
+Rent for Jan 2025 was 15000 paid from SBI
+Electricity for Jan 2025 was 2000 paid from SBI
+
+Salary for Feb 2025 was 50000 received in SBI
+Rent for Feb 2025 was 15000 paid from SBI
+Electricity for Feb 2025 was 2200 paid from SBI
+```"""
+        await send_telegram_reply(chat_id, template)
+        return {"ok": True}
+
+    # =====================================================================
+    # NEW COMMAND: DYNAMIC MONTHLY REPORTING (P&L Carry Forward Solution)
+    # =====================================================================
+    elif text.startswith("/monthly"):
+        parts = text.replace("/monthly", "").strip().split()
+        if len(parts) < 2:
+            await send_telegram_reply(chat_id, "⚠️ Use format: `/monthly [Month] [Year]`\nExample: `/monthly Jan 2025`")
+            return {"ok": True}
+
+        # Use first 3 letters for standard parsing (Jan, Feb, etc.)
+        month_str, year_str = parts[0][:3], parts[1]
+        try:
+            target_dt = datetime.strptime(f"1 {month_str} {year_str}", "%d %b %Y")
+            start_date = target_dt.strftime("%Y-%m-%d")
+
+            if target_dt.month == 12:
+                end_dt = target_dt.replace(year=target_dt.year + 1, month=1)
+            else:
+                end_dt = target_dt.replace(month=target_dt.month + 1)
+            end_date = end_dt.strftime("%Y-%m-%d")
+
+            # Dynamically query Supabase for the specific month
+            txns = supabase_admin.table('transactions') \
+                .select('amount, txn_type') \
+                .eq('user_id', user_id) \
+                .gte('date', start_date) \
+                .lt('date', end_date) \
+                .eq('soft_deleted', False) \
+                .execute()
+
+            total_income = sum(t['amount'] for t in txns.data if t['txn_type'] == 'income')
+            total_expense = sum(t['amount'] for t in txns.data if t['txn_type'] == 'expense')
+            net_saved = total_income - total_expense
+
+            reply = f"📊 *Monthly Report: {target_dt.strftime('%B %Y')}*\n\n"
+            reply += f"🟢 *Total Income:* ₹{total_income:,.2f}\n"
+            reply += f"🔴 *Total Expense:* ₹{total_expense:,.2f}\n"
+            reply += "------------------------\n"
+            reply += f"💰 *Net Saved (Carry Forward):* ₹{net_saved:,.2f}"
+
+            await send_telegram_reply(chat_id, reply)
+
+        except ValueError:
+            await send_telegram_reply(chat_id, "⚠️ Invalid date format. Use: `/monthly Jan 2025`")
         return {"ok": True}
 
     else:
@@ -469,9 +609,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             response_sections = []
             committed_items = []
 
-            # =====================================================================
-            # ACCOUNT PRE-FLIGHT CHECK
-            # =====================================================================
             acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
             user_accounts = acc_res.data or []
 
@@ -495,8 +632,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
                 for tx in transactions_list:
                     amount = tx.amount if tx.amount else Decimal('0.00')
-
-                    # <--- Title Casing applied to Item Description
                     description = str(tx.item or tx.merchant or text).title()
 
                     if amount <= Decimal('0.00'):
@@ -504,15 +639,61 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             f"⚠️ Could not process '{description}'. Please specify a valid amount.")
                         continue
 
-                    if tx.future and tx.future.is_future:
-                        response_sections.append(f"🗓️ '{description}' identified as a future plan.")
-                        continue
+                    # =========================================================
+                    # HISTORICAL BYPASS & RECURRENCE EXPANSION ENGINE
+                    # =========================================================
+                    tx_dates = []
+                    is_recurring_past = False
+
+                    if tx.recurrence and tx.recurrence.enabled and tx.recurrence.start_date:
+                        freq = tx.recurrence.frequency or "monthly"
+                        tx_dates = generate_recurrence_dates(tx.recurrence.start_date, freq, current_dt)
+
+                        if tx.recurrence.end_date:
+                            try:
+                                end_dt = datetime.strptime(tx.recurrence.end_date.split("T")[0], "%Y-%m-%d").replace(
+                                    tzinfo=tz_ist)
+                                tx_dates = [d for d in tx_dates if d <= end_dt]
+                            except Exception:
+                                pass
+
+                        if tx_dates:
+                            is_recurring_past = True
+
+                    if not is_recurring_past:
+                        # Ensure future logic still applies if it's not a historical recurring transaction
+                        if tx.future and tx.future.is_future:
+                            response_sections.append(f"🗓️ '{description}' identified as a future plan.")
+                            continue
+
+                        db_date_obj = current_dt
+                        if tx.date and tx.date.relative_date:
+                            try:
+                                db_date_obj = datetime.strptime(tx.date.relative_date.split("T")[0],
+                                                                "%Y-%m-%d").replace(tzinfo=tz_ist)
+                            except Exception:
+                                pass
+                        tx_dates = [db_date_obj]
+
+                    num_occurrences = Decimal(len(tx_dates))
+
+                    # ----------------- LIVE VS HISTORICAL SEGREGATION -----------------
+                    live_occurrences = 0
+                    historical_occurrences = 0
+
+                    for d_obj in tx_dates:
+                        if d_obj.date() < current_dt.date():
+                            historical_occurrences += 1
+                        else:
+                            live_occurrences += 1
+
+                    live_total = amount * Decimal(live_occurrences)
+                    # =========================================================
 
                     if not tx.intent:
                         response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
                         continue
 
-                    # Filter false-positive clarifications from LLM
                     if tx.needs_clarification:
                         fields = " ".join(tx.clarification_fields).lower() if tx.clarification_fields else ""
                         if "name" in fields or "person" in fields or "lender" in fields:
@@ -520,9 +701,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             response_sections.append(f"⚠️ Could not process '{description}'. Please clarify: {missing}")
                             continue
 
-                    # =========================================================
-                    # STRICT ACCOUNT ROUTING & BALANCE VALIDATION
-                    # =========================================================
                     source_acc_obj = None
                     dest_acc_obj = None
 
@@ -555,30 +733,37 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             continue
 
                     updates_to_make = []
-                    if source_acc_obj:
-                        current_bal = Decimal(str(source_acc_obj['balance']))
-                        if current_bal < amount:
-                            response_sections.append(
-                                f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but transaction requires ₹{amount:,.2f}.")
-                            continue
-                        updates_to_make.append((source_acc_obj['id'], float(current_bal - Decimal(amount)), "DEBIT"))
+                    # ONLY DEDUCT LIVE (TODAY/FUTURE) TRANSACTIONS FROM LIVE BALANCE
+                    if live_total > Decimal('0.00'):
+                        if source_acc_obj:
+                            current_bal = Decimal(str(source_acc_obj['balance']))
+                            if current_bal < live_total:
+                                response_sections.append(
+                                    f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but today's transaction(s) require ₹{live_total:,.2f}.")
+                                continue
+                            updates_to_make.append(
+                                (source_acc_obj['id'], float(current_bal - live_total), "DEBIT", float(live_total)))
 
-                    if dest_acc_obj:
-                        current_bal = Decimal(str(dest_acc_obj['balance']))
-                        updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount)), "CREDIT"))
+                        if dest_acc_obj:
+                            current_bal = Decimal(str(dest_acc_obj['balance']))
+                            updates_to_make.append(
+                                (dest_acc_obj['id'], float(current_bal + live_total), "CREDIT", float(live_total)))
 
-                    for acc_id, new_bal, log_type in updates_to_make:
+                    for acc_id, new_bal, log_type, txn_amount in updates_to_make:
                         supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
-
-                        # --- ACCOUNT LOGGING ---
                         try:
+                            log_desc = f"{description} (Live Deduction)" if (
+                                        is_recurring_past or historical_occurrences > 0) else description
+                            if is_recurring_past and live_occurrences > 1:
+                                log_desc = f"{description} ({live_occurrences} Live Occurrences)"
+
                             supabase_admin.table('account_logs').insert({
                                 "account_id": acc_id,
                                 "user_id": user_id,
                                 "log_type": log_type,
-                                "amount": float(amount),
+                                "amount": txn_amount,
                                 "balance_after": new_bal,
-                                "description": description
+                                "description": log_desc
                             }).execute()
                         except Exception:
                             pass
@@ -599,8 +784,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         ai_classified = category_pull_service.classify_item(search_item_name, intent=tx.intent)
                         category = ai_classified.get("category")
                         subcategory = ai_classified.get("subcategory") or "General"
-
-                        # <--- Title Casing applied to AI generated taxonomy normalization
                         normalized_taxonomy_item = str(ai_classified.get("normalized_item") or search_item_name).title()
 
                         if category:
@@ -613,37 +796,30 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             except Exception:
                                 pass
 
-                    db_date = current_dt.isoformat()
-                    display_date_raw = "Today"
-                    if tx.date:
-                        if tx.date.raw_expression: display_date_raw = str(tx.date.raw_expression).title()
-                        if tx.date.relative_date:
-                            try:
-                                parsed_date = datetime.strptime(tx.date.relative_date.split("T")[0],
-                                                                "%Y-%m-%d").replace(tzinfo=tz_ist)
-                                db_date = parsed_date.isoformat()
-                                display_date_raw = parsed_date.strftime("%d %b %Y")
-                            except Exception:
-                                pass
-
-                    db_payload = {
-                        "user_id": user_id,
-                        "amount": float(amount),
-                        "txn_type": tx.intent,
-                        "description": description,
-                        "intent": tx.intent,
-                        "category": category,
-                        "subcategory": subcategory,
-                        "date": db_date,
-                        "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
-                        "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
-                        "soft_deleted": False
-                    }
+                    # Prepare Batch Insertion Payloads (Both Live and Historical get saved to DB)
+                    db_payloads = []
+                    for d_obj in tx_dates:
+                        db_payloads.append({
+                            "user_id": user_id,
+                            "amount": float(amount),
+                            "txn_type": tx.intent,
+                            "description": description,
+                            "intent": tx.intent,
+                            "category": category,
+                            "subcategory": subcategory,
+                            "date": d_obj.isoformat(),
+                            "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
+                            "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
+                            "soft_deleted": False
+                        })
 
                     try:
-                        supabase.table("transactions").insert(db_payload).execute()
+                        if len(db_payloads) == 1:
+                            supabase.table("transactions").insert(db_payloads[0]).execute()
+                        elif len(db_payloads) > 1:
+                            supabase.table("transactions").insert(db_payloads).execute()
                     except Exception as e:
-                        response_sections.append(f"❌ Failed to save '{description}': Database error.")
+                        response_sections.append(f"❌ Failed to save '{description}': Database insertion error.")
                         continue
 
                     intent_lower = tx.intent.lower()
@@ -661,15 +837,35 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}" if source_acc_obj else ""
 
                     cat_display = f"{category} -> {subcategory}" if subcategory else (category or "Unassigned")
+
+                    # Display Formatting
+                    if is_recurring_past and num_occurrences > 1:
+                        display_date_raw = f"{int(num_occurrences)} Occurrences ({tx_dates[0].strftime('%d %b %Y')} to {tx_dates[-1].strftime('%d %b %Y')})"
+                        amt_display = f"₹{float(amount * num_occurrences):,.2f} (₹{float(amount):,.2f} x {int(num_occurrences)})"
+                    else:
+                        display_date_raw = "Today"
+                        if tx.date:
+                            if tx.date.raw_expression:
+                                display_date_raw = str(tx.date.raw_expression).title()
+                            elif tx.date.relative_date:
+                                try:
+                                    parsed_date = datetime.strptime(tx.date.relative_date.split("T")[0], "%Y-%m-%d")
+                                    display_date_raw = parsed_date.strftime("%d %b %Y")
+                                except Exception:
+                                    pass
+                        amt_display = f"₹{float(amount):,.2f}"
+
+                    # Explicit UI Warning for the Historical Bypass
+                    bypass_msg = f"\nℹ️ *Historical Bypass Applied:* {historical_occurrences} past transaction(s) logged to charts without deducting from live balance." if historical_occurrences > 0 else ""
+
                     committed_items.append(
-                        f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* ₹{float(amount):,.2f}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
+                        f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* {amt_display}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}{bypass_msg}"
                     )
 
             if committed_items:
                 response_sections.append("\n\n".join(committed_items))
 
             if validated_data.loan and validated_data.loan.intent:
-                # Markdown Crash Fix: Stripping underscores from AI outputs
                 safe_intent_str = validated_data.loan.intent.replace("_", " ").title()
                 safe_lender_str = validated_data.loan.lender.replace("_",
                                                                      " ") if validated_data.loan.lender else "Unknown Lender"
