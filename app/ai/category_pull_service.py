@@ -9,35 +9,17 @@ class CategoryPullService:
         self.admin_db = admin_db_client
 
     def manual_category_pull(self, query: str, user_id: str) -> dict:
-        """
-        Returns a dictionary with execution results:
-        {"added": int, "error": str or None}
-        """
         result = {"added": 0, "error": None}
-
         if not self.ai or not self.admin_db:
-            result["error"] = "System configuration missing (AI or DB client is None)."
+            result["error"] = "System configuration missing."
             return result
 
         base_rules_and_format = """
 RULES:
 1. Generate exactly 15-20 items.
-2. Items must represent realistic, commonly occurring day-to-day purchases or expenses.
-3. Each item must have a meaningful Category and Subcategory.
-4. Keep categories broad and reusable.
-5. Keep subcategories specific enough to be useful for transaction classification.
-6. Do not create overly specific, obscure, rare, luxury, or unusual items.
-7. Do not generate duplicate items.
-8. Avoid generating multiple items that are effectively the same thing.
-9. Do not use brand names unless the brand itself is commonly used as the generic description of the expense.
-10. Categories and subcategories must be logically consistent.
-11. Each item should be something a user could realistically enter into a personal finance app.
-12. Items should be suitable for future AI transaction classification.
-13. Use simple, commonly understood English names.
-14. Do not include prices, currency, descriptions, explanations, IDs, or additional fields.
-15. Return ONLY valid JSON.
-16. Do not wrap the response in Markdown code fences.
-17. Do not include any text before or after the JSON.
+2. Items must represent realistic day-to-day purchases.
+3. Keep categories broad and reusable.
+4. Return ONLY valid JSON.
 
 OUTPUT FORMAT:
 {
@@ -51,17 +33,16 @@ OUTPUT FORMAT:
 }
 
 FINAL REQUIREMENT:
-Return exactly one JSON object containing a "categories" array with 15-20 objects.
-Every object MUST contain exactly these three fields: category, subcategory, item."""
+Return exactly one JSON object. Every object MUST contain exactly these three fields: category, subcategory, item."""
 
         if not query:
             system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-Your task is to generate 15-20 common, realistic, practical day-to-day financial items that people may commonly purchase or spend money on.
-FOCUS AREAS: Household, Medicines & Healthcare, Groceries, Food & Dining, Transportation, Utilities, Personal Care, Education, Entertainment.
+Your task is to generate 15-20 common, realistic, practical day-to-day financial items that people may commonly purchase.
+FOCUS AREAS: Household, Medicines & Healthcare, Groceries, Food & Dining, Transportation, Utilities, Personal Care.
 {base_rules_and_format}"""
         else:
             system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-Your task is to generate 15-20 common, realistic, practical day-to-day financial items STRICTLY RELATED TO THE DOMAIN: "{query}".
+Your task is to generate 15-20 common, realistic day-to-day financial items STRICTLY RELATED TO THE DOMAIN: "{query}".
 {base_rules_and_format}"""
 
         try:
@@ -76,37 +57,66 @@ Your task is to generate 15-20 common, realistic, practical day-to-day financial
             )
 
             raw_content = completion.choices[0].message.content.strip()
-
-            # Safeguard just in case Groq ignores JSON mode
-            if raw_content.startswith("```"):
-                raw_content = raw_content.split("```")[1]
-                if raw_content.startswith("json"):
-                    raw_content = raw_content[4:]
-                raw_content = raw_content.strip()
-
             parsed = json.loads(raw_content)
             items_list = parsed.get("categories", [])
 
             if not items_list:
-                result["error"] = "AI returned an empty list or invalid JSON structure."
+                result["error"] = "AI returned an empty list."
                 return result
 
+            # ==============================================================
+            # NEW: RELATIONAL HIERARCHY INSERTION LOGIC (FIX FOR PGRST204)
+            # ==============================================================
+            # 1. Fetch existing taxonomy to prevent duplicates and get IDs
+            existing = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute().data or []
+
+            cats_map = {r['name'].lower(): r['id'] for r in existing if r.get('level') == 'CATEGORY'}
+            subcats_map = {f"{r.get('parent_id')}_{r['name'].lower()}": r['id'] for r in existing if
+                           r.get('level') == 'SUBCATEGORY'}
+            items_map = {f"{r.get('parent_id')}_{r['name'].lower()}": r['id'] for r in existing if
+                         r.get('level') == 'ITEM'}
+
             db_errors = []
+
             for entry in items_list:
-                cat = entry.get("category")
-                itm = entry.get("item")
+                cat_name = entry.get("category")
+                sub_name = entry.get("subcategory")
+                itm_name = entry.get("item")
 
-                if cat and itm:
-                    try:
-                        payload = {"user_id": user_id, "name": itm, "level": "ITEM", "category": cat}
-                        self.admin_db.table('categories').insert(payload).execute()
+                if not (cat_name and sub_name and itm_name):
+                    continue
+
+                try:
+                    # 2. Get or Create CATEGORY Node
+                    cat_key = cat_name.lower()
+                    if cat_key not in cats_map:
+                        res = self.admin_db.table('categories').insert(
+                            {"user_id": user_id, "name": cat_name, "level": "CATEGORY"}).execute()
+                        cats_map[cat_key] = res.data[0]['id']
+                    cat_id = cats_map[cat_key]
+
+                    # 3. Get or Create SUBCATEGORY Node
+                    sub_key = f"{cat_id}_{sub_name.lower()}"
+                    if sub_key not in subcats_map:
+                        res = self.admin_db.table('categories').insert(
+                            {"user_id": user_id, "name": sub_name, "level": "SUBCATEGORY",
+                             "parent_id": cat_id}).execute()
+                        subcats_map[sub_key] = res.data[0]['id']
+                    sub_id = subcats_map[sub_key]
+
+                    # 4. Get or Create ITEM Node
+                    itm_key = f"{sub_id}_{itm_name.lower()}"
+                    if itm_key not in items_map:
+                        self.admin_db.table('categories').insert(
+                            {"user_id": user_id, "name": itm_name, "level": "ITEM", "parent_id": sub_id}).execute()
+                        items_map[itm_key] = True
                         result["added"] += 1
-                    except Exception as e:
-                        db_errors.append(str(e))
 
-            # If nothing was added, the database rejected all insertions (e.g. RLS Violation)
+                except Exception as e:
+                    db_errors.append(str(e))
+
             if result["added"] == 0 and db_errors:
-                result["error"] = f"Supabase DB Insert Error: {db_errors[0]}"
+                result["error"] = f"DB Hierarchy Insert Error: {db_errors[0]}"
 
             return result
 
@@ -114,24 +124,34 @@ Your task is to generate 15-20 common, realistic, practical day-to-day financial
             result["error"] = f"Execution Exception: {str(e)}"
             return result
 
+    def add_single_item_to_taxonomy(self, cat_name: str, sub_name: str, item_name: str, user_id: str) -> None:
+        """Helper for Transaction AI Fallback to safely insert hierarchical records."""
+        if not self.admin_db or not cat_name or not sub_name or not item_name: return
+        try:
+            res_c = self.admin_db.table('categories').select('id').eq('user_id', user_id).eq('level', 'CATEGORY').ilike(
+                'name', cat_name).execute()
+            cat_id = res_c.data[0]['id'] if res_c.data else self.admin_db.table('categories').insert(
+                {"user_id": user_id, "name": cat_name, "level": "CATEGORY"}).execute().data[0]['id']
+
+            res_s = self.admin_db.table('categories').select('id').eq('user_id', user_id).eq('level', 'SUBCATEGORY').eq(
+                'parent_id', cat_id).ilike('name', sub_name).execute()
+            sub_id = res_s.data[0]['id'] if res_s.data else self.admin_db.table('categories').insert(
+                {"user_id": user_id, "name": sub_name, "level": "SUBCATEGORY", "parent_id": cat_id}).execute().data[0][
+                'id']
+
+            res_i = self.admin_db.table('categories').select('id').eq('user_id', user_id).eq('level', 'ITEM').eq(
+                'parent_id', sub_id).ilike('name', item_name).execute()
+            if not res_i.data:
+                self.admin_db.table('categories').insert(
+                    {"user_id": user_id, "name": item_name, "level": "ITEM", "parent_id": sub_id}).execute()
+        except Exception as e:
+            print(f"Fallback insert error: {e}")
+
     def classify_item(self, item_name: str) -> dict:
-        if not self.ai:
-            return {"category": None, "subcategory": None, "item": item_name}
-
+        if not self.ai: return {"category": None, "subcategory": None, "item": item_name}
         system_prompt = """You are the PocketMunim Category Classification Engine.
-Your sole responsibility is to classify a given financial transaction item into the most appropriate PocketMunim Category and Subcategory.
-
-CLASSIFICATION RULES:
-1. Select the most appropriate day-to-day Category and most specific Subcategory.
-2. If the item is ambiguous or unrelated, return null for both.
-3. Return ONLY valid JSON.
-
-OUTPUT FORMAT MUST BE STRICT JSON:
-{
-  "category": "string or null",
-  "subcategory": "string or null",
-  "item": "original item exactly as provided"
-}"""
+Classify the given item into a day-to-day Category and most specific Subcategory. Return ONLY JSON.
+OUTPUT FORMAT MUST BE STRICT JSON: {"category": "...", "subcategory": "...", "item": "..."}"""
         try:
             completion = self.ai.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -144,10 +164,7 @@ OUTPUT FORMAT MUST BE STRICT JSON:
             )
             raw_content = completion.choices[0].message.content.strip()
             parsed = json.loads(raw_content)
-            return {
-                "category": parsed.get("category"),
-                "subcategory": parsed.get("subcategory"),
-                "item": parsed.get("item") or item_name
-            }
-        except Exception as e:
+            return {"category": parsed.get("category"), "subcategory": parsed.get("subcategory"),
+                    "item": parsed.get("item") or item_name}
+        except Exception:
             return {"category": None, "subcategory": None, "item": item_name}

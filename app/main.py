@@ -321,7 +321,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             success_msg = f"✅ Successfully pulled and saved {added_count} items to the database and refreshed In-Memory Cache."
             await send_telegram_reply(chat_id, success_msg)
         else:
-            # THIS WILL PRINT THE EXACT ERROR TO YOUR TELEGRAM
+            # PRINTS THE EXACT ERROR TO YOUR TELEGRAM (e.g., Database Hierarchy Issues)
             error_reason = pull_result.get("error", "Unknown logic failure")
             await send_telegram_reply(chat_id, f"❌ Failed to pull categories.\n\nReason: {error_reason}")
 
@@ -402,23 +402,23 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         if not category:
                             ai_classified = category_pull_service.classify_item(search_item_name)
                             category = ai_classified.get("category")
+                            subcategory = ai_classified.get("subcategory") or "General"
                             source_origin = "Tier 3: AI Fallback"
 
-                            # IF FOUND BY AI -> Persist to DB -> REBUILD RAM CACHE
+                            # IF FOUND BY AI -> Persist Hierarchically to DB -> REBUILD RAM CACHE
                             if category:
                                 try:
-                                    new_cat_payload = {
-                                        "user_id": user_id,
-                                        "name": search_item_name,
-                                        "level": "ITEM",
-                                        "category": category
-                                    }
-                                    supabase.table('categories').insert(new_cat_payload).execute()
-
+                                    # Use the new hierarchical helper to prevent schema errors (PGRST204)
+                                    category_pull_service.add_single_item_to_taxonomy(
+                                        cat_name=category,
+                                        sub_name=subcategory,
+                                        item_name=search_item_name,
+                                        user_id=user_id
+                                    )
                                     # Refresh Cache dynamically so subsequent identical items hit RAM
                                     cache_manager.rebuild_cache()
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    print(f"Failed to persist AI fallback: {str(e)}")
 
                         print(
                             f"[CATEGORY SOURCE] Item: '{search_item_name}' | Category: '{category}' | Origin: {source_origin}")
