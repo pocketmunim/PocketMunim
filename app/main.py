@@ -39,7 +39,7 @@ category_pull_service = CategoryPullService(None, supabase_admin)
 # In-memory secure report token store (Token -> {user_id, expires_at})
 REPORT_TOKENS = {}
 
-# IN-MEMORY DUPLICATE MANAGER
+# IN-MEMORY DUPLICATE MANAGER (Zero DB Footprint)
 PENDING_BATCHES = {}
 
 # Timezone Helper
@@ -200,7 +200,7 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (UPDATED RULES 7 & 8)
+# FOUNDER FROZEN SYSTEM PROMPT (DATE FIX APPLIED)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -1159,12 +1159,53 @@ Electricity for Jan 2025 was 2000 paid from SBI
                 f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            raw_response_text = execute_resilient_ai(system_prompt=dynamic_system_prompt, user_prompt=text,
-                                                     db_client=supabase_admin, is_json=True)
-            raw_json = json.loads(raw_response_text)
+            # =================================================================
+            # SMART INVISIBLE CHUNKING ENGINE (Consolidates to ONE Output)
+            # =================================================================
+            raw_items = re.split(r'\n|,', text)
+            valid_items = [i.strip() for i in raw_items if len(i.strip()) > 2]
 
-            validated_data = AITransactionExtraction(**raw_json)
-            transactions_list = validated_data.transactions
+            transactions_list = []
+            validated_data = None
+
+            if len(valid_items) > 1:
+                CHUNK_SIZE = 10
+
+                if len(valid_items) > CHUNK_SIZE:
+                    await send_telegram_reply(chat_id,
+                                              f"⏳ *Processing {len(valid_items)} items...*\nSecurely analyzing and syncing to your ledger. Please wait.")
+
+                for i in range(0, len(valid_items), CHUNK_SIZE):
+                    chunk_text = " , ".join(valid_items[i:i + CHUNK_SIZE])
+                    try:
+                        raw_response_text = execute_resilient_ai(
+                            system_prompt=dynamic_system_prompt,
+                            user_prompt=chunk_text,
+                            db_client=supabase_admin,
+                            is_json=True
+                        )
+                        raw_json = json.loads(raw_response_text)
+                        chunk_data = AITransactionExtraction(**raw_json)
+                        validated_data = chunk_data
+                        if chunk_data.transactions:
+                            transactions_list.extend(chunk_data.transactions)
+                    except Exception as e:
+                        print(f"Chunk processing failed: {e}")
+                        continue
+            else:
+                raw_response_text = execute_resilient_ai(
+                    system_prompt=dynamic_system_prompt,
+                    user_prompt=text,
+                    db_client=supabase_admin,
+                    is_json=True
+                )
+                raw_json = json.loads(raw_response_text)
+                validated_data = AITransactionExtraction(**raw_json)
+                if validated_data.transactions:
+                    transactions_list.extend(validated_data.transactions)
+
+            # =================================================================
+
             response_sections = []
             committed_items = []
 
@@ -1176,7 +1217,11 @@ Electricity for Jan 2025 was 2000 paid from SBI
                                           "❌ *No Bank Accounts Configured*\n\nYou must add an account before logging transactions.\n\nUse this command:\n`/addaccount [BankName] [Balance]`\nExample: `/addaccount HDFC 50000`")
                 return {"ok": True}
 
-            if validated_data.loan and validated_data.loan.intent == "loan_payment":
+            if not transactions_list:
+                await send_telegram_reply(chat_id, "⚠️ No valid financial transactions were extracted from your text.")
+                return {"ok": True}
+
+            if validated_data and validated_data.loan and validated_data.loan.intent == "loan_payment":
                 lender_name = validated_data.loan.lender
                 if lender_name:
                     loan_check = supabase_admin.table('loans').select('*').eq('user_id', user_id).ilike('lender',
@@ -1256,7 +1301,6 @@ Electricity for Jan 2025 was 2000 paid from SBI
                             response_sections.append(f"🗓️ '{description}' identified as a future plan.")
                             continue
 
-                        # Check if clarification is needed (e.g. missing income source - Observation 5)
                         if not tx.intent or tx.needs_clarification:
                             missing = ", ".join(
                                 tx.clarification_fields) if tx.clarification_fields else "Intent/Details"
@@ -1456,7 +1500,7 @@ Electricity for Jan 2025 was 2000 paid from SBI
             if committed_items:
                 response_sections.append("\n\n".join(committed_items))
 
-            if validated_data.loan and validated_data.loan.intent:
+            if validated_data and validated_data.loan and validated_data.loan.intent:
                 safe_intent_str = validated_data.loan.intent.replace("_", " ").title()
                 safe_lender_str = validated_data.loan.lender.replace("_",
                                                                      " ") if validated_data.loan.lender else "Unknown Lender"
