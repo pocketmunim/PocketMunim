@@ -14,39 +14,69 @@ class CategoryPullService:
             result["error"] = "System configuration missing."
             return result
 
-        base_rules_and_format = """
+        # =====================================================================
+        # 1. FETCH EXISTING DB RECORDS FIRST (For Exclusion List & Merging)
+        # =====================================================================
+        existing_res = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute()
+        existing_data = existing_res.data or []
+
+        db_map = {}
+        existing_items_set = set()
+
+        # Build case-insensitive map for merging AND collect all existing items
+        for row in existing_data:
+            cat_key = row['category_name'].strip().lower()
+            db_map[cat_key] = row
+            for sub in row.get('subcategories', []):
+                for item in sub.get('items', []):
+                    existing_items_set.add(item.strip().lower())
+
+        # Generate Exclusion Text if user already has items
+        exclusion_text = ""
+        if existing_items_set:
+            existing_items_str = ", ".join(sorted(existing_items_set))
+            exclusion_text = f"\n\nCRITICAL EXCLUSION LIST:\nThe user ALREADY HAS the following items. You MUST NOT generate any of these items. Generate completely NEW, unlisted items:\n[{existing_items_str}]\n"
+
+        # =====================================================================
+        # 2. CONSTRUCT AI PROMPT WITH EXCLUSION LIST
+        # =====================================================================
+        base_rules_and_format = f"""
 RULES:
 1. Generate realistic day-to-day purchases.
 2. Group them intelligently into broad Categories.
 3. Inside each Category, group items into Subcategories.
 4. Output MUST STRICTLY MATCH the nested JSON schema below.
 5. Return ONLY valid JSON.
+6. Do not generate duplicate items.{exclusion_text}
 
 OUTPUT FORMAT:
-{
+{{
   "taxonomy": [
-    {
+    {{
       "category_name": "Groceries",
       "subcategories": [
-        {
+        {{
           "subcategory_name": "Dairy and Eggs",
-          "items": ["milk", "paneer", "butter", "eggs"]
-        },
-        {
+          "items": ["paneer", "butter"]
+        }},
+        {{
           "subcategory_name": "Fruits",
           "items": ["apple", "banana"]
-        }
+        }}
       ]
-    }
+    }}
   ]
-}
+}}
 """
 
         if not query:
-            system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate common day-to-day items.\n{base_rules_and_format}"
+            system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate 15-20 common, realistic day-to-day items.\n{base_rules_and_format}"
         else:
-            system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate items STRICTLY RELATED TO: '{query}'.\n{base_rules_and_format}"
+            system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate 15-20 items STRICTLY RELATED TO: '{query}'.\n{base_rules_and_format}"
 
+        # =====================================================================
+        # 3. EXECUTE AI PULL
+        # =====================================================================
         try:
             completion = self.ai.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -66,14 +96,11 @@ OUTPUT FORMAT:
                 result["error"] = "AI returned an empty taxonomy."
                 return result
 
-            # Fetch existing DB records
-            existing_res = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute()
-
-            # Create a case-insensitive map of the database (e.g. "groceries" -> full db row)
-            db_map = {row['category_name'].strip().lower(): row for row in (existing_res.data or [])}
-
             db_errors = []
 
+            # =====================================================================
+            # 4. INTELLIGENT DEEP MERGE (CASE INSENSITIVE)
+            # =====================================================================
             for cat_obj in taxonomy_list:
                 raw_cat_name = cat_obj.get("category_name", "").strip()
                 new_subs = cat_obj.get("subcategories", [])
@@ -85,16 +112,13 @@ OUTPUT FORMAT:
 
                 try:
                     if cat_key in db_map:
-                        # ==========================================
-                        # INTELLIGENT DEEP MERGE (CASE INSENSITIVE)
-                        # ==========================================
                         existing_row = db_map[cat_key]
-                        actual_cat_name = existing_row['category_name']  # Preserves original DB casing
+                        actual_cat_name = existing_row['category_name']
                         existing_subs = existing_row.get('subcategories', [])
 
                         sub_dict = {}
 
-                        # 1. Load existing subcategories into a case-insensitive dictionary
+                        # Load existing subcategories
                         for s in existing_subs:
                             s_key = s.get('subcategory_name', 'General').strip().lower()
                             sub_dict[s_key] = {
@@ -102,7 +126,7 @@ OUTPUT FORMAT:
                                 "items": {i.strip().lower(): i.strip() for i in s.get('items', [])}
                             }
 
-                        # 2. Merge new AI subcategories and items into the dictionary
+                        # Merge new AI subcategories and items safely
                         for ns in new_subs:
                             raw_s_name = ns.get('subcategory_name', 'General').strip()
                             s_key = raw_s_name.lower()
@@ -114,27 +138,24 @@ OUTPUT FORMAT:
                             for i in i_list:
                                 i_key = i.strip().lower()
                                 if i_key not in sub_dict[s_key]["items"]:
-                                    sub_dict[s_key]["items"][i_key] = i.strip()  # Appends new item uniquely
+                                    sub_dict[s_key]["items"][i_key] = i.strip()
 
-                        # 3. Reconstruct the JSONB array format
+                                    # Reconstruct JSONB array
                         merged_subs = [{"subcategory_name": v["original_name"], "items": list(v["items"].values())} for
                                        v in sub_dict.values()]
 
-                        # 4. Push exact updated array to DB
+                        # Push exact updated array to DB
                         self.admin_db.table('categories').update({"subcategories": merged_subs}).eq('user_id',
                                                                                                     user_id).eq(
                             'category_name', actual_cat_name).execute()
                         db_map[cat_key]['subcategories'] = merged_subs
                     else:
-                        # ==========================================
-                        # INSERT COMPLETELY NEW CATEGORY ROW
-                        # ==========================================
+                        # Insert completely new category row
                         clean_subs = []
                         for ns in new_subs:
                             raw_s_name = ns.get('subcategory_name', 'General').strip()
                             i_list = ns.get('items', [])
 
-                            # Ensure no duplicates within the AI's own response
                             unique_items = list({i.strip().lower(): i.strip() for i in i_list}.values())
                             clean_subs.append({"subcategory_name": raw_s_name, "items": unique_items})
 
@@ -164,7 +185,6 @@ OUTPUT FORMAT:
         """Helper for Transaction AI Fallback to safely merge a single item into the JSONB array."""
         if not self.admin_db or not cat_name or not sub_name or not item_name: return
         try:
-            # Case insensitive search for the category row
             res = self.admin_db.table('categories').select('*').eq('user_id', user_id).ilike('category_name',
                                                                                              cat_name.strip()).execute()
 
@@ -175,11 +195,8 @@ OUTPUT FORMAT:
 
                 found_sub = False
                 for sub in existing_subs:
-                    # Case insensitive search for the subcategory
                     if sub.get('subcategory_name', '').strip().lower() == sub_name.strip().lower():
                         existing_items = [i.strip().lower() for i in sub.get('items', [])]
-
-                        # Only append if item is completely new
                         if item_name.strip().lower() not in existing_items:
                             sub['items'].append(item_name.strip())
                         found_sub = True
@@ -191,7 +208,6 @@ OUTPUT FORMAT:
                 self.admin_db.table('categories').update({"subcategories": existing_subs}).eq('user_id', user_id).eq(
                     'category_name', actual_cat_name).execute()
             else:
-                # Completely new category
                 new_subs = [{"subcategory_name": sub_name.strip(), "items": [item_name.strip()]}]
                 self.admin_db.table('categories').insert(
                     {"user_id": user_id, "category_name": cat_name.strip(), "subcategories": new_subs}).execute()
