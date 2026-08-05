@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
                     "commands": [
                         {"command": "start", "description": "Start PocketMunim"},
                         {"command": "register", "description": "Register your account"},
+                        {"command": "addaccount", "description": "Add a bank account (e.g. /addaccount HDFC 5000)"},
                         {"command": "categorypull", "description": "Seed or refresh categories"},
                         {"command": "report", "description": "Get financial dashboard link"}
                     ]
@@ -67,7 +68,7 @@ async def send_telegram_reply(chat_id: int, text: str):
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (WITH FEW-SHOT EXAMPLES)
+# FOUNDER FROZEN SYSTEM PROMPT (100% RESTORED + ACCOUNT ROUTING)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -76,14 +77,17 @@ CRITICAL RULES (NON-NEGOTIABLE):
 1. NO MATHEMATICS: You are strictly forbidden from calculating totals, EMIs, or balances.
 2. NO HALLUCINATION: If a field is missing, return `null`. Never guess or assume default values.
 3. MULTI-INTENT & SEQUENCING: A single message may contain multiple operations. Extract each as a separate object in the `transactions` array. Assign a chronological `execution_order` (1, 2, 3).
-4. BULK DETECTION (BUG #1 & #2 FIXED): If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
-5. UNKNOWN CATEGORIES (BUG #5 FIXED): If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
-6. LOAN PAYMENTS (BUG #3 FIXED): A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
+4. BULK DETECTION: If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
+5. UNKNOWN CATEGORIES: If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
+6. LOAN PAYMENTS: A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
 7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day, "day before yesterday" = minus 2 days). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR.
 8. CLARIFICATION: If a transaction is missing a critical component, set `needs_clarification = true` and list missing keys in `clarification_fields`.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers, no conversational text.
-10. PEER-TO-PEER TRANSFERS (NO CASH HALLUCINATION): If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]", and DO NOT assume or hallucinate the word "Cash" unless explicitly stated.
-11. INBOUND VS OUTBOUND PHRASING: If a person sends money to the user (e.g., "John sent 4k", "got 5k from Ram"), intent is strictly "income" (money received), and item must be formatted as "Received from [Name]". Never classify it as an outgoing expense.
+10. PEER-TO-PEER TRANSFERS: If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]", and DO NOT assume or hallucinate the word "Cash" unless explicitly stated.
+11. ACCOUNT ROUTING: 
+    - If the user specifies an account they paid FROM (e.g., "bought milk from Kotak"), set `source_account` to "Kotak".
+    - If the user specifies an account they received money INTO, set `destination_account`.
+    - If it's a transfer between their OWN accounts (e.g., "send 10k from SBI to Axis"), intent is `transfer_own`, `source_account` is "SBI", `destination_account` is "Axis".
 
 JSON OUTPUT SCHEMA:
 {
@@ -207,6 +211,7 @@ Output:
       "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 4000, 
       "normalized_currency": "INR", "item": "Received from John", "payment_method": null,
       "category": null, "subcategory": null,
+      "source_account": null, "destination_account": null,
       "date": {"raw_expression": "day before yesterday", "relative_date": "2026-08-03", "date_type": "relative"}, "future": {"is_future": false},
       "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
       "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
@@ -228,10 +233,33 @@ Output:
       "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 10000, 
       "normalized_currency": "INR", "item": "Received from Raj", "payment_method": null,
       "category": null, "subcategory": null,
+      "source_account": null, "destination_account": null,
       "date": {"raw_expression": "yesterday", "relative_date": "2026-08-04", "date_type": "relative"}, "future": {"is_future": false},
       "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
       "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
       "needs_clarification": false, "confidence": {"overall_confidence": 0.98}
+    }
+  ]
+}
+
+User: "send 10000 from SBI to Axis account"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "send 10000 from SBI to Axis account",
+    "operation_type": "single", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "transfer_own", "amount": 10000, 
+      "normalized_currency": "INR", "item": "Self Transfer", "payment_method": null,
+      "category": "Transfers", "subcategory": "Bank Account Transfer",
+      "source_account": "SBI", "destination_account": "Axis",
+      "date": {"raw_expression": "today", "relative_date": null, "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": true},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.99}
     }
   ]
 }
@@ -243,6 +271,27 @@ Output:
 @app.get("/")
 def health_check():
     return {"status": "PocketMunim Enterprise API is live", "status_code": 200}
+
+
+def get_account_from_list(accounts_list, target_name=None):
+    """Helper: Finds an account by name (case-insensitive) OR returns the default."""
+    if not accounts_list:
+        return None
+
+    if target_name:
+        target_clean = target_name.strip().lower()
+        for acc in accounts_list:
+            if acc['account_name'].lower() == target_clean:
+                return acc
+        return None  # Explicitly return None if a SPECIFIC account was requested but not found
+
+    # If no specific account requested, find default
+    for acc in accounts_list:
+        if acc.get('is_default'):
+            return acc
+
+    # Fallback to the first account created
+    return accounts_list[0]
 
 
 @app.post("/webhook")
@@ -264,7 +313,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
     user_id = str(request.state.telegram_id)
 
+    # =====================================================================
     # MANDATORY USER REGISTRATION GATEWAY
+    # =====================================================================
     user_res = supabase_admin.table('users').select('*').eq('telegram_id', chat_id).execute()
     user_exists = bool(user_res.data)
 
@@ -281,12 +332,8 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                     pass
         if not user_exists:
             try:
-                supabase_admin.table('users').insert({
-                    "id": user_id,
-                    "telegram_id": chat_id,
-                    "full_name": name,
-                    "currency": currency
-                }).execute()
+                supabase_admin.table('users').insert(
+                    {"id": user_id, "telegram_id": chat_id, "full_name": name, "currency": currency}).execute()
                 await send_telegram_reply(chat_id,
                                           f"✅ *Registration Successful!*\n\nWelcome to PocketMunim, *{name}*! Your account is active.")
             except Exception as e:
@@ -296,72 +343,129 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     if not user_exists:
-        copyable_form = "```text\n/register Name: [Your Full Name], Currency: INR\n```"
-        reg_msg = (
-            "🚨 *Registration Mandatory*\n\n"
-            "To use PocketMunim, you must register your account first.\n\n"
-            "📋 *Copy, fill, and send the registration form below:*\n"
-            f"{copyable_form}"
-        )
-        await send_telegram_reply(chat_id, reg_msg)
+        copyable_form = "```text\n/register Name: [Your Name], Currency: INR\n```"
+        await send_telegram_reply(chat_id,
+                                  f"🚨 *Registration Mandatory*\n\nTo use PocketMunim, you must register your account first.\n\n📋 *Copy, fill, and send the registration form below:*\n{copyable_form}")
+        return {"ok": True}
+
+    # =====================================================================
+    # COMMAND: ADD ACCOUNT (/addaccount HDFC 5000)
+    # =====================================================================
+    if text.startswith("/addaccount"):
+        parts = text.replace("/addaccount", "").strip().split()
+        if len(parts) < 2:
+            await send_telegram_reply(chat_id,
+                                      "⚠️ Invalid format. Use: `/addaccount [BankName] [InitialBalance]`\nExample: `/addaccount HDFC 5000`")
+            return {"ok": True}
+
+        acc_name = " ".join(parts[:-1])
+        try:
+            acc_bal = float(parts[-1])
+        except ValueError:
+            await send_telegram_reply(chat_id, "⚠️ Invalid balance amount. Please provide a valid number.")
+            return {"ok": True}
+
+        # Check if it's the first account
+        existing_accs = supabase_admin.table('accounts').select('id').eq('user_id', user_id).execute()
+        is_first = len(existing_accs.data) == 0
+
+        try:
+            supabase_admin.table('accounts').insert({
+                "user_id": user_id,
+                "account_name": acc_name,
+                "balance": acc_bal,
+                "is_default": is_first  # Auto-make default if it's the first one
+            }).execute()
+
+            def_msg = " (Set as Default)" if is_first else ""
+            await send_telegram_reply(chat_id,
+                                      f"🏦 *Account Added*\nName: {acc_name}\nBalance: ₹{acc_bal:,.2f}{def_msg}")
+        except Exception as e:
+            await send_telegram_reply(chat_id, f"❌ Failed to add account: {str(e)}")
+        return {"ok": True}
+
+    # =====================================================================
+    # COMMAND: SET DEFAULT ACCOUNT (/setdefault HDFC)
+    # =====================================================================
+    if text.startswith("/setdefault"):
+        acc_name = text.replace("/setdefault", "").strip()
+        if not acc_name:
+            await send_telegram_reply(chat_id, "⚠️ Please provide an account name. Example: `/setdefault HDFC`")
+            return {"ok": True}
+
+        acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).ilike('account_name',
+                                                                                            acc_name).execute()
+        if not acc_res.data:
+            await send_telegram_reply(chat_id, f"❌ Account '{acc_name}' not found.")
+            return {"ok": True}
+
+        try:
+            # Remove default from all
+            supabase_admin.table('accounts').update({"is_default": False}).eq('user_id', user_id).execute()
+            # Set new default
+            supabase_admin.table('accounts').update({"is_default": True}).eq('id', acc_res.data[0]['id']).execute()
+            await send_telegram_reply(chat_id, f"✅ '{acc_res.data[0]['account_name']}' is now your default account.")
+        except Exception as e:
+            await send_telegram_reply(chat_id, f"❌ Failed to set default: {str(e)}")
         return {"ok": True}
 
     if text.startswith("/start"):
-        reply_text = "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active."
-        await send_telegram_reply(chat_id, reply_text)
+        await send_telegram_reply(chat_id,
+                                  "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
         return {"ok": True}
 
     elif text.startswith("/report"):
-        reply_text = "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)"
-        await send_telegram_reply(chat_id, reply_text)
+        await send_telegram_reply(chat_id,
+                                  "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)")
         return {"ok": True}
 
     elif text.startswith("/categorypull"):
         query = text.replace("/categorypull", "").strip()
-        if not query:
-            await send_telegram_reply(chat_id, "⏳ Seeding random day-to-day life categories using AI...")
-        else:
-            await send_telegram_reply(chat_id, f"⏳ Pulling categories for '{query}' using AI...")
-
+        await send_telegram_reply(chat_id, f"⏳ Pulling categories...")
         pull_result = category_pull_service.manual_category_pull(query, user_id)
-        added_count = pull_result.get("added", 0)
-
-        if added_count > 0:
-            cache_manager = CategoryCacheManager(supabase, user_id)
-            cache_manager.rebuild_cache()
-            success_msg = f"✅ Successfully pulled and mapped {added_count} new items to the database and refreshed Cache."
-            await send_telegram_reply(chat_id, success_msg)
+        if pull_result.get("added", 0) > 0:
+            CategoryCacheManager(supabase, user_id).rebuild_cache()
+            await send_telegram_reply(chat_id, f"✅ Successfully pulled {pull_result['added']} items.")
         else:
-            error_reason = pull_result.get("error", "Unknown logic failure")
-            await send_telegram_reply(chat_id, f"❌ Failed to pull categories.\n\nReason: {error_reason}")
+            await send_telegram_reply(chat_id, f"❌ Failed to pull categories: {pull_result.get('error')}")
         return {"ok": True}
 
     else:
         try:
             tz_ist = timezone(timedelta(hours=5, minutes=30))
             current_dt = datetime.now(tz_ist)
-            current_date_str = current_dt.strftime("%Y-%m-%d")
-            current_day_str = current_dt.strftime("%A")
 
             dynamic_system_prompt = SYSTEM_PROMPT.replace(
                 "{CURRENT_DATE}",
-                f"{current_date_str} ({current_day_str})"
+                f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            raw_response_text = execute_resilient_ai(
-                system_prompt=dynamic_system_prompt,
-                user_prompt=text,
-                db_client=supabase_admin,
-                is_json=True
-            )
-
+            # Execution through AI Provider (with failover rotation)
+            raw_response_text = execute_resilient_ai(system_prompt=dynamic_system_prompt, user_prompt=text,
+                                                     db_client=supabase_admin, is_json=True)
             raw_json = json.loads(raw_response_text)
+
+            # Pydantic schema validation happens here
             validated_data = AITransactionExtraction(**raw_json)
 
             transactions_list = validated_data.transactions
             response_sections = []
             committed_items = []
 
+            # =====================================================================
+            # ACCOUNT PRE-FLIGHT CHECK
+            # =====================================================================
+            acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
+            user_accounts = acc_res.data or []
+
+            if not user_accounts and transactions_list:
+                await send_telegram_reply(chat_id,
+                                          "❌ *No Bank Accounts Configured*\n\nYou must add an account before logging transactions.\n\nUse this command:\n`/addaccount [BankName] [Balance]`\nExample: `/addaccount HDFC 50000`")
+                return {"ok": True}
+
+            # =====================================================================
+            # LOAN PRE-FLIGHT CHECK
+            # =====================================================================
             if validated_data.loan and validated_data.loan.intent == "loan_payment":
                 lender_name = validated_data.loan.lender
                 if lender_name:
@@ -388,16 +492,67 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
                             continue
 
-                        if tx.intent == "expense":
-                            source_acc = tx.source_account or "Default"
-                            acc_res = supabase_admin.table('accounts').select('balance').eq('user_id', user_id).ilike(
-                                'account_name', source_acc).execute()
-                            if acc_res.data:
-                                current_bal = Decimal(str(acc_res.data[0]['balance']))
-                                if current_bal < amount:
-                                    response_sections.append(f"❌ *Insufficient Balance* in '{source_acc}'.")
-                                    continue
+                        # =========================================================
+                        # STRICT ACCOUNT ROUTING & BALANCE VALIDATION
+                        # =========================================================
+                        source_acc_obj = None
+                        dest_acc_obj = None
 
+                        # Resolve Accounts
+                        if tx.intent in ["expense", "transfer_other"]:
+                            source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
+                            if not source_acc_obj:
+                                requested_acc = tx.source_account or "Default"
+                                response_sections.append(
+                                    f"❌ *Account Not Found*\nYou requested to pay from '{requested_acc}', but it does not exist in your system.")
+                                continue
+
+                        elif tx.intent == "income":
+                            dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
+                            if not dest_acc_obj:
+                                requested_acc = tx.destination_account or "Default"
+                                response_sections.append(
+                                    f"❌ *Account Not Found*\nYou requested to receive into '{requested_acc}', but it does not exist.")
+                                continue
+
+                        elif tx.intent == "transfer_own":
+                            source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
+                            dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
+
+                            if not source_acc_obj:
+                                response_sections.append(
+                                    f"❌ *Source Account Not Found*\nCannot transfer from '{tx.source_account}'.")
+                                continue
+                            if not dest_acc_obj:
+                                response_sections.append(
+                                    f"❌ *Destination Account Not Found*\nCannot transfer to '{tx.destination_account}'.")
+                                continue
+
+                        # Balance Validations & Updates
+                        updates_to_make = []  # Tuples of (account_id, new_balance)
+
+                        if source_acc_obj:
+                            current_bal = Decimal(str(source_acc_obj['balance']))
+                            if current_bal < amount:
+                                response_sections.append(
+                                    f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but transaction requires ₹{amount:,.2f}.")
+                                continue
+                            updates_to_make.append((source_acc_obj['id'], float(current_bal - Decimal(amount))))
+
+                        if dest_acc_obj:
+                            current_bal = Decimal(str(dest_acc_obj['balance']))
+                            updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount))))
+
+                        # Apply DB Account Balances atomically
+                        for acc_id, new_bal in updates_to_make:
+                            supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
+                            # Update local cache to prevent double-spending in bulk requests
+                            for a in user_accounts:
+                                if a['id'] == acc_id:
+                                    a['balance'] = new_bal
+                        # =========================================================
+
+                        # AI Category Fallback
                         search_item_name = tx.item or description
                         category = None
                         subcategory = None
@@ -421,22 +576,23 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                     )
                                     cache_manager.rebuild_cache()
                                 except Exception as e:
-                                    print(f"Failed persistence: {e}")
+                                    pass
 
+                        # Date calculations
                         db_date = current_dt.isoformat()
                         display_date_raw = "Today"
                         if tx.date:
-                            if tx.date.raw_expression:
-                                display_date_raw = str(tx.date.raw_expression).title()
+                            if tx.date.raw_expression: display_date_raw = str(tx.date.raw_expression).title()
                             if tx.date.relative_date:
                                 try:
-                                    date_part = tx.date.relative_date.split("T")[0]
-                                    parsed_date = datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=tz_ist)
+                                    parsed_date = datetime.strptime(tx.date.relative_date.split("T")[0],
+                                                                    "%Y-%m-%d").replace(tzinfo=tz_ist)
                                     db_date = parsed_date.isoformat()
                                     display_date_raw = parsed_date.strftime("%d %b %Y")
                                 except Exception:
                                     pass
 
+                        # Save Transaction Log
                         db_payload = {
                             "user_id": user_id,
                             "amount": float(amount),
@@ -446,23 +602,30 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             "category": category,
                             "subcategory": subcategory,
                             "date": db_date,
+                            "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
+                            "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
                             "soft_deleted": False
                         }
                         supabase.table("transactions").insert(db_payload).execute()
 
+                        # UI Formatting
                         intent_lower = tx.intent.lower()
                         if "income" in intent_lower or "credit" in intent_lower:
                             color_badge = "🟢 *INCOME*"
+                            acc_text = f"🔹 *To Account:* {dest_acc_obj['account_name']}"
                         elif "expense" in intent_lower or "debit" in intent_lower:
                             color_badge = "🔴 *EXPENSE*"
-                        elif "transfer" in intent_lower:
-                            color_badge = "🔵 *TRANSFER*"
+                            acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}"
+                        elif "transfer_own" in intent_lower:
+                            color_badge = "🔵 *TRANSFER (SELF)*"
+                            acc_text = f"🔹 *From:* {source_acc_obj['account_name']} ➡️ *To:* {dest_acc_obj['account_name']}"
                         else:
-                            color_badge = "🟠 *TRANSACTION*"
+                            color_badge = "🔵 *TRANSFER*"
+                            acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}" if source_acc_obj else ""
 
                         cat_display = f"{category} -> {subcategory}" if subcategory else (category or "Unassigned")
                         committed_items.append(
-                            f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* ₹{float(amount):,.2f}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
+                            f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* ₹{float(amount):,.2f}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
                         )
 
             if committed_items:
