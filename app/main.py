@@ -1,11 +1,13 @@
 import os
 import re
 import json
+import uuid
 import httpx
 import calendar
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from supabase import create_client, Client
 
@@ -29,6 +31,12 @@ supabase_admin: Client = create_client(SUPABASE_URL,
 
 # Initialize Phase 4 Category Services
 category_pull_service = CategoryPullService(None, supabase_admin)
+
+# In-memory secure report token store (Token -> {user_id, expires_at})
+REPORT_TOKENS = {}
+
+# Timezone Helper
+TZ_IST = timezone(timedelta(hours=5, minutes=30))
 
 # =====================================================================
 # SECURITY: WEB APPLICATION FIREWALL (WAF) PATTERN
@@ -54,7 +62,7 @@ async def lifespan(app: FastAPI):
                         {"command": "register", "description": "Register your account"},
                         {"command": "addaccount", "description": "Add a bank account"},
                         {"command": "categorypull", "description": "Seed or refresh categories"},
-                        {"command": "report", "description": "Get financial dashboard"},
+                        {"command": "report", "description": "Get 1-hour secure AI HTML dashboard report"},
                         {"command": "monthly", "description": "Get monthly P&L (e.g. /monthly Jan 2025)"},
                         {"command": "history", "description": "Get template for bulk past entries"}
                     ]
@@ -151,7 +159,7 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (WITH RULES 8 & 13 REINSTATED)
+# FOUNDER FROZEN SYSTEM PROMPT
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -166,13 +174,13 @@ CRITICAL RULES (NON-NEGOTIABLE):
 7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. Calculate relative dates strictly in YYYY-MM-DD. For "last month", "last year", or "last week", subtract exactly that interval from today (e.g., Aug 5 minus 1 month is Jul 5). DO NOT default to the 1st of the month.
 8. CLARIFICATION STRICTNESS: You MUST NOT set needs_clarification = true unless the AMOUNT is missing or Rule 12 applies. Never ask for missing accounts, categories, or payment methods.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers.
-10. PEER-TO-PEER TRANSFERS: If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]".
+10. PEER-TO-PEER TRANSFERS / INCOME SOURCES: If a user receives money (e.g., "got 10k from raj" or "received extra income of 50"), set intent to "income". If the source name/person is missing (e.g., generic "extra income" without a donor/company), you MUST set `needs_clarification = true` and `clarification_fields = ["source name"]`.
 11. ACCOUNT ROUTING: 
     - If user specifies an account paid FROM (e.g., "bought milk from Kotak"), set `source_account` to "Kotak".
     - If user specifies an account received INTO, set `destination_account`.
     - If transfer between OWN accounts ("send 10k from SBI to Axis"), intent is `transfer_own`, `source_account` is "SBI", `destination_account` is "Axis".
 12. GENERIC NAMES: If a transaction involves a person but uses a generic term (e.g., "friend", "brother", "mitra", "dost", "vendor") instead of a specific name, you MUST set `needs_clarification = true` and ask for the specific name.
-13. PAST RECURRING: Do NOT mark `future.is_future = true` for recurring transactions that started in the past (e.g., "daily milk from 1st jan"). Only mark future for one-time explicit future dates.
+13. PAST RECURRING: For inputs like "every month on 17th from jun 2025", set recurrence.enabled = true, extract frequency (e.g. 'monthly'), and set start_date strictly in YYYY-MM-DD (e.g. '2025-06-17'). Do NOT mark future.is_future = true if the start date is in the past.
 
 JSON OUTPUT SCHEMA:
 {
@@ -305,7 +313,27 @@ Output:
   ]
 }
 
-User: "got 10k from raj yesterday"
+User: "received extra income of 50"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "received extra income of 50",
+    "operation_type": "single", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": false, "unsupported_chat": false, "account_required": false
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 50, 
+      "normalized_currency": "INR", "item": "Extra Income", "payment_method": null,
+      "category": "Income", "subcategory": "Other Income",
+      "source_account": null, "destination_account": null,
+      "date": {"raw_expression": "today", "relative_date": null, "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": true, "clarification_fields": ["source name"], "confidence": {"overall_confidence": 0.95}
+    }
+  ]
+  User: "got 10k from raj yesterday"
 Output:
 {
   "metadata": {
@@ -371,6 +399,137 @@ def get_account_from_list(accounts_list, target_name=None):
     return accounts_list[0]
 
 
+# =====================================================================
+# DYNAMIC NEXT-LEVEL AI HTML REPORT ENDPOINT (1-Hour Expiry)
+# =====================================================================
+@app.get("/report/view/{token}", response_class=HTMLResponse)
+async def view_report(token: str):
+    token_data = REPORT_TOKENS.get(token)
+    if not token_data:
+        raise HTTPException(status_code=404, detail="Report link expired or invalid.")
+
+    if datetime.now(TZ_IST) > token_data["expires_at"]:
+        del REPORT_TOKENS[token]
+        raise HTTPException(status_code=410, detail="Report link has expired (1-hour validity exceeded).")
+
+    user_id = token_data["user_id"]
+
+    # Fetch user details
+    user_res = supabase_admin.table('users').select('*').eq('id', user_id).execute()
+    user_name = user_res.data[0]['full_name'] if user_res.data else "Valued User"
+
+    # Fetch accounts
+    acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
+    accounts = acc_res.data or []
+    total_balance = sum(float(a['balance']) for a in accounts)
+
+    # Fetch transactions
+    txn_res = supabase_admin.table('transactions').select('*').eq('user_id', user_id).eq('soft_deleted', False).order(
+        'date', desc=True).execute()
+    txns = txn_res.data or []
+
+    total_income = sum(float(t['amount']) for t in txns if t['txn_type'] == 'income')
+    total_expense = sum(float(t['amount']) for t in txns if t['txn_type'] == 'expense')
+    net_savings = total_income - total_expense
+
+    # Build HTML with Next-Level AI Styling, Phases, and Vibrant Colors
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>PocketMunim AI Financial Intelligence Report</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+    </head>
+    <body class="bg-slate-950 text-slate-100 min-h-screen py-10 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-5xl mx-auto space-y-8">
+            <!-- Header Phase -->
+            <div class="bg-gradient-to-r from-indigo-900 via-purple-900 to-slate-900 border border-indigo-500/30 rounded-3xl p-8 shadow-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+                <div>
+                    <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/20 text-indigo-300 text-xs font-semibold mb-3">
+                        <span class="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
+                        AI Intelligence Report &bull; Ishita Financial Intelligence (I) Pvt Ltd
+                    </div>
+                    <h1 class="text-3xl font-bold tracking-tight text-white">Financial Dashboard: {user_name}</h1>
+                    <p class="text-slate-400 text-sm mt-1">Generated live on {datetime.now(TZ_IST).strftime('%d %B %Y, %I:%M %p')} IST (Expires in 1 Hour)</p>
+                </div>
+                <div class="bg-slate-900/80 border border-slate-700/60 rounded-2xl p-4 text-right">
+                    <p class="text-xs text-slate-400 font-medium">Net Worth / Balance</p>
+                    <p class="text-2xl font-extrabold text-emerald-400">₹{total_balance:,.2f}</p>
+                </div>
+            </div>
+
+            <!-- Metrics Phase -->
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-6">
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-lg border-l-4 border-l-emerald-500">
+                    <p class="text-sm font-medium text-slate-400">Total Income</p>
+                    <p class="text-2xl font-bold text-emerald-400 mt-2">₹{total_income:,.2f}</p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-lg border-l-4 border-l-rose-500">
+                    <p class="text-sm font-medium text-slate-400">Total Expenses</p>
+                    <p class="text-2xl font-bold text-rose-400 mt-2">₹{total_expense:,.2f}</p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-lg border-l-4 border-l-cyan-500">
+                    <p class="text-sm font-medium text-slate-400">Net Savings</p>
+                    <p class="text-2xl font-bold text-cyan-400 mt-2">₹{net_savings:,.2f}</p>
+                </div>
+            </div>
+
+            <!-- Accounts Phase -->
+            <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-xl">
+                <h2 class="text-xl font-bold text-white mb-4">Linked Bank Accounts</h2>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {"".join([f'''<div class="bg-slate-950 border border-slate-800 p-4 rounded-xl flex justify-between items-center">
+                        <span class="font-semibold text-slate-200">{acc["account_name"]}</span>
+                        <span class="font-mono text-emerald-400">₹{float(acc["balance"]):,.2f}</span>
+                    </div>''' for acc in accounts])}
+                </div>
+            </div>
+
+            <!-- Transactions Ledger Phase -->
+            <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-xl">
+                <h2 class="text-xl font-bold text-white mb-4">Transaction History</h2>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-sm text-slate-300">
+                        <thead class="bg-slate-950 text-slate-400 uppercase text-xs tracking-wider border-b border-slate-800">
+                            <tr>
+                                <th class="py-3 px-4">Date</th>
+                                <th class="py-3 px-4">Description</th>
+                                <th class="py-3 px-4">Category</th>
+                                <th class="py-3 px-4">Type</th>
+                                <th class="py-3 px-4 text-right">Amount</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800">
+                            {"".join([f'''<tr class="hover:bg-slate-800/50">
+                                <td class="py-3 px-4 text-slate-400">{datetime.fromisoformat(t["date"].replace('Z', '+00:00')).astimezone(TZ_IST).strftime('%d %b %Y')}</td>
+                                <td class="py-3 px-4 font-medium text-white">{t["description"]}</td>
+                                <td class="py-3 px-4 text-slate-400">{t["category"] or "Unassigned"}</td>
+                                <td class="py-3 px-4"><span class="px-2 py-1 rounded-full text-xs font-semibold {'bg-emerald-500/20 text-emerald-300' if t['txn_type'] == 'income' else 'bg-rose-500/20 text-rose-300'}">{t["txn_type"].upper()}</span></td>
+                                <td class="py-3 px-4 text-right font-mono {'text-emerald-400' if t['txn_type'] == 'income' else 'text-rose-400'}">{'+' if t['txn_type'] == 'income' else '-'}₹{float(t["amount"]):,.2f}</td>
+                            </tr>''' for t in txns[:50]])}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Footer Phase -->
+            <div class="text-center text-xs text-slate-500 pt-4">
+                &copy; 2026 Ishita Financial Intelligence (I) Private Limited. All rights reserved. Powered by PocketMunim AI.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+# =====================================================================
+# WEBHOOK HANDLER
+# =====================================================================
 @app.post("/webhook")
 async def telegram_webhook(request: Request, authorized: bool = Depends(authenticate_telegram_request)):
     try:
@@ -419,7 +578,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     # =====================================================================
-    # MANDATORY REGISTRATION GATEWAY & HARDENED VALIDATION
+    # MANDATORY REGISTRATION GATEWAY & SALARY STRUCTURING
     # =====================================================================
     if not user_exists and not text.startswith("/register"):
         copyable_form = "```text\n/register\nName: [Your Name]\nCurrency: INR\nMonthly Salary: [Amount]\nBank Account: [Bank Name]\nCurrent Balance: [Amount]\n```"
@@ -428,11 +587,10 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     if text.startswith("/register"):
-        # Strict validation against placeholder brackets or blank forms
         if "[" in text or "]" in text or "Your Name" in text or len(text.replace("/register", "").strip()) < 10:
             copyable_form = "```text\n/register\nName: [Your Name]\nCurrency: INR\nMonthly Salary: [Amount]\nBank Account: [Bank Name]\nCurrent Balance: [Amount]\n```"
             await send_telegram_reply(chat_id,
-                                      f"⚠️ *Invalid or Incomplete Registration Form*\n\nPlease fill in all required fields properly (do not leave placeholder brackets like `[Your Name]`).\n\n📋 *Copy and fill this form:*\n{copyable_form}")
+                                      f"⚠️ *Invalid or Incomplete Registration Form*\n\nPlease fill in all required fields properly without placeholder brackets.\n\n📋 *Copy and fill this form:*\n{copyable_form}")
             return {"ok": True}
 
         lines = text.split("\n")
@@ -457,10 +615,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 except:
                     pass
 
-        # Hardened check to ensure real information was provided
         if not name or monthly_salary is None or not bank_name or current_balance is None:
             await send_telegram_reply(chat_id,
-                                      "❌ *Registration Failed*\n\nMissing required fields (Name, Monthly Salary, Bank Account, or Current Balance). Please use the `/history` or registration template correctly.")
+                                      "❌ *Registration Failed*\n\nMissing required fields. Please ensure Name, Monthly Salary, Bank Account, and Current Balance are provided.")
             return {"ok": True}
 
         if not user_exists:
@@ -474,8 +631,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 }).execute()
                 acc_id = acc_res.data[0]['id']
 
-                tz_ist = timezone(timedelta(hours=5, minutes=30))
-                current_dt = datetime.now(tz_ist)
+                current_dt = datetime.now(TZ_IST)
                 current_year = current_dt.year
                 current_month = current_dt.month
 
@@ -486,12 +642,24 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         last_day = calendar.monthrange(current_year, m)[1]
                         salary_date = current_dt.replace(year=current_year, month=m, day=last_day, hour=23, minute=59,
                                                          second=59)
+                        month_name = salary_date.strftime('%b %Y')
 
+                        # Populate salaries table
+                        supabase_admin.table('salaries').insert({
+                            "user_id": user_id,
+                            "year": current_year,
+                            "month_number": m,
+                            "month_name": month_name,
+                            "amount": monthly_salary,
+                            "is_deducted": False
+                        }).execute()
+
+                        # Populate transactions table with explicit category/subcategory (Observation 2 & 3)
                         supabase_admin.table('transactions').insert({
                             "user_id": user_id,
                             "amount": monthly_salary,
                             "txn_type": "income",
-                            "description": f"Salary for {salary_date.strftime('%b %Y')}",
+                            "description": f"Salary for {month_name}",
                             "intent": "income",
                             "category": "Income",
                             "subcategory": "Salary",
@@ -550,8 +718,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id, "⚠️ Invalid amount.")
             return {"ok": True}
 
-        tz_ist = timezone(timedelta(hours=5, minutes=30))
-        current_dt = datetime.now(tz_ist)
+        current_dt = datetime.now(TZ_IST)
         target_months = []
         target_year = current_dt.year
 
@@ -581,28 +748,48 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         for m in target_months:
             last_day = calendar.monthrange(target_year, m)[1]
             salary_date = current_dt.replace(year=target_year, month=m, day=last_day, hour=23, minute=59, second=59)
-            start_of_month = current_dt.replace(year=target_year, month=m, day=1, hour=0, minute=0, second=0)
+            month_name = salary_date.strftime('%b %Y')
 
-            existing_tx = supabase_admin.table('transactions').select('*') \
+            # Check salaries table
+            sal_check = supabase_admin.table('salaries').select('*') \
                 .eq('user_id', user_id) \
-                .eq('subcategory', 'Salary') \
-                .gte('date', start_of_month.isoformat()) \
-                .lt('date', (start_of_month + timedelta(days=32)).replace(day=1).isoformat()) \
+                .eq('year', target_year) \
+                .eq('month_number', m) \
                 .execute()
 
-            if existing_tx.data:
-                tx_id = existing_tx.data[0]['id']
-                old_amount = float(existing_tx.data[0]['amount'])
+            if sal_check.data:
+                sal_id = sal_check.data[0]['id']
+                old_amount = float(sal_check.data[0]['amount'])
+                if sal_check.data[0]['is_deducted']:
+                    await send_telegram_reply(chat_id,
+                                              f"⚠️ Salary for {month_name} has already been deducted and cannot be modified directly.")
+                    continue
                 diff = new_amount - old_amount
                 balance_adjustment += diff
-                supabase_admin.table('transactions').update({"amount": new_amount}).eq("id", tx_id).execute()
+                supabase_admin.table('salaries').update({"amount": new_amount}).eq("id", sal_id).execute()
+
+                # Update corresponding transaction
+                supabase_admin.table('transactions').update({"amount": new_amount}) \
+                    .eq('user_id', user_id) \
+                    .eq('subcategory', 'Salary') \
+                    .eq('date', salary_date.isoformat()) \
+                    .execute()
             else:
                 balance_adjustment += new_amount
+                supabase_admin.table('salaries').insert({
+                    "user_id": user_id,
+                    "year": target_year,
+                    "month_number": m,
+                    "month_name": month_name,
+                    "amount": new_amount,
+                    "is_deducted": False
+                }).execute()
+
                 supabase_admin.table('transactions').insert({
                     "user_id": user_id,
                     "amount": new_amount,
                     "txn_type": "income",
-                    "description": f"Salary for {salary_date.strftime('%b %Y')}",
+                    "description": f"Salary for {month_name}",
                     "intent": "income",
                     "category": "Income",
                     "subcategory": "Salary",
@@ -631,7 +818,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     # =====================================================================
-    # NLP OVERRIDE: DEDUCT ALL AMOUNT OF [MONTH]
+    # NLP OVERRIDE: DEDUCT ALL AMOUNT OF [MONTH] (With Hard Block for Double Deduction)
     # =====================================================================
     deduct_all_match = re.match(r"^deduct all amount of ([a-zA-Z]+)$", text, re.IGNORECASE)
     if deduct_all_match:
@@ -645,25 +832,29 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             return {"ok": True}
 
         target_m = int(month_map[month_str])
-        tz_ist = timezone(timedelta(hours=5, minutes=30))
-        current_dt = datetime.now(tz_ist)
+        current_dt = datetime.now(TZ_IST)
         target_year = current_dt.year
 
-        start_of_month = current_dt.replace(year=target_year, month=target_m, day=1, hour=0, minute=0, second=0)
-
-        existing_tx = supabase_admin.table('transactions').select('*') \
+        # Check salaries table
+        sal_res = supabase_admin.table('salaries').select('*') \
             .eq('user_id', user_id) \
-            .eq('subcategory', 'Salary') \
-            .gte('date', start_of_month.isoformat()) \
-            .lt('date', (start_of_month + timedelta(days=32)).replace(day=1).isoformat()) \
+            .eq('year', target_year) \
+            .eq('month_number', target_m) \
             .execute()
 
-        if not existing_tx.data:
-            await send_telegram_reply(chat_id,
-                                      f"❌ No salary found for {month_str.title()} {target_year} to deduct from.")
+        if not sal_res.data:
+            await send_telegram_reply(chat_id, f"❌ No salary record found for {month_str.title()} {target_year}.")
             return {"ok": True}
 
-        salary_amount = float(existing_tx.data[0]['amount'])
+        sal_record = sal_res.data[0]
+
+        # HARD BLOCK FOR DOUBLE DEDUCTION (Observation 4)
+        if sal_record['is_deducted']:
+            await send_telegram_reply(chat_id,
+                                      f"❌ *Hard Block Activated*\n\nSalary for **{month_str.title()} {target_year}** (₹{float(sal_record['amount']):,.2f}) has **already been fully deducted**. Duplicate deductions are strictly blocked.")
+            return {"ok": True}
+
+        salary_amount = float(sal_record['amount'])
 
         acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).eq('is_default', True).execute()
         if not acc_res.data:
@@ -678,6 +869,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         last_day = calendar.monthrange(target_year, target_m)[1]
         expense_date = current_dt.replace(year=target_year, month=target_m, day=last_day, hour=23, minute=59, second=59)
 
+        # Insert expense transaction
         supabase_admin.table('transactions').insert({
             "user_id": user_id,
             "amount": salary_amount,
@@ -691,6 +883,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             "destination_account": None,
             "soft_deleted": False
         }).execute()
+
+        # Mark salary as deducted in salaries table
+        supabase_admin.table('salaries').update({"is_deducted": True}).eq("id", sal_record['id']).execute()
 
         new_bal = current_bal - salary_amount
         supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", default_acc['id']).execute()
@@ -706,6 +901,25 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
         await send_telegram_reply(chat_id,
                                   f"✅ Deducted ₹{salary_amount:,.2f} for {month_str.title()} successfully.\nNew Balance: ₹{new_bal:,.2f}")
+        return {"ok": True}
+
+    # =====================================================================
+    # COMMAND: /REPORT (Generates 1-Hour Secure Dynamic HTML Link)
+    # =====================================================================
+    elif text.startswith("/report"):
+        token = str(uuid.uuid4())
+        expires_at = datetime.now(TZ_IST) + timedelta(hours=1)
+        REPORT_TOKENS[token] = {"user_id": user_id, "expires_at": expires_at}
+
+        report_url = f"https://{request.url.hostname}/report/view/{token}" if request.url.hostname else f"http://localhost:8000/report/view/{token}"
+
+        response_msg = (
+            f"📊 *Next-Level AI Financial Report Generated*\n\n"
+            f"Your interactive HTML report is ready with phase-by-phase analytics and color-coded metrics.\n\n"
+            f"🔗 [View Downloadable Report]({report_url})\n\n"
+            f"⏰ *Note:* This secure link will automatically expire in **1 hour**."
+        )
+        await send_telegram_reply(chat_id, response_msg)
         return {"ok": True}
 
     # =====================================================================
@@ -761,11 +975,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     elif text.startswith("/start"):
         await send_telegram_reply(chat_id,
                                   "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
-        return {"ok": True}
-
-    elif text.startswith("/report"):
-        await send_telegram_reply(chat_id,
-                                  "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)")
         return {"ok": True}
 
     elif text.startswith("/categorypull"):
@@ -837,8 +1046,7 @@ Electricity for Jan 2025 was 2000 paid from SBI
     # =====================================================================
     else:
         try:
-            tz_ist = timezone(timedelta(hours=5, minutes=30))
-            current_dt = datetime.now(tz_ist)
+            current_dt = datetime.now(TZ_IST)
 
             dynamic_system_prompt = SYSTEM_PROMPT.replace(
                 "{CURRENT_DATE}",
@@ -884,8 +1092,12 @@ Electricity for Jan 2025 was 2000 paid from SBI
                             response_sections.append(f"🗓️ '{description}' identified as a future plan.")
                             continue
 
+                        # Check if clarification is needed (e.g. missing income source - Observation 5)
                         if not tx.intent or tx.needs_clarification:
-                            response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
+                            missing = ", ".join(
+                                tx.clarification_fields) if tx.clarification_fields else "Intent/Details"
+                            response_sections.append(
+                                f"⚠️ Could not process '{description}'. Please clarify: {missing}.")
                             continue
 
                         # =========================================================
@@ -901,7 +1113,7 @@ Electricity for Jan 2025 was 2000 paid from SBI
                             if tx.recurrence.end_date:
                                 try:
                                     end_dt = datetime.strptime(tx.recurrence.end_date.split("T")[0],
-                                                               "%Y-%m-%d").replace(tzinfo=tz_ist)
+                                                               "%Y-%m-%d").replace(tzinfo=TZ_IST)
                                     tx_dates = [d for d in tx_dates if d <= end_dt]
                                 except Exception:
                                     pass
@@ -914,7 +1126,7 @@ Electricity for Jan 2025 was 2000 paid from SBI
                             if tx.date and tx.date.relative_date:
                                 try:
                                     db_date_obj = datetime.strptime(tx.date.relative_date.split("T")[0],
-                                                                    "%Y-%m-%d").replace(tzinfo=tz_ist)
+                                                                    "%Y-%m-%d").replace(tzinfo=TZ_IST)
                                 except Exception:
                                     pass
                             tx_dates = [db_date_obj]
