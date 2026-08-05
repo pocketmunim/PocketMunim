@@ -30,7 +30,6 @@ class BulkTransactionService:
 
         for tx in transactions_list:
             description = str(tx.item or tx.merchant or "Item").title()
-
             amount = tx.amount if tx.amount else Decimal('0.00')
 
             # Capture Ignored Items precisely
