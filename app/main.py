@@ -18,17 +18,33 @@ app = FastAPI()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 GROQ_API_KEYS = os.getenv("GROQ_API_KEYS", "").split(",")
 
-# Initialize Supabase Client
+# Initialize Supabase Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# Admin client to bypass RLS/Auth for background/manual seeding
+supabase_admin: Client = create_client(SUPABASE_URL,
+                                       SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else supabase
 
 # Initialize Groq Client
 active_groq_key = GROQ_API_KEYS[0].strip() if GROQ_API_KEYS and GROQ_API_KEYS[0] else os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=active_groq_key) if active_groq_key else None
 
 # Initialize Phase 4 Category Services
-category_pull_service = CategoryPullService(groq_client)
+category_pull_service = CategoryPullService(groq_client, supabase_admin)
+
+
+# =====================================================================
+# HELPER: SEND TELEGRAM MESSAGE IMMEDIATELY
+# =====================================================================
+async def send_telegram_reply(chat_id: int, text: str):
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json={"chat_id": chat_id, "text": text})
+
 
 # =====================================================================
 # FOUNDER FROZEN SYSTEM PROMPT (STRICTLY UNMODIFIED)
@@ -268,15 +284,49 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
+    user_id = request.state.telegram_id
     reply_text = "System processing error."
 
     # 1. Handle System Commands
     if text.startswith("/start"):
         reply_text = "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active. Send your expenses naturally (e.g., *milk 40* or *dinner 450*)."
+        await send_telegram_reply(chat_id, reply_text)
+        return {"ok": True}
+
     elif text.startswith("/report"):
         reply_text = "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)"
+        await send_telegram_reply(chat_id, reply_text)
+        return {"ok": True}
 
-    # 2. Handle Financial NLP Extraction & Multi-Intent Routing
+    # =====================================================================
+    # 2. COMMAND: ON-DEMAND CATEGORY SEEDING (/categorypull)
+    # =====================================================================
+    elif text.startswith("/categorypull"):
+        query = text.replace("/categorypull", "").strip()
+
+        if not query:
+            await send_telegram_reply(chat_id,
+                                      "⏳ Seeding random day-to-day life categories (Household, Medicines, etc.) using AI...")
+        else:
+            await send_telegram_reply(chat_id, f"⏳ Pulling categories for '{query}' using AI...")
+
+        # Trigger pull and save to DB via CategoryPullService
+        added_count = category_pull_service.manual_category_pull(query, user_id)
+
+        if added_count > 0:
+            # Refresh In-Memory RAM Cache immediately
+            cache_manager = CategoryCacheManager(supabase, user_id)
+            cache_manager.rebuild_cache()
+            success_msg = f"✅ Successfully pulled and saved {added_count} items to the database and refreshed In-Memory Cache."
+            await send_telegram_reply(chat_id, success_msg)
+        else:
+            await send_telegram_reply(chat_id, f"❌ Failed to find or parse categories.")
+
+        return {"ok": True}
+
+    # =====================================================================
+    # 3. STANDARD TRANSACTION PROCESSING (The Phase 4 Waterfall)
+    # =====================================================================
     else:
         try:
             if not groq_client:
@@ -298,7 +348,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             validated_data = AITransactionExtraction(**raw_json)
 
             transactions_list = validated_data.transactions
-            user_id = request.state.telegram_id
             response_sections = []
             committed_items = []
 
@@ -311,48 +360,48 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
                     if amount > Decimal('0.00'):
 
-                        # Future Transaction Interceptor
+                        # Rule 29: Future Transaction Interceptor
                         if tx.future and tx.future.is_future:
                             response_sections.append(
                                 f"🗓️ '{description}' identified as a future plan. Budget intelligence will activate in Phase 9.")
                             continue
 
-                        # Clarification Rule
+                        # Strict Clarification Rule
                         if not tx.intent or tx.needs_clarification:
                             clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
                             response_sections.append(clarification_msg)
                             continue
 
                         # =========================================================
-                        # PHASE 4: PURE DYNAMIC CATEGORY SOURCING (ZERO HARDCODING)
+                        # PHASE 4: DYNAMIC WATERFALL (RAM -> DB -> AI -> REBUILD)
                         # =========================================================
                         search_item_name = tx.item or description
                         category = None
                         source_origin = "Unresolved"
 
-                        # Tier 1: Check In-Memory JSONB Cache
+                        # TIER 1: Check In-Memory JSONB RAM Cache
                         cached_match = cache_manager.search_item(search_item_name)
                         if cached_match and cached_match.get("category"):
                             category = cached_match["category"]
-                            source_origin = "In-Memory JSONB Cache"
+                            source_origin = "Tier 1: In-Memory RAM Cache"
                         else:
-                            # Tier 2: Check Relational Database (`categories` table)
+                            # TIER 2: Check Relational Database (`categories` table)
                             try:
                                 db_res = supabase.table('categories').select('*').eq('user_id', user_id).ilike('name',
                                                                                                                search_item_name).execute()
                                 if db_res.data and db_res.data[0].get('category'):
                                     category = db_res.data[0].get('category')
-                                    source_origin = "Relational Database Table"
+                                    source_origin = "Tier 2: Relational DB"
                             except Exception:
                                 pass
 
-                        # Tier 3: AI Fallback (CategoryPullService) if still not found
+                        # TIER 3: AI Fallback Fetch
                         if not category:
                             ai_classified = category_pull_service.classify_item(search_item_name)
                             category = ai_classified.get("category")
-                            source_origin = "AI Fallback (CategoryPullService)"
+                            source_origin = "Tier 3: AI Fallback"
 
-                            # Auto-persist newly discovered category to DB and rebuild cache if valid
+                            # IF FOUND BY AI -> Persist to DB -> REBUILD RAM CACHE
                             if category:
                                 try:
                                     new_cat_payload = {
@@ -362,13 +411,14 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                         "category": category
                                     }
                                     supabase.table('categories').insert(new_cat_payload).execute()
+
+                                    # Refresh Cache dynamically so subsequent identical items hit RAM
                                     cache_manager.rebuild_cache()
                                 except Exception:
                                     pass
 
-                        # Log source to Vercel runtime console
                         print(
-                            f"[CATEGORY SOURCE] Item: '{search_item_name}' | Resolved Category: '{category}' | Loaded From: {source_origin}")
+                            f"[CATEGORY SOURCE] Item: '{search_item_name}' | Category: '{category}' | Origin: {source_origin}")
 
                         db_payload = {
                             "user_id": user_id,
@@ -395,19 +445,10 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             else:
                 reply_text = "\n\n".join(response_sections)
 
+            await send_telegram_reply(chat_id, reply_text)
+
         except Exception as e:
             reply_text = f"Error processing intent through NLP engine: {str(e)}"
-
-    # Send Outbound Reply via Telegram Bot API
-    if TELEGRAM_BOT_TOKEN:
-        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                telegram_url,
-                json={
-                    "chat_id": chat_id,
-                    "text": reply_text
-                }
-            )
+            await send_telegram_reply(chat_id, reply_text)
 
     return {"ok": True}
