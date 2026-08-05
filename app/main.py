@@ -541,14 +541,30 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                 response_sections.append(
                                     f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but transaction requires ₹{amount:,.2f}.")
                                 continue
-                            updates_to_make.append((source_acc_obj['id'], float(current_bal - Decimal(amount))))
+                            updates_to_make.append(
+                                (source_acc_obj['id'], float(current_bal - Decimal(amount)), "DEBIT"))
 
                         if dest_acc_obj:
                             current_bal = Decimal(str(dest_acc_obj['balance']))
-                            updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount))))
+                            updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount)), "CREDIT"))
 
-                        for acc_id, new_bal in updates_to_make:
+                        for acc_id, new_bal, log_type in updates_to_make:
                             supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
+
+                            # --- NEW ACCOUNT LOGGING LOGIC ---
+                            try:
+                                supabase_admin.table('account_logs').insert({
+                                    "account_id": acc_id,
+                                    "user_id": user_id,
+                                    "log_type": log_type,
+                                    "amount": float(amount),
+                                    "balance_after": new_bal,
+                                    "description": description
+                                }).execute()
+                            except Exception as e:
+                                pass
+                            # ---------------------------------
+
                             for a in user_accounts:
                                 if a['id'] == acc_id: a['balance'] = new_bal
 
