@@ -15,23 +15,43 @@ class BulkTransactionService:
         unique_payloads = []
         pending_duplicates = []
         breakdown = []
+        ignored = []
 
         totals = {
             "expenses": Decimal('0.00'),
             "income": Decimal('0.00'),
             "transfers": Decimal('0.00')
         }
+        counts = {
+            "expenses": 0,
+            "income": 0,
+            "transfers": 0
+        }
 
         for tx in transactions_list:
+            description = str(tx.item or tx.merchant or "Item").title()
+
             amount = tx.amount if tx.amount else Decimal('0.00')
+
+            # Capture Ignored Items precisely
             if amount <= Decimal('0.00'):
+                ignored.append(f"• {description} (Zero or missing amount)")
                 continue
 
-            description = str(tx.item or tx.merchant or "Item").title()
-            intent = tx.intent or "expense"
+            if tx.future and tx.future.is_future:
+                ignored.append(f"• {description} (Future/Planned item skipped)")
+                continue
 
+            if not tx.intent or tx.needs_clarification:
+                missing = ", ".join(tx.clarification_fields) if tx.clarification_fields else "Intent"
+                ignored.append(f"• {description} (Needs Clarification: {missing})")
+                continue
+
+            intent = tx.intent.lower()
             category = tx.category
             subcategory = tx.subcategory
+
+            # Category Resolution
             if not category:
                 cached = self.cache_manager.search_item(description)
                 if cached and cached.get("category"):
@@ -69,19 +89,27 @@ class BulkTransactionService:
                 })
             else:
                 unique_payloads.append(payload)
+                cat_disp = f"{category} -> {subcategory}" if subcategory else category
+
+                # Tabulate Totals & Counts
                 if intent == "expense" or intent == "transfer_other":
                     totals["expenses"] += amount
+                    counts["expenses"] += 1
+                    breakdown.append(f"🔴 {description}: ₹{float(amount):,.2f} ({cat_disp})")
                 elif intent == "income":
                     totals["income"] += amount
+                    counts["income"] += 1
+                    breakdown.append(f"🟢 {description}: ₹{float(amount):,.2f} ({cat_disp})")
                 elif intent == "transfer_own":
                     totals["transfers"] += amount
-
-                cat_disp = f"{category} -> {subcategory}" if subcategory else category
-                breakdown.append(f"• {description}: ₹{float(amount):,.2f} ({cat_disp})")
+                    counts["transfers"] += 1
+                    breakdown.append(f"🔵 {description}: ₹{float(amount):,.2f} ({cat_disp})")
 
         return {
             "unique": unique_payloads,
             "duplicates": pending_duplicates,
             "totals": totals,
-            "breakdown": breakdown
+            "counts": counts,
+            "breakdown": breakdown,
+            "ignored": ignored
         }
