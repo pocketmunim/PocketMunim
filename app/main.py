@@ -253,16 +253,18 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     user_res = supabase_admin.table('users').select('*').eq('telegram_id', chat_id).execute()
     user_exists = bool(user_res.data)
 
-    # Handle /register command explicitly
     if text.startswith("/register"):
         reg_parts = text.replace("/register", "").strip()
-        # Expecting format: Name: John Doe, Currency: INR
         name = "PocketMunim User"
         currency = "INR"
 
         if reg_parts:
-            # Simple parsing or default assignment
             name = reg_parts.split(",")[0].replace("Name:", "").strip() if "Name:" in reg_parts else reg_parts
+            if "Currency:" in reg_parts:
+                try:
+                    currency = reg_parts.split("Currency:")[1].strip()
+                except Exception:
+                    pass
 
         if not user_exists:
             try:
@@ -280,7 +282,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id, "ℹ️ You are already registered with PocketMunim!")
         return {"ok": True}
 
-    # If user is not registered, block all actions and give copiable registration form
     if not user_exists:
         copyable_form = "```text\n/register Name: [Your Full Name], Currency: INR\n```"
         reg_msg = (
@@ -293,7 +294,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
     # =====================================================================
 
-    # 1. Handle System Commands
     if text.startswith("/start"):
         reply_text = "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active. Send your expenses naturally (e.g., *milk 40* or *dinner 450*)."
         await send_telegram_reply(chat_id, reply_text)
@@ -304,9 +304,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         await send_telegram_reply(chat_id, reply_text)
         return {"ok": True}
 
-    # =====================================================================
-    # 2. COMMAND: ON-DEMAND CATEGORY SEEDING (/categorypull)
-    # =====================================================================
     elif text.startswith("/categorypull"):
         query = text.replace("/categorypull", "").strip()
 
@@ -329,15 +326,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
         return {"ok": True}
 
-    # =====================================================================
-    # 3. STANDARD TRANSACTION PROCESSING (The Phase 4 Waterfall)
-    # =====================================================================
     else:
         try:
             if not groq_client:
                 raise Exception("Groq API client is not configured.")
 
-            # Calculate precise IST time dynamically
             tz_ist = timezone(timedelta(hours=5, minutes=30))
             current_dt = datetime.now(tz_ist)
             current_date_str = current_dt.strftime("%Y-%m-%d")
@@ -415,9 +408,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                     continue
                         # =========================================================
 
-                        # =========================================================
-                        # PHASE 4: DYNAMIC WATERFALL (RAM -> AI -> REBUILD)
-                        # =========================================================
                         search_item_name = tx.item or description
                         category = None
                         subcategory = None
@@ -446,7 +436,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                 except Exception as e:
                                     print(f"Failed to persist AI fallback: {str(e)}")
 
-                        # Date calculation logic
                         db_date = current_dt.isoformat()
                         display_date_raw = "Today"
 
@@ -474,14 +463,12 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             "description": description,
                             "intent": tx.intent,
                             "category": category,
+                            "subcategory": subcategory,
                             "date": db_date,
                             "soft_deleted": False
                         }
                         supabase.table("transactions").insert(db_payload).execute()
 
-                        # =========================================================
-                        # COLOR-CODED UI BADGES & FORMATTING
-                        # =========================================================
                         intent_lower = tx.intent.lower()
                         if "income" in intent_lower or "credit" in intent_lower:
                             color_badge = "🟢 *INCOME*"

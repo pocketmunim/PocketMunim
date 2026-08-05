@@ -99,7 +99,6 @@ OUTPUT FORMAT:
                         existing_subs = existing_row.get('subcategories', [])
 
                         sub_dict = {}
-
                         for s in existing_subs:
                             s_key = s.get('subcategory_name', 'General').strip().lower()
                             sub_dict[s_key] = {

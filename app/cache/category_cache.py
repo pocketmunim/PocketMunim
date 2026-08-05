@@ -1,6 +1,5 @@
 from typing import Optional, Dict
 
-# GLOBAL IN-MEMORY RAM CACHE
 _MEMORY_DICT: Dict[str, Dict] = {}
 
 
@@ -23,7 +22,7 @@ class CategoryCacheManager:
         return None
 
     def rebuild_cache(self) -> None:
-        """Pulls the new JSONB arrays from DB and maps them to RAM instantly."""
+        """Pulls JSONB arrays from DB and maps them to RAM instantly."""
         try:
             res = self.db.table('categories').select('category_name, subcategories').eq('user_id',
                                                                                         self.user_id).execute()
