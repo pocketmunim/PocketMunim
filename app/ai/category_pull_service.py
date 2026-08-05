@@ -1,6 +1,6 @@
 import json
 from groq import Groq
-from typing import List
+from typing import List, Optional
 
 
 class CategoryPullService:
@@ -187,31 +187,31 @@ OUTPUT FORMAT:
                 self.admin_db.table('categories').insert(
                     {"user_id": user_id, "category_name": cat_name.strip(), "subcategories": new_subs}).execute()
         except Exception as e:
-            print(f"Fallback insert error: {e}")
+            print(f"Failed fallback insert: {e}")
 
-    def classify_item(self, item_name: str) -> dict:
-        if not self.ai: return {"category": None, "subcategory": None, "normalized_item": item_name}
+    def classify_item(self, item_name: str, intent: Optional[str] = None) -> dict:
+        if not self.ai:
+            return {"category": "General", "subcategory": "Miscellaneous", "normalized_item": item_name}
 
-        system_prompt = """You are the PocketMunim Category Classification Engine.
-Classify the given input into a day-to-day Category and most specific Subcategory.
+        system_prompt = f"""You are the PocketMunim Category Classification Engine.
+Classify the given input and transaction intent ('{intent}') into a proper financial Category and Subcategory.
 
-CRITICAL NORMALIZATION RULE:
-If the input is a full sentence or contains specific amounts, personal names, or hardcoded details, you MUST generalize it. Strip out specific details and return a clean, generic, reusable item name.
-- Example 1: "received 50k from sushma" or "got 10k from raj" -> category: "Transfers", subcategory: "Incoming Transfer", normalized_item: "Personal Transfer Received". NEVER hallucinate the word "Cash".
-- Example 2: "bought pizza for 500" -> category: "Food & Dining", subcategory: "Dining Out", normalized_item: "Pizza"
+CRITICAL RULES:
+1. Normalization: If the input contains specific amounts, personal names, or hardcoded details (e.g., "John sent 4k"), generalize it into a clean, reusable item name (e.g., "Personal Transfer Received"). Never hallucinate "Cash".
+2. Universal Coverage: Handle all transaction types (expense, income, transfer_own, transfer_other) logically. For income/transfers, categorize appropriately (e.g., Transfers, Income). For expenses, categorize into standard spending buckets (e.g., Food & Dining, Utilities, Shopping).
 
 OUTPUT FORMAT MUST BE STRICT JSON:
-{
+{{
   "category": "string",
   "subcategory": "string",
   "normalized_item": "clean generic string"
-}"""
+}}"""
         try:
             completion = self.ai.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"item: \"{item_name}\""}
+                    {"role": "user", "content": f"item: \"{item_name}\", intent: \"{intent}\""}
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.0
@@ -219,9 +219,9 @@ OUTPUT FORMAT MUST BE STRICT JSON:
             raw_content = completion.choices[0].message.content.strip()
             parsed = json.loads(raw_content)
             return {
-                "category": parsed.get("category"),
-                "subcategory": parsed.get("subcategory"),
+                "category": parsed.get("category") or "General",
+                "subcategory": parsed.get("subcategory") or "Miscellaneous",
                 "normalized_item": parsed.get("normalized_item") or item_name
             }
         except Exception:
-            return {"category": None, "subcategory": None, "normalized_item": item_name}
+            return {"category": "General", "subcategory": "Miscellaneous", "normalized_item": item_name}    

@@ -72,7 +72,7 @@ async def send_telegram_reply(chat_id: int, text: str):
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (WITH INBOUND PHRASING RULE)
+# FOUNDER FROZEN SYSTEM PROMPT (WITH FEW-SHOT EXAMPLES)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -434,13 +434,15 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         category = None
                         subcategory = None
 
+                        # TIER 1: Check In-Memory JSONB RAM Cache
                         cached_match = cache_manager.search_item(search_item_name)
                         if cached_match and cached_match.get("category"):
                             category = cached_match["category"]
                             subcategory = cached_match.get("subcategory")
 
+                        # TIER 3: Dynamic AI Fallback (Passing Intent for Universal Type Coverage)
                         if not category:
-                            ai_classified = category_pull_service.classify_item(search_item_name)
+                            ai_classified = category_pull_service.classify_item(search_item_name, intent=tx.intent)
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
 
