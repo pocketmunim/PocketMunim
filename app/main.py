@@ -272,7 +272,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
-    # Strictly map to Telegram ID based on new JSONB Database schema
+    # Strictly map to Telegram ID based on JSONB Database schema
     user_id = str(request.state.telegram_id)
     reply_text = "System processing error."
 
@@ -348,13 +348,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
                     if amount > Decimal('0.00'):
 
-                        # Rule 29: Future Transaction Interceptor
                         if tx.future and tx.future.is_future:
                             response_sections.append(
                                 f"🗓️ '{description}' identified as a future plan. Budget intelligence will activate in Phase 9.")
                             continue
 
-                        # Strict Clarification Rule
                         if not tx.intent or tx.needs_clarification:
                             clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
                             response_sections.append(clarification_msg)
@@ -381,7 +379,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
 
-                            # Retrieve normalized item to keep Taxonomy clean of hardcoded data
                             normalized_taxonomy_item = ai_classified.get("normalized_item") or search_item_name
                             source_origin = "Tier 3: AI Fallback"
 
@@ -400,7 +397,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         print(
                             f"[CATEGORY SOURCE] Item: '{search_item_name}' | Category: '{category}' | Origin: {source_origin}")
 
-                        # FULL DB PAYLOAD: Ensuring no previously extracted fields are lost
+                        # REVERTED DB PAYLOAD: Strictly matches original working schema to prevent PGRST204
                         db_payload = {
                             "user_id": user_id,
                             "amount": float(amount),
@@ -408,10 +405,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             "description": description,
                             "intent": tx.intent,
                             "category": category,
-                            "subcategory": subcategory,
-                            "date": tx.date.raw_expression if tx.date else None,
-                            "payment_method": tx.payment_method,
-                            "merchant": tx.merchant,
                             "soft_deleted": False
                         }
                         supabase.table("transactions").insert(db_payload).execute()
