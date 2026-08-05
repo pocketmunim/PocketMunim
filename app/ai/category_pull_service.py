@@ -37,15 +37,6 @@ OUTPUT FORMAT:
           "items": ["apple", "banana"]
         }
       ]
-    },
-    {
-      "category_name": "Household",
-      "subcategories": [
-        {
-          "subcategory_name": "Cleaning",
-          "items": ["dishwash liquid", "detergent"]
-        }
-      ]
     }
   ]
 }
@@ -75,47 +66,85 @@ OUTPUT FORMAT:
                 result["error"] = "AI returned an empty taxonomy."
                 return result
 
-            # Fetch existing DB to merge smartly
+            # Fetch existing DB records
             existing_res = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute()
-            db_map = {row['category_name']: row['subcategories'] for row in (existing_res.data or [])}
+
+            # Create a case-insensitive map of the database (e.g. "groceries" -> full db row)
+            db_map = {row['category_name'].strip().lower(): row for row in (existing_res.data or [])}
 
             db_errors = []
 
             for cat_obj in taxonomy_list:
-                cat_name = cat_obj.get("category_name")
+                raw_cat_name = cat_obj.get("category_name", "").strip()
                 new_subs = cat_obj.get("subcategories", [])
 
-                if not cat_name or not new_subs:
+                if not raw_cat_name or not new_subs:
                     continue
 
+                cat_key = raw_cat_name.lower()
+
                 try:
-                    if cat_name in db_map:
-                        # SMART MERGE: Combine existing subcategories and items with AI output
-                        existing_subs = db_map[cat_name]
-                        sub_dict = {s['subcategory_name']: set(s.get('items', [])) for s in existing_subs}
+                    if cat_key in db_map:
+                        # ==========================================
+                        # INTELLIGENT DEEP MERGE (CASE INSENSITIVE)
+                        # ==========================================
+                        existing_row = db_map[cat_key]
+                        actual_cat_name = existing_row['category_name']  # Preserves original DB casing
+                        existing_subs = existing_row.get('subcategories', [])
 
+                        sub_dict = {}
+
+                        # 1. Load existing subcategories into a case-insensitive dictionary
+                        for s in existing_subs:
+                            s_key = s.get('subcategory_name', 'General').strip().lower()
+                            sub_dict[s_key] = {
+                                "original_name": s.get('subcategory_name', 'General'),
+                                "items": {i.strip().lower(): i.strip() for i in s.get('items', [])}
+                            }
+
+                        # 2. Merge new AI subcategories and items into the dictionary
                         for ns in new_subs:
-                            s_name = ns.get('subcategory_name')
+                            raw_s_name = ns.get('subcategory_name', 'General').strip()
+                            s_key = raw_s_name.lower()
                             i_list = ns.get('items', [])
-                            if s_name in sub_dict:
-                                sub_dict[s_name].update(i_list)
-                            else:
-                                sub_dict[s_name] = set(i_list)
 
-                        merged_subs = [{"subcategory_name": k, "items": list(v)} for k, v in sub_dict.items()]
+                            if s_key not in sub_dict:
+                                sub_dict[s_key] = {"original_name": raw_s_name, "items": {}}
 
+                            for i in i_list:
+                                i_key = i.strip().lower()
+                                if i_key not in sub_dict[s_key]["items"]:
+                                    sub_dict[s_key]["items"][i_key] = i.strip()  # Appends new item uniquely
+
+                        # 3. Reconstruct the JSONB array format
+                        merged_subs = [{"subcategory_name": v["original_name"], "items": list(v["items"].values())} for
+                                       v in sub_dict.values()]
+
+                        # 4. Push exact updated array to DB
                         self.admin_db.table('categories').update({"subcategories": merged_subs}).eq('user_id',
                                                                                                     user_id).eq(
-                            'category_name', cat_name).execute()
-                        db_map[cat_name] = merged_subs
+                            'category_name', actual_cat_name).execute()
+                        db_map[cat_key]['subcategories'] = merged_subs
                     else:
-                        # INSERT NEW CATEGORY ROW
+                        # ==========================================
+                        # INSERT COMPLETELY NEW CATEGORY ROW
+                        # ==========================================
+                        clean_subs = []
+                        for ns in new_subs:
+                            raw_s_name = ns.get('subcategory_name', 'General').strip()
+                            i_list = ns.get('items', [])
+
+                            # Ensure no duplicates within the AI's own response
+                            unique_items = list({i.strip().lower(): i.strip() for i in i_list}.values())
+                            clean_subs.append({"subcategory_name": raw_s_name, "items": unique_items})
+
                         self.admin_db.table('categories').insert({
                             "user_id": user_id,
-                            "category_name": cat_name,
-                            "subcategories": new_subs
+                            "category_name": raw_cat_name,
+                            "subcategories": clean_subs
                         }).execute()
-                        db_map[cat_name] = new_subs
+
+                        db_map[cat_key] = {"category_name": raw_cat_name, "subcategories": clean_subs}
 
                     result["added"] += sum(len(sub.get("items", [])) for sub in new_subs)
 
@@ -135,29 +164,37 @@ OUTPUT FORMAT:
         """Helper for Transaction AI Fallback to safely merge a single item into the JSONB array."""
         if not self.admin_db or not cat_name or not sub_name or not item_name: return
         try:
-            res = self.admin_db.table('categories').select('subcategories').eq('user_id', user_id).eq('category_name',
-                                                                                                      cat_name).execute()
+            # Case insensitive search for the category row
+            res = self.admin_db.table('categories').select('*').eq('user_id', user_id).ilike('category_name',
+                                                                                             cat_name.strip()).execute()
 
             if res.data:
-                # Merge into existing category
-                existing_subs = res.data[0]['subcategories']
+                existing_row = res.data[0]
+                actual_cat_name = existing_row['category_name']
+                existing_subs = existing_row.get('subcategories', [])
+
                 found_sub = False
                 for sub in existing_subs:
-                    if sub.get('subcategory_name') == sub_name:
-                        if item_name not in sub.get('items', []):
-                            sub['items'].append(item_name)
+                    # Case insensitive search for the subcategory
+                    if sub.get('subcategory_name', '').strip().lower() == sub_name.strip().lower():
+                        existing_items = [i.strip().lower() for i in sub.get('items', [])]
+
+                        # Only append if item is completely new
+                        if item_name.strip().lower() not in existing_items:
+                            sub['items'].append(item_name.strip())
                         found_sub = True
                         break
+
                 if not found_sub:
-                    existing_subs.append({"subcategory_name": sub_name, "items": [item_name]})
+                    existing_subs.append({"subcategory_name": sub_name.strip(), "items": [item_name.strip()]})
 
                 self.admin_db.table('categories').update({"subcategories": existing_subs}).eq('user_id', user_id).eq(
-                    'category_name', cat_name).execute()
+                    'category_name', actual_cat_name).execute()
             else:
-                # Insert completely new category
-                new_subs = [{"subcategory_name": sub_name, "items": [item_name]}]
+                # Completely new category
+                new_subs = [{"subcategory_name": sub_name.strip(), "items": [item_name.strip()]}]
                 self.admin_db.table('categories').insert(
-                    {"user_id": user_id, "category_name": cat_name, "subcategories": new_subs}).execute()
+                    {"user_id": user_id, "category_name": cat_name.strip(), "subcategories": new_subs}).execute()
         except Exception as e:
             print(f"Fallback insert error: {e}")
 
