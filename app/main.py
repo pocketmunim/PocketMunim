@@ -89,7 +89,7 @@ CRITICAL RULES (NON-NEGOTIABLE):
 4. BULK DETECTION: If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
 5. UNKNOWN CATEGORIES: If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
 6. LOAN PAYMENTS: A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
-7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day, "day before yesterday" = minus 2 days). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR. For "last month", "last year", or "last week", subtract exactly that interval from today (e.g., Aug 5 minus 1 month is Jul 5). DO NOT default to the 1st of the month.
+7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. Calculate relative dates strictly in YYYY-MM-DD. For "last month", "last year", or "last week", subtract exactly that interval from today (e.g., Aug 5 minus 1 month is Jul 5). DO NOT default to the 1st of the month.
 8. CLARIFICATION STRICTNESS: ONLY set `needs_clarification = true` if the AMOUNT or INTENT is completely unknown. NEVER ask for clarification for missing accounts, categories, items, or payment methods (the system handles defaults automatically).
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers.
 10. PEER-TO-PEER TRANSFERS: If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]".
@@ -359,6 +359,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                     currency = reg_parts.split("Currency:")[1].strip()
                 except Exception:
                     pass
+
+        name = name.title()  # <--- Title Casing applied to Username
+
         if not user_exists:
             try:
                 supabase_admin.table('users').insert(
@@ -387,7 +390,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id,
                                       "⚠️ Invalid format. Use: `/addaccount [BankName] [InitialBalance]`\nExample: `/addaccount HDFC 5000`")
             return {"ok": True}
-        acc_name = " ".join(parts[:-1])
+
+        acc_name = " ".join(parts[:-1]).title()  # <--- Title Casing applied to Account Name
+
         try:
             acc_bal = float(parts[-1])
         except ValueError:
@@ -408,7 +413,8 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     if text.startswith("/setdefault"):
-        acc_name = text.replace("/setdefault", "").strip()
+        acc_name = text.replace("/setdefault", "").strip().title()  # <--- Title Casing applied to Account Name
+
         if not acc_name:
             await send_telegram_reply(chat_id, "⚠️ Please provide an account name. Example: `/setdefault HDFC`")
             return {"ok": True}
@@ -489,7 +495,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
                 for tx in transactions_list:
                     amount = tx.amount if tx.amount else Decimal('0.00')
-                    description = tx.item or tx.merchant or text
+
+                    # <--- Title Casing applied to Item Description
+                    description = str(tx.item or tx.merchant or text).title()
 
                     if amount > Decimal('0.00'):
                         if tx.future and tx.future.is_future:
@@ -551,7 +559,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         for acc_id, new_bal, log_type in updates_to_make:
                             supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
 
-                            # --- NEW ACCOUNT LOGGING LOGIC ---
+                            # --- ACCOUNT LOGGING ---
                             try:
                                 supabase_admin.table('account_logs').insert({
                                     "account_id": acc_id,
@@ -563,12 +571,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                 }).execute()
                             except Exception as e:
                                 pass
-                            # ---------------------------------
 
                             for a in user_accounts:
                                 if a['id'] == acc_id: a['balance'] = new_bal
 
-                        search_item_name = tx.item or description
+                        search_item_name = description
                         category = None
                         subcategory = None
 
@@ -581,7 +588,10 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             ai_classified = category_pull_service.classify_item(search_item_name, intent=tx.intent)
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
-                            normalized_taxonomy_item = ai_classified.get("normalized_item") or search_item_name
+
+                            # <--- Title Casing applied to AI generated taxonomy normalization
+                            normalized_taxonomy_item = str(
+                                ai_classified.get("normalized_item") or search_item_name).title()
 
                             if category:
                                 try:
