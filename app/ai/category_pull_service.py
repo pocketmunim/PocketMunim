@@ -16,55 +16,52 @@ class CategoryPullService:
 
         base_rules_and_format = """
 RULES:
-1. Generate exactly 15-20 items.
-2. Items must represent realistic, commonly occurring day-to-day purchases or expenses.
-3. Each item must have a meaningful Category and Subcategory.
-4. Keep categories broad and reusable.
-5. Keep subcategories specific enough to be useful for transaction classification.
-6. Do not create overly specific, obscure, rare, luxury, or unusual items.
-7. Do not generate duplicate items.
-8. Avoid generating multiple items that are effectively the same thing.
-9. Do not use brand names unless the brand itself is commonly used as the generic description of the expense.
-10. Categories and subcategories must be logically consistent.
-11. Each item should be something a user could realistically enter into a personal finance app.
-12. Items should be suitable for future AI transaction classification.
-13. Use simple, commonly understood English names.
-14. Do not include prices, currency, descriptions, explanations, IDs, or additional fields.
-15. Return ONLY valid JSON.
-16. Do not wrap the response in Markdown code fences.
-17. Do not include any text before or after the JSON.
+1. Generate realistic day-to-day purchases.
+2. Group them intelligently into broad Categories.
+3. Inside each Category, group items into Subcategories.
+4. Output MUST STRICTLY MATCH the nested JSON schema below.
+5. Return ONLY valid JSON.
 
 OUTPUT FORMAT:
 {
-  "categories": [
+  "taxonomy": [
     {
-      "category": "Medicines & Healthcare",
-      "subcategory": "Pharmacy",
-      "item": "Paracetamol"
+      "category_name": "Groceries",
+      "subcategories": [
+        {
+          "subcategory_name": "Dairy and Eggs",
+          "items": ["milk", "paneer", "butter", "eggs"]
+        },
+        {
+          "subcategory_name": "Fruits",
+          "items": ["apple", "banana"]
+        }
+      ]
+    },
+    {
+      "category_name": "Household",
+      "subcategories": [
+        {
+          "subcategory_name": "Cleaning",
+          "items": ["dishwash liquid", "detergent"]
+        }
+      ]
     }
   ]
 }
-
-FINAL REQUIREMENT:
-Return exactly one JSON object containing a "categories" array with 15-20 objects.
-Every object MUST contain exactly these three fields: category, subcategory, item."""
+"""
 
         if not query:
-            system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-Your task is to generate 15-20 common, realistic, practical day-to-day financial items that people may commonly purchase or spend money on.
-FOCUS AREAS: Household, Medicines & Healthcare, Groceries, Food & Dining, Transportation, Utilities, Personal Care, Education, Entertainment, Shopping.
-{base_rules_and_format}"""
+            system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate common day-to-day items.\n{base_rules_and_format}"
         else:
-            system_prompt = f"""You are the PocketMunim Day-to-Day Taxonomy Expansion Engine.
-Your task is to generate 15-20 common, realistic, practical day-to-day financial items STRICTLY RELATED TO THE DOMAIN: "{query}".
-{base_rules_and_format}"""
+            system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate items STRICTLY RELATED TO: '{query}'.\n{base_rules_and_format}"
 
         try:
             completion = self.ai.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Generate the JSON category list now. Output ONLY valid JSON."}
+                    {"role": "user", "content": "Generate the taxonomy JSON now. Output ONLY valid JSON."}
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.4
@@ -72,61 +69,61 @@ Your task is to generate 15-20 common, realistic, practical day-to-day financial
 
             raw_content = completion.choices[0].message.content.strip()
             parsed = json.loads(raw_content)
-            items_list = parsed.get("categories", [])
+            taxonomy_list = parsed.get("taxonomy", [])
 
-            if not items_list:
-                result["error"] = "AI returned an empty list."
+            if not taxonomy_list:
+                result["error"] = "AI returned an empty taxonomy."
                 return result
 
-            # Fetch existing taxonomy to prevent duplicates and link hierarchical IDs correctly
-            existing = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute().data or []
-            cats_map = {r['name'].lower(): r['id'] for r in existing if r.get('level') == 'CATEGORY'}
-            subcats_map = {f"{r.get('parent_id')}_{r['name'].lower()}": r['id'] for r in existing if
-                           r.get('level') == 'SUBCATEGORY'}
-            items_map = {f"{r.get('parent_id')}_{r['name'].lower()}": r['id'] for r in existing if
-                         r.get('level') == 'ITEM'}
+            # Fetch existing DB to merge smartly
+            existing_res = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute()
+            db_map = {row['category_name']: row['subcategories'] for row in (existing_res.data or [])}
 
             db_errors = []
 
-            for entry in items_list:
-                cat_name = entry.get("category")
-                sub_name = entry.get("subcategory")
-                itm_name = entry.get("item")
+            for cat_obj in taxonomy_list:
+                cat_name = cat_obj.get("category_name")
+                new_subs = cat_obj.get("subcategories", [])
 
-                if not (cat_name and sub_name and itm_name):
+                if not cat_name or not new_subs:
                     continue
 
                 try:
-                    # Get or Create CATEGORY
-                    cat_key = cat_name.lower()
-                    if cat_key not in cats_map:
-                        res = self.admin_db.table('categories').insert(
-                            {"user_id": user_id, "name": cat_name, "level": "CATEGORY"}).execute()
-                        cats_map[cat_key] = res.data[0]['id']
-                    cat_id = cats_map[cat_key]
+                    if cat_name in db_map:
+                        # SMART MERGE: Combine existing subcategories and items with AI output
+                        existing_subs = db_map[cat_name]
+                        sub_dict = {s['subcategory_name']: set(s.get('items', [])) for s in existing_subs}
 
-                    # Get or Create SUBCATEGORY
-                    sub_key = f"{cat_id}_{sub_name.lower()}"
-                    if sub_key not in subcats_map:
-                        res = self.admin_db.table('categories').insert(
-                            {"user_id": user_id, "name": sub_name, "level": "SUBCATEGORY",
-                             "parent_id": cat_id}).execute()
-                        subcats_map[sub_key] = res.data[0]['id']
-                    sub_id = subcats_map[sub_key]
+                        for ns in new_subs:
+                            s_name = ns.get('subcategory_name')
+                            i_list = ns.get('items', [])
+                            if s_name in sub_dict:
+                                sub_dict[s_name].update(i_list)
+                            else:
+                                sub_dict[s_name] = set(i_list)
 
-                    # Get or Create ITEM
-                    itm_key = f"{sub_id}_{itm_name.lower()}"
-                    if itm_key not in items_map:
-                        self.admin_db.table('categories').insert(
-                            {"user_id": user_id, "name": itm_name, "level": "ITEM", "parent_id": sub_id}).execute()
-                        items_map[itm_key] = True
-                        result["added"] += 1
+                        merged_subs = [{"subcategory_name": k, "items": list(v)} for k, v in sub_dict.items()]
+
+                        self.admin_db.table('categories').update({"subcategories": merged_subs}).eq('user_id',
+                                                                                                    user_id).eq(
+                            'category_name', cat_name).execute()
+                        db_map[cat_name] = merged_subs
+                    else:
+                        # INSERT NEW CATEGORY ROW
+                        self.admin_db.table('categories').insert({
+                            "user_id": user_id,
+                            "category_name": cat_name,
+                            "subcategories": new_subs
+                        }).execute()
+                        db_map[cat_name] = new_subs
+
+                    result["added"] += sum(len(sub.get("items", [])) for sub in new_subs)
 
                 except Exception as e:
                     db_errors.append(str(e))
 
             if result["added"] == 0 and db_errors:
-                result["error"] = f"DB Insert Error (Check Supabase Columns): {db_errors[0]}"
+                result["error"] = f"DB Upsert Error: {db_errors[0]}"
 
             return result
 
@@ -135,25 +132,32 @@ Your task is to generate 15-20 common, realistic, practical day-to-day financial
             return result
 
     def add_single_item_to_taxonomy(self, cat_name: str, sub_name: str, item_name: str, user_id: str) -> None:
-        """Helper for Transaction AI Fallback to safely insert hierarchical records."""
+        """Helper for Transaction AI Fallback to safely merge a single item into the JSONB array."""
         if not self.admin_db or not cat_name or not sub_name or not item_name: return
         try:
-            res_c = self.admin_db.table('categories').select('id').eq('user_id', user_id).eq('level', 'CATEGORY').ilike(
-                'name', cat_name).execute()
-            cat_id = res_c.data[0]['id'] if res_c.data else self.admin_db.table('categories').insert(
-                {"user_id": user_id, "name": cat_name, "level": "CATEGORY"}).execute().data[0]['id']
+            res = self.admin_db.table('categories').select('subcategories').eq('user_id', user_id).eq('category_name',
+                                                                                                      cat_name).execute()
 
-            res_s = self.admin_db.table('categories').select('id').eq('user_id', user_id).eq('level', 'SUBCATEGORY').eq(
-                'parent_id', cat_id).ilike('name', sub_name).execute()
-            sub_id = res_s.data[0]['id'] if res_s.data else self.admin_db.table('categories').insert(
-                {"user_id": user_id, "name": sub_name, "level": "SUBCATEGORY", "parent_id": cat_id}).execute().data[0][
-                'id']
+            if res.data:
+                # Merge into existing category
+                existing_subs = res.data[0]['subcategories']
+                found_sub = False
+                for sub in existing_subs:
+                    if sub.get('subcategory_name') == sub_name:
+                        if item_name not in sub.get('items', []):
+                            sub['items'].append(item_name)
+                        found_sub = True
+                        break
+                if not found_sub:
+                    existing_subs.append({"subcategory_name": sub_name, "items": [item_name]})
 
-            res_i = self.admin_db.table('categories').select('id').eq('user_id', user_id).eq('level', 'ITEM').eq(
-                'parent_id', sub_id).ilike('name', item_name).execute()
-            if not res_i.data:
+                self.admin_db.table('categories').update({"subcategories": existing_subs}).eq('user_id', user_id).eq(
+                    'category_name', cat_name).execute()
+            else:
+                # Insert completely new category
+                new_subs = [{"subcategory_name": sub_name, "items": [item_name]}]
                 self.admin_db.table('categories').insert(
-                    {"user_id": user_id, "name": item_name, "level": "ITEM", "parent_id": sub_id}).execute()
+                    {"user_id": user_id, "category_name": cat_name, "subcategories": new_subs}).execute()
         except Exception as e:
             print(f"Fallback insert error: {e}")
 

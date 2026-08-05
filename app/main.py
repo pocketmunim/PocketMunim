@@ -3,6 +3,7 @@ import json
 import httpx
 from decimal import Decimal
 from fastapi import FastAPI, Request, HTTPException, Depends
+from contextlib import asynccontextmanager
 from supabase import create_client, Client
 from groq import Groq
 
@@ -11,8 +12,6 @@ from app.security.auth import authenticate_telegram_request
 from app.ai.schemas import AITransactionExtraction
 from app.ai.category_pull_service import CategoryPullService
 from app.cache.category_cache import CategoryCacheManager
-
-app = FastAPI()
 
 # Environment Configurations
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -32,6 +31,31 @@ groq_client = Groq(api_key=active_groq_key) if active_groq_key else None
 
 # Initialize Phase 4 Category Services
 category_pull_service = CategoryPullService(groq_client, supabase_admin)
+
+
+# =====================================================================
+# STARTUP EVENT: SET TELEGRAM MENU BAR COMMANDS AUTOMATICALLY
+# =====================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            async with httpx.AsyncClient() as client:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+                commands = {
+                    "commands": [
+                        {"command": "start", "description": "Start PocketMunim"},
+                        {"command": "categorypull", "description": "Seed or refresh categories"},
+                        {"command": "report", "description": "Get financial dashboard link"}
+                    ]
+                }
+                await client.post(url, json=commands)
+        except Exception as e:
+            print(f"Failed to set Telegram menu: {e}")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # =====================================================================
@@ -283,7 +307,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
-    # Standard mapping (assuming user_id in DB is set to TEXT to handle Telegram IDs)
     user_id = str(request.state.telegram_id)
     reply_text = "System processing error."
 
@@ -310,18 +333,15 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         else:
             await send_telegram_reply(chat_id, f"⏳ Pulling categories for '{query}' using AI...")
 
-        # Trigger pull and save to DB
         pull_result = category_pull_service.manual_category_pull(query, user_id)
         added_count = pull_result.get("added", 0)
 
         if added_count > 0:
-            # Refresh In-Memory RAM Cache immediately
             cache_manager = CategoryCacheManager(supabase, user_id)
             cache_manager.rebuild_cache()
-            success_msg = f"✅ Successfully pulled and saved {added_count} items to the database and refreshed In-Memory Cache."
+            success_msg = f"✅ Successfully pulled and mapped {added_count} items to the database and refreshed In-Memory Cache."
             await send_telegram_reply(chat_id, success_msg)
         else:
-            # PRINTS THE EXACT ERROR TO YOUR TELEGRAM
             error_reason = pull_result.get("error", "Unknown logic failure")
             await send_telegram_reply(chat_id, f"❌ Failed to pull categories.\n\nReason: {error_reason}")
 
@@ -363,13 +383,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
                     if amount > Decimal('0.00'):
 
-                        # Rule 29: Future Transaction Interceptor
                         if tx.future and tx.future.is_future:
                             response_sections.append(
                                 f"🗓️ '{description}' identified as a future plan. Budget intelligence will activate in Phase 9.")
                             continue
 
-                        # Strict Clarification Rule
                         if not tx.intent or tx.needs_clarification:
                             clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
                             response_sections.append(clarification_msg)
@@ -387,16 +405,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         if cached_match and cached_match.get("category"):
                             category = cached_match["category"]
                             source_origin = "Tier 1: In-Memory RAM Cache"
-                        else:
-                            # TIER 2: Check Relational Database (`categories` table)
-                            try:
-                                db_res = supabase.table('categories').select('*').eq('user_id', user_id).ilike('name',
-                                                                                                               search_item_name).execute()
-                                if db_res.data and db_res.data[0].get('category'):
-                                    category = db_res.data[0].get('category')
-                                    source_origin = "Tier 2: Relational DB"
-                            except Exception:
-                                pass
 
                         # TIER 3: AI Fallback Fetch
                         if not category:
@@ -405,7 +413,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             subcategory = ai_classified.get("subcategory") or "General"
                             source_origin = "Tier 3: AI Fallback"
 
-                            # IF FOUND BY AI -> Persist Hierarchically to DB -> REBUILD RAM CACHE
+                            # IF FOUND BY AI -> Persist to DB JSONB ARRAY -> REBUILD RAM CACHE
                             if category:
                                 try:
                                     category_pull_service.add_single_item_to_taxonomy(
