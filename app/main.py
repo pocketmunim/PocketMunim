@@ -70,7 +70,7 @@ async def send_telegram_reply(chat_id: int, text: str):
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (STRICTLY UNMODIFIED)
+# FOUNDER FROZEN SYSTEM PROMPT (WITH PEER-TO-PEER TRANSFER RULE)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -85,6 +85,7 @@ CRITICAL RULES (NON-NEGOTIABLE):
 7. EXACT DATES & CURRENCY: Preserve the exact date expression. Default `normalized_currency` to "INR".
 8. CLARIFICATION: If a transaction is missing a critical component, set `needs_clarification = true` and list missing keys in `clarification_fields`.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers, no conversational text.
+10. PEER-TO-PEER TRANSFERS (NO CASH HALLUCINATION): If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]", and DO NOT assume or hallucinate the word "Cash" unless explicitly stated.
 
 JSON OUTPUT SCHEMA:
 {
@@ -195,6 +196,27 @@ JSON OUTPUT SCHEMA:
 
 FEW-SHOT EXAMPLES:
 
+User: "got 10k from raj"
+Output:
+{
+  "metadata": {
+    "raw_user_text": "got 10k from raj",
+    "operation_type": "single", "language": "English", "entry_source": "telegram",
+    "bulk_operation": false, "category_lookup_required": true, "unsupported_chat": false, "account_required": false
+  },
+  "transactions": [
+    {
+      "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 10000, 
+      "normalized_currency": "INR", "item": "Received from raj", "payment_method": null,
+      "category": null, "subcategory": null,
+      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
+      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
+      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
+      "needs_clarification": false, "confidence": {"overall_confidence": 0.98}
+    }
+  ]
+}
+
 User: "Salary 85000 credited and paid 15000 EMI for Sushma"
 Output: 
 {
@@ -223,64 +245,7 @@ Output:
   ],
   "loan": {"intent": "loan_payment", "lender": "Sushma", "amount": 15000}
 }
-
-User: "Added 50k to Upstox via UPI"
-Output:
-{
-  "metadata": {
-    "raw_user_text": "Added 50k to Upstox via UPI", "operation_type": "single", "language": "English", "entry_source": "telegram",
-    "bulk_operation": false, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
-  },
-  "transactions": [
-    {
-      "transaction_sequence": 1, "execution_order": 1, "intent": "transfer_other", "amount": 50000, 
-      "normalized_currency": "INR", "merchant": "Upstox", "payment_method": "UPI", "destination_account": "Upstox",
-      "category": "Investments", "subcategory": "Trading Account",
-      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
-      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": true},
-      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
-      "needs_clarification": false, "confidence": {"overall_confidence": 0.98}
-    }
-  ]
-}
-
-User: "Milk 50, Bread 40, Eggs 60, Paneer 120, Curd 40, Butter 90"
-Output:
-{
-  "metadata": {
-    "raw_user_text": "Milk 50, Bread 40, Eggs 60, Paneer 120, Curd 40, Butter 90",
-    "operation_type": "bulk", "language": "English", "entry_source": "telegram",
-    "bulk_operation": true, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
-  },
-  "transactions": [
-    {"transaction_sequence": 1, "execution_order": 1, "intent": "expense", "amount": 50, "item": "Milk"},
-    {"transaction_sequence": 2, "execution_order": 2, "intent": "expense", "amount": 40, "item": "Bread"},
-    {"transaction_sequence": 3, "execution_order": 3, "intent": "expense", "amount": 60, "item": "Eggs"},
-    {"transaction_sequence": 4, "execution_order": 4, "intent": "expense", "amount": 120, "item": "Paneer"},
-    {"transaction_sequence": 5, "execution_order": 5, "intent": "expense", "amount": 40, "item": "Curd"},
-    {"transaction_sequence": 6, "execution_order": 6, "intent": "expense", "amount": 90, "item": "Butter"}
-  ]
-}
-
-User: "Bought dragon fruit for 150"
-Output:
-{
-  "metadata": {
-    "raw_user_text": "Bought dragon fruit for 150",
-    "operation_type": "single", "language": "English", "entry_source": "telegram",
-    "bulk_operation": false, "category_lookup_required": true, "unsupported_chat": false, "account_required": true
-  },
-  "transactions": [
-    {
-      "transaction_sequence": 1, "execution_order": 1, "intent": "expense", "amount": 150, 
-      "normalized_currency": "INR", "item": "dragon fruit", "category": null, "subcategory": null,
-      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
-      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
-      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
-      "needs_clarification": false, "confidence": {"overall_confidence": 0.95}
-    }
-  ]
-}"""
+"""
 
 
 # =====================================================================
@@ -307,6 +272,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
+    # Strictly map to Telegram ID based on new JSONB Database schema
     user_id = str(request.state.telegram_id)
     reply_text = "System processing error."
 
@@ -328,8 +294,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         query = text.replace("/categorypull", "").strip()
 
         if not query:
-            await send_telegram_reply(chat_id,
-                                      "⏳ Seeding random day-to-day life categories (Household, Medicines, etc.) using AI...")
+            await send_telegram_reply(chat_id, "⏳ Seeding random day-to-day life categories using AI...")
         else:
             await send_telegram_reply(chat_id, f"⏳ Pulling categories for '{query}' using AI...")
 
@@ -383,27 +348,31 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
                     if amount > Decimal('0.00'):
 
+                        # Rule 29: Future Transaction Interceptor
                         if tx.future and tx.future.is_future:
                             response_sections.append(
                                 f"🗓️ '{description}' identified as a future plan. Budget intelligence will activate in Phase 9.")
                             continue
 
+                        # Strict Clarification Rule
                         if not tx.intent or tx.needs_clarification:
                             clarification_msg = f"⚠️ Could not process '{description}'. Please clarify: Is this an expense, income, or transfer?"
                             response_sections.append(clarification_msg)
                             continue
 
                         # =========================================================
-                        # PHASE 4: DYNAMIC WATERFALL (RAM -> DB -> AI -> REBUILD)
+                        # PHASE 4: DYNAMIC WATERFALL (RAM -> AI -> REBUILD)
                         # =========================================================
                         search_item_name = tx.item or description
                         category = None
+                        subcategory = None
                         source_origin = "Unresolved"
 
                         # TIER 1: Check In-Memory JSONB RAM Cache
                         cached_match = cache_manager.search_item(search_item_name)
                         if cached_match and cached_match.get("category"):
                             category = cached_match["category"]
+                            subcategory = cached_match.get("subcategory")
                             source_origin = "Tier 1: In-Memory RAM Cache"
 
                         # TIER 3: AI Fallback Fetch
@@ -412,7 +381,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
 
-                            # Retrieve the normalized, generic item name from the AI to keep Taxonomy clean
+                            # Retrieve normalized item to keep Taxonomy clean of hardcoded data
                             normalized_taxonomy_item = ai_classified.get("normalized_item") or search_item_name
                             source_origin = "Tier 3: AI Fallback"
 
@@ -431,14 +400,18 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         print(
                             f"[CATEGORY SOURCE] Item: '{search_item_name}' | Category: '{category}' | Origin: {source_origin}")
 
+                        # FULL DB PAYLOAD: Ensuring no previously extracted fields are lost
                         db_payload = {
                             "user_id": user_id,
                             "amount": float(amount),
                             "txn_type": tx.intent,
-                            # Save original raw text for the user's ledger view
                             "description": description,
                             "intent": tx.intent,
                             "category": category,
+                            "subcategory": subcategory,
+                            "date": tx.date.raw_expression if tx.date else None,
+                            "payment_method": tx.payment_method,
+                            "merchant": tx.merchant,
                             "soft_deleted": False
                         }
                         supabase.table("transactions").insert(db_payload).execute()

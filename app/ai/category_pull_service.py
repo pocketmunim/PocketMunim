@@ -50,10 +50,6 @@ OUTPUT FORMAT:
         {{
           "subcategory_name": "Dairy and Eggs",
           "items": ["paneer", "butter"]
-        }},
-        {{
-          "subcategory_name": "Fruits",
-          "items": ["apple", "banana"]
         }}
       ]
     }}
@@ -201,7 +197,9 @@ OUTPUT FORMAT:
 Classify the given input into a day-to-day Category and most specific Subcategory.
 
 CRITICAL NORMALIZATION RULE:
-If the input is a full sentence or contains specific amounts, personal names, or hardcoded details (e.g., "received 50k from sushma" or "bought pizza for 500"), you MUST generalize it. Strip out the specific details and return a clean, generic, reusable item name for a taxonomy tree (e.g., "Personal Transfer" or "Pizza").
+If the input is a full sentence or contains specific amounts, personal names, or hardcoded details, you MUST generalize it. Strip out specific details and return a clean, generic, reusable item name.
+- Example 1: "received 50k from sushma" or "got 10k from raj" -> category: "Transfers", subcategory: "Incoming Transfer", normalized_item: "Personal Transfer Received". NEVER hallucinate the word "Cash".
+- Example 2: "bought pizza for 500" -> category: "Food & Dining", subcategory: "Dining Out", normalized_item: "Pizza"
 
 OUTPUT FORMAT MUST BE STRICT JSON:
 {
