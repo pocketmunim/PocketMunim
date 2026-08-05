@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import httpx
 from decimal import Decimal
@@ -27,6 +28,14 @@ supabase_admin: Client = create_client(SUPABASE_URL,
 
 # Initialize Phase 4 Category Services
 category_pull_service = CategoryPullService(None, supabase_admin)
+
+# =====================================================================
+# SECURITY: WEB APPLICATION FIREWALL (WAF) PATTERN
+# =====================================================================
+MALICIOUS_PATTERN = re.compile(
+    r"(DROP\s+TABLE|SELECT\s+\*|OR\s+1=1|<script>|<img|jndi:ldap|rm\s+-rf|;/|{{.*}}|\.\./\.\./|\"\s*OR\s*\"\")",
+    re.IGNORECASE
+)
 
 
 # =====================================================================
@@ -68,26 +77,28 @@ async def send_telegram_reply(chat_id: int, text: str):
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (100% RESTORED + ACCOUNT ROUTING)
+# FOUNDER FROZEN SYSTEM PROMPT (STRICT CLARIFICATION & DATES)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
 
 CRITICAL RULES (NON-NEGOTIABLE):
-1. NO MATHEMATICS: You are strictly forbidden from calculating totals, EMIs, or balances.
+1. NO MATHEMATICS & NO SPLITTING: You are strictly forbidden from calculating totals, EMIs, balances, or splitting amounts. (e.g., 'paid 4000 split between 4' MUST be logged as a 4000/4 transaction).
 2. NO HALLUCINATION: If a field is missing, return `null`. Never guess or assume default values.
-3. MULTI-INTENT & SEQUENCING: A single message may contain multiple operations. Extract each as a separate object in the `transactions` array. Assign a chronological `execution_order` (1, 2, 3).
+3. MULTI-INTENT & SEQUENCING: A single message may contain multiple operations. Extract each as a separate object in the `transactions` array. Assign a chronological `execution_order`.
 4. BULK DETECTION: If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
 5. UNKNOWN CATEGORIES: If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
 6. LOAN PAYMENTS: A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
-7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day, "day before yesterday" = minus 2 days). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR.
-8. CLARIFICATION: If a transaction is missing a critical component, set `needs_clarification = true` and list missing keys in `clarification_fields`.
-9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers, no conversational text.
-10. PEER-TO-PEER TRANSFERS: If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]", and DO NOT assume or hallucinate the word "Cash" unless explicitly stated.
+7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day, "day before yesterday" = minus 2 days). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR. For "last month", "last year", or "last week", subtract exactly that interval from today (e.g., Aug 5 minus 1 month is Jul 5). DO NOT default to the 1st of the month.
+8. CLARIFICATION STRICTNESS: ONLY set `needs_clarification = true` if the AMOUNT or INTENT is completely unknown. NEVER ask for clarification for missing accounts, categories, items, or payment methods (the system handles defaults automatically).
+9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers.
+10. PEER-TO-PEER TRANSFERS: If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]".
 11. ACCOUNT ROUTING: 
-    - If the user specifies an account they paid FROM (e.g., "bought milk from Kotak"), set `source_account` to "Kotak".
-    - If the user specifies an account they received money INTO, set `destination_account`.
-    - If it's a transfer between their OWN accounts (e.g., "send 10k from SBI to Axis"), intent is `transfer_own`, `source_account` is "SBI", `destination_account` is "Axis".
+    - If user specifies an account paid FROM (e.g., "bought milk from Kotak"), set `source_account` to "Kotak".
+    - If user specifies an account received INTO, set `destination_account`.
+    - If transfer between OWN accounts ("send 10k from SBI to Axis"), intent is `transfer_own`, `source_account` is "SBI", `destination_account` is "Axis".
+12. GENERIC NAMES: If a transaction involves a person but uses a generic term (e.g., "friend", "brother", "mitra", "dost", "vendor") instead of a specific name, you MUST set `needs_clarification = true` and ask for the specific name.
+13. PAST RECURRING: Do NOT mark `future.is_future = true` for recurring transactions that started in the past (e.g., "daily milk from 1st jan"). Only mark future for one-time explicit future dates.
 
 JSON OUTPUT SCHEMA:
 {
@@ -274,23 +285,15 @@ def health_check():
 
 
 def get_account_from_list(accounts_list, target_name=None):
-    """Helper: Finds an account by name (case-insensitive) OR returns the default."""
-    if not accounts_list:
-        return None
-
+    if not accounts_list: return None
     if target_name:
         target_clean = target_name.strip().lower()
         for acc in accounts_list:
             if acc['account_name'].lower() == target_clean:
                 return acc
-        return None  # Explicitly return None if a SPECIFIC account was requested but not found
-
-    # If no specific account requested, find default
+        return None
     for acc in accounts_list:
-        if acc.get('is_default'):
-            return acc
-
-    # Fallback to the first account created
+        if acc.get('is_default'): return acc
     return accounts_list[0]
 
 
@@ -314,11 +317,37 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     user_id = str(request.state.telegram_id)
 
     # =====================================================================
-    # MANDATORY USER REGISTRATION GATEWAY
+    # WAF: INJECTION PROTECTION & STRIKE TRACKER
     # =====================================================================
+    if MALICIOUS_PATTERN.search(text):
+        user_res = supabase_admin.table('users').select('security_strikes').eq('telegram_id', chat_id).execute()
+        current_strikes = 0
+        if user_res.data:
+            current_strikes = user_res.data[0].get('security_strikes') or 0
+
+        new_strikes = current_strikes + 1
+        supabase_admin.table('users').update({'security_strikes': new_strikes}).eq('telegram_id', chat_id).execute()
+
+        if new_strikes >= 3:
+            await send_telegram_reply(chat_id,
+                                      "🚨 *ACCOUNT BLOCKED*\n\nMultiple malicious inputs detected. Your account has been suspended for security reasons.")
+        else:
+            await send_telegram_reply(chat_id,
+                                      f"⚠️ *SECURITY WARNING ({new_strikes}/3)*\n\nMalicious input detected. Please refrain from sending injection scripts. Your account will be blocked after 3 strikes.")
+        return {"ok": True}
+
+    # Check if user is already blocked
     user_res = supabase_admin.table('users').select('*').eq('telegram_id', chat_id).execute()
     user_exists = bool(user_res.data)
 
+    if user_exists and user_res.data[0].get('security_strikes', 0) >= 3:
+        await send_telegram_reply(chat_id,
+                                  "🚨 *ACCOUNT BLOCKED*\n\nYour account is suspended due to security violations.")
+        return {"ok": True}
+
+    # =====================================================================
+    # MANDATORY USER REGISTRATION GATEWAY
+    # =====================================================================
     if text.startswith("/register"):
         reg_parts = text.replace("/register", "").strip()
         name = "PocketMunim User"
@@ -333,7 +362,8 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         if not user_exists:
             try:
                 supabase_admin.table('users').insert(
-                    {"id": user_id, "telegram_id": chat_id, "full_name": name, "currency": currency}).execute()
+                    {"id": user_id, "telegram_id": chat_id, "full_name": name, "currency": currency,
+                     "security_strikes": 0}).execute()
                 await send_telegram_reply(chat_id,
                                           f"✅ *Registration Successful!*\n\nWelcome to PocketMunim, *{name}*! Your account is active.")
             except Exception as e:
@@ -349,7 +379,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     # =====================================================================
-    # COMMAND: ADD ACCOUNT (/addaccount HDFC 5000)
+    # COMMAND: ADD ACCOUNT & SET DEFAULT
     # =====================================================================
     if text.startswith("/addaccount"):
         parts = text.replace("/addaccount", "").strip().split()
@@ -357,7 +387,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id,
                                       "⚠️ Invalid format. Use: `/addaccount [BankName] [InitialBalance]`\nExample: `/addaccount HDFC 5000`")
             return {"ok": True}
-
         acc_name = " ".join(parts[:-1])
         try:
             acc_bal = float(parts[-1])
@@ -365,18 +394,12 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id, "⚠️ Invalid balance amount. Please provide a valid number.")
             return {"ok": True}
 
-        # Check if it's the first account
         existing_accs = supabase_admin.table('accounts').select('id').eq('user_id', user_id).execute()
         is_first = len(existing_accs.data) == 0
-
         try:
             supabase_admin.table('accounts').insert({
-                "user_id": user_id,
-                "account_name": acc_name,
-                "balance": acc_bal,
-                "is_default": is_first  # Auto-make default if it's the first one
+                "user_id": user_id, "account_name": acc_name, "balance": acc_bal, "is_default": is_first
             }).execute()
-
             def_msg = " (Set as Default)" if is_first else ""
             await send_telegram_reply(chat_id,
                                       f"🏦 *Account Added*\nName: {acc_name}\nBalance: ₹{acc_bal:,.2f}{def_msg}")
@@ -384,25 +407,18 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             await send_telegram_reply(chat_id, f"❌ Failed to add account: {str(e)}")
         return {"ok": True}
 
-    # =====================================================================
-    # COMMAND: SET DEFAULT ACCOUNT (/setdefault HDFC)
-    # =====================================================================
     if text.startswith("/setdefault"):
         acc_name = text.replace("/setdefault", "").strip()
         if not acc_name:
             await send_telegram_reply(chat_id, "⚠️ Please provide an account name. Example: `/setdefault HDFC`")
             return {"ok": True}
-
         acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).ilike('account_name',
                                                                                             acc_name).execute()
         if not acc_res.data:
             await send_telegram_reply(chat_id, f"❌ Account '{acc_name}' not found.")
             return {"ok": True}
-
         try:
-            # Remove default from all
             supabase_admin.table('accounts').update({"is_default": False}).eq('user_id', user_id).execute()
-            # Set new default
             supabase_admin.table('accounts').update({"is_default": True}).eq('id', acc_res.data[0]['id']).execute()
             await send_telegram_reply(chat_id, f"✅ '{acc_res.data[0]['account_name']}' is now your default account.")
         except Exception as e:
@@ -413,12 +429,10 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         await send_telegram_reply(chat_id,
                                   "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
         return {"ok": True}
-
     elif text.startswith("/report"):
         await send_telegram_reply(chat_id,
                                   "Dashboard link generated: https://pocketmunim.app/dashboard (Valid for 24 hours)")
         return {"ok": True}
-
     elif text.startswith("/categorypull"):
         query = text.replace("/categorypull", "").strip()
         await send_telegram_reply(chat_id, f"⏳ Pulling categories...")
@@ -440,14 +454,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            # Execution through AI Provider (with failover rotation)
             raw_response_text = execute_resilient_ai(system_prompt=dynamic_system_prompt, user_prompt=text,
                                                      db_client=supabase_admin, is_json=True)
             raw_json = json.loads(raw_response_text)
 
-            # Pydantic schema validation happens here
             validated_data = AITransactionExtraction(**raw_json)
-
             transactions_list = validated_data.transactions
             response_sections = []
             committed_items = []
@@ -463,9 +474,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                           "❌ *No Bank Accounts Configured*\n\nYou must add an account before logging transactions.\n\nUse this command:\n`/addaccount [BankName] [Balance]`\nExample: `/addaccount HDFC 50000`")
                 return {"ok": True}
 
-            # =====================================================================
-            # LOAN PRE-FLIGHT CHECK
-            # =====================================================================
             if validated_data.loan and validated_data.loan.intent == "loan_payment":
                 lender_name = validated_data.loan.lender
                 if lender_name:
@@ -498,7 +506,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         source_acc_obj = None
                         dest_acc_obj = None
 
-                        # Resolve Accounts
                         if tx.intent in ["expense", "transfer_other"]:
                             source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
                             if not source_acc_obj:
@@ -518,7 +525,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         elif tx.intent == "transfer_own":
                             source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
                             dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
-
                             if not source_acc_obj:
                                 response_sections.append(
                                     f"❌ *Source Account Not Found*\nCannot transfer from '{tx.source_account}'.")
@@ -528,9 +534,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                     f"❌ *Destination Account Not Found*\nCannot transfer to '{tx.destination_account}'.")
                                 continue
 
-                        # Balance Validations & Updates
-                        updates_to_make = []  # Tuples of (account_id, new_balance)
-
+                        updates_to_make = []
                         if source_acc_obj:
                             current_bal = Decimal(str(source_acc_obj['balance']))
                             if current_bal < amount:
@@ -543,16 +547,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             current_bal = Decimal(str(dest_acc_obj['balance']))
                             updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount))))
 
-                        # Apply DB Account Balances atomically
                         for acc_id, new_bal in updates_to_make:
                             supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
-                            # Update local cache to prevent double-spending in bulk requests
                             for a in user_accounts:
-                                if a['id'] == acc_id:
-                                    a['balance'] = new_bal
-                        # =========================================================
+                                if a['id'] == acc_id: a['balance'] = new_bal
 
-                        # AI Category Fallback
                         search_item_name = tx.item or description
                         category = None
                         subcategory = None
@@ -578,7 +577,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                 except Exception as e:
                                     pass
 
-                        # Date calculations
                         db_date = current_dt.isoformat()
                         display_date_raw = "Today"
                         if tx.date:
@@ -592,7 +590,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                 except Exception:
                                     pass
 
-                        # Save Transaction Log
                         db_payload = {
                             "user_id": user_id,
                             "amount": float(amount),
@@ -608,7 +605,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         }
                         supabase.table("transactions").insert(db_payload).execute()
 
-                        # UI Formatting
                         intent_lower = tx.intent.lower()
                         if "income" in intent_lower or "credit" in intent_lower:
                             color_badge = "🟢 *INCOME*"
@@ -632,8 +628,11 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 response_sections.append("\n\n".join(committed_items))
 
             if validated_data.loan and validated_data.loan.intent:
-                response_sections.append(
-                    f"🏦 *Loan Alert:* {validated_data.loan.intent} for {validated_data.loan.lender}")
+                # Markdown Crash Fix: Stripping underscores from AI outputs
+                safe_intent_str = validated_data.loan.intent.replace("_", " ").title()
+                safe_lender_str = validated_data.loan.lender.replace("_",
+                                                                     " ") if validated_data.loan.lender else "Unknown Lender"
+                response_sections.append(f"🏦 *Loan Alert:* {safe_intent_str} for {safe_lender_str}")
 
             reply_text = "\n\n".join(
                 response_sections) if response_sections else f"Processed text: '{text}'. No commitments made."
