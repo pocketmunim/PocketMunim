@@ -530,7 +530,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     # =====================================================================
     elif text.startswith("/history"):
         template = """📋 *Historical Data Auto-Template*
-Copy this block, fill in your past numbers, and send it back. The system will automatically log them accurately while safely bypassing your live current balance:
+Copy this block, fill in your past numbers, and send it back. The system will strictly sync everything to your ledger:
 
 ```text
 Salary for Jan 2025 was 50000 received in SBI
@@ -640,7 +640,7 @@ Electricity for Feb 2025 was 2200 paid from SBI
                         continue
 
                     # =========================================================
-                    # HISTORICAL BYPASS & RECURRENCE EXPANSION ENGINE
+                    # RECURRENCE EXPANSION ENGINE (UNIVERSAL DEDUCTION)
                     # =========================================================
                     tx_dates = []
                     is_recurring_past = False
@@ -676,18 +676,7 @@ Electricity for Feb 2025 was 2200 paid from SBI
                         tx_dates = [db_date_obj]
 
                     num_occurrences = Decimal(len(tx_dates))
-
-                    # ----------------- LIVE VS HISTORICAL SEGREGATION -----------------
-                    live_occurrences = 0
-                    historical_occurrences = 0
-
-                    for d_obj in tx_dates:
-                        if d_obj.date() < current_dt.date():
-                            historical_occurrences += 1
-                        else:
-                            live_occurrences += 1
-
-                    live_total = amount * Decimal(live_occurrences)
+                    total_amount = amount * num_occurrences
                     # =========================================================
 
                     if not tx.intent:
@@ -733,30 +722,27 @@ Electricity for Feb 2025 was 2200 paid from SBI
                             continue
 
                     updates_to_make = []
-                    # ONLY DEDUCT LIVE (TODAY/FUTURE) TRANSACTIONS FROM LIVE BALANCE
-                    if live_total > Decimal('0.00'):
+                    # STRICT UNIVERSAL DEDUCTION
+                    if total_amount > Decimal('0.00'):
                         if source_acc_obj:
                             current_bal = Decimal(str(source_acc_obj['balance']))
-                            if current_bal < live_total:
+                            if current_bal < total_amount:
                                 response_sections.append(
-                                    f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but today's transaction(s) require ₹{live_total:,.2f}.")
+                                    f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but transaction requires ₹{total_amount:,.2f}.")
                                 continue
                             updates_to_make.append(
-                                (source_acc_obj['id'], float(current_bal - live_total), "DEBIT", float(live_total)))
+                                (source_acc_obj['id'], float(current_bal - total_amount), "DEBIT", float(total_amount)))
 
                         if dest_acc_obj:
                             current_bal = Decimal(str(dest_acc_obj['balance']))
                             updates_to_make.append(
-                                (dest_acc_obj['id'], float(current_bal + live_total), "CREDIT", float(live_total)))
+                                (dest_acc_obj['id'], float(current_bal + total_amount), "CREDIT", float(total_amount)))
 
                     for acc_id, new_bal, log_type, txn_amount in updates_to_make:
                         supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
                         try:
-                            log_desc = f"{description} (Live Deduction)" if (
-                                        is_recurring_past or historical_occurrences > 0) else description
-                            if is_recurring_past and live_occurrences > 1:
-                                log_desc = f"{description} ({live_occurrences} Live Occurrences)"
-
+                            log_desc = f"{description} ({int(num_occurrences)} Occurrences)" if (
+                                        is_recurring_past and num_occurrences > 1) else description
                             supabase_admin.table('account_logs').insert({
                                 "account_id": acc_id,
                                 "user_id": user_id,
@@ -796,7 +782,7 @@ Electricity for Feb 2025 was 2200 paid from SBI
                             except Exception:
                                 pass
 
-                    # Prepare Batch Insertion Payloads (Both Live and Historical get saved to DB)
+                    # Prepare Batch Insertion Payloads
                     db_payloads = []
                     for d_obj in tx_dates:
                         db_payloads.append({
@@ -841,7 +827,7 @@ Electricity for Feb 2025 was 2200 paid from SBI
                     # Display Formatting
                     if is_recurring_past and num_occurrences > 1:
                         display_date_raw = f"{int(num_occurrences)} Occurrences ({tx_dates[0].strftime('%d %b %Y')} to {tx_dates[-1].strftime('%d %b %Y')})"
-                        amt_display = f"₹{float(amount * num_occurrences):,.2f} (₹{float(amount):,.2f} x {int(num_occurrences)})"
+                        amt_display = f"₹{float(total_amount):,.2f} (₹{float(amount):,.2f} x {int(num_occurrences)})"
                     else:
                         display_date_raw = "Today"
                         if tx.date:
@@ -855,11 +841,8 @@ Electricity for Feb 2025 was 2200 paid from SBI
                                     pass
                         amt_display = f"₹{float(amount):,.2f}"
 
-                    # Explicit UI Warning for the Historical Bypass
-                    bypass_msg = f"\nℹ️ *Historical Bypass Applied:* {historical_occurrences} past transaction(s) logged to charts without deducting from live balance." if historical_occurrences > 0 else ""
-
                     committed_items.append(
-                        f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* {amt_display}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}{bypass_msg}"
+                        f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* {amt_display}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
                     )
 
             if committed_items:
