@@ -2,6 +2,7 @@ import os
 import json
 import httpx
 from decimal import Decimal
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends
 from contextlib import asynccontextmanager
 from supabase import create_client, Client
@@ -45,6 +46,7 @@ async def lifespan(app: FastAPI):
                 commands = {
                     "commands": [
                         {"command": "start", "description": "Start PocketMunim"},
+                        {"command": "register", "description": "Register your account"},
                         {"command": "categorypull", "description": "Seed or refresh categories"},
                         {"command": "report", "description": "Get financial dashboard link"}
                     ]
@@ -66,11 +68,11 @@ async def send_telegram_reply(chat_id: int, text: str):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": chat_id, "text": text})
+        await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (WITH PEER-TO-PEER TRANSFER RULE)
+# FOUNDER FROZEN SYSTEM PROMPT (WITH DYNAMIC TIME INJECTION)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -82,7 +84,7 @@ CRITICAL RULES (NON-NEGOTIABLE):
 4. BULK DETECTION (BUG #1 & #2 FIXED): If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
 5. UNKNOWN CATEGORIES (BUG #5 FIXED): If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
 6. LOAN PAYMENTS (BUG #3 FIXED): A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
-7. EXACT DATES & CURRENCY: Preserve the exact date expression. Default `normalized_currency` to "INR".
+7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. You MUST calculate exact relative dates (e.g., "yesterday" = current date minus 1 day). Output calculated date strictly in YYYY-MM-DD format in `date.relative_date`. Preserve spoken words in `date.raw_expression`. Default currency is INR.
 8. CLARIFICATION: If a transaction is missing a critical component, set `needs_clarification = true` and list missing keys in `clarification_fields`.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers, no conversational text.
 10. PEER-TO-PEER TRANSFERS (NO CASH HALLUCINATION): If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]", and DO NOT assume or hallucinate the word "Cash" unless explicitly stated.
@@ -196,54 +198,25 @@ JSON OUTPUT SCHEMA:
 
 FEW-SHOT EXAMPLES:
 
-User: "got 10k from raj"
+User: "got 10k from raj yesterday"
 Output:
 {
   "metadata": {
-    "raw_user_text": "got 10k from raj",
+    "raw_user_text": "got 10k from raj yesterday",
     "operation_type": "single", "language": "English", "entry_source": "telegram",
     "bulk_operation": false, "category_lookup_required": true, "unsupported_chat": false, "account_required": false
   },
   "transactions": [
     {
       "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 10000, 
-      "normalized_currency": "INR", "item": "Received from raj", "payment_method": null,
+      "normalized_currency": "INR", "item": "Received from Raj", "payment_method": null,
       "category": null, "subcategory": null,
-      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
+      "date": {"raw_expression": "yesterday", "relative_date": "2026-08-04", "date_type": "relative"}, "future": {"is_future": false},
       "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
       "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
       "needs_clarification": false, "confidence": {"overall_confidence": 0.98}
     }
   ]
-}
-
-User: "Salary 85000 credited and paid 15000 EMI for Sushma"
-Output: 
-{
-  "metadata": {
-    "raw_user_text": "Salary 85000 credited and paid 15000 EMI for Sushma",
-    "operation_type": "mixed", "language": "English", "entry_source": "telegram",
-    "bulk_operation": false, "category_lookup_required": false, "unsupported_chat": false, "account_required": true
-  },
-  "transactions": [
-    {
-      "transaction_sequence": 1, "execution_order": 1, "intent": "income", "amount": 85000, 
-      "normalized_currency": "INR", "item": "Salary", "category": "Income", "subcategory": "Salary",
-      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
-      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
-      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
-      "needs_clarification": false, "confidence": {"overall_confidence": 0.99}
-    },
-    {
-      "transaction_sequence": 2, "execution_order": 2, "intent": "expense", "amount": 15000, 
-      "normalized_currency": "INR", "item": "EMI for Sushma", "category": "Loans", "subcategory": "EMI Payment",
-      "date": {"raw_expression": "today", "date_type": "relative"}, "future": {"is_future": false},
-      "validation": {"amount_valid": true, "date_valid": true, "item_valid": true, "account_valid": false},
-      "duplicate_detection": {"possible_duplicate": false, "duplicate_reference": null},
-      "needs_clarification": false, "confidence": {"overall_confidence": 0.99}
-    }
-  ],
-  "loan": {"intent": "loan_payment", "lender": "Sushma", "amount": 15000}
 }
 """
 
@@ -272,9 +245,53 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
-    # Strictly map to Telegram ID based on JSONB Database schema
     user_id = str(request.state.telegram_id)
-    reply_text = "System processing error."
+
+    # =====================================================================
+    # BUSINESS LOGIC: MANDATORY USER REGISTRATION GATEWAY
+    # =====================================================================
+    user_res = supabase_admin.table('users').select('*').eq('telegram_id', chat_id).execute()
+    user_exists = bool(user_res.data)
+
+    # Handle /register command explicitly
+    if text.startswith("/register"):
+        reg_parts = text.replace("/register", "").strip()
+        # Expecting format: Name: John Doe, Currency: INR
+        name = "PocketMunim User"
+        currency = "INR"
+
+        if reg_parts:
+            # Simple parsing or default assignment
+            name = reg_parts.split(",")[0].replace("Name:", "").strip() if "Name:" in reg_parts else reg_parts
+
+        if not user_exists:
+            try:
+                supabase_admin.table('users').insert({
+                    "id": user_id,
+                    "telegram_id": chat_id,
+                    "full_name": name,
+                    "currency": currency
+                }).execute()
+                await send_telegram_reply(chat_id,
+                                          f"✅ *Registration Successful!*\n\nWelcome to PocketMunim, *{name}*! Your account is now active and ready for financial tracking.")
+            except Exception as e:
+                await send_telegram_reply(chat_id, f"❌ Registration failed: {str(e)}")
+        else:
+            await send_telegram_reply(chat_id, "ℹ️ You are already registered with PocketMunim!")
+        return {"ok": True}
+
+    # If user is not registered, block all actions and give copiable registration form
+    if not user_exists:
+        copyable_form = "```text\n/register Name: [Your Full Name], Currency: INR\n```"
+        reg_msg = (
+            "🚨 *Registration Mandatory*\n\n"
+            "To use PocketMunim, you must register your account first.\n\n"
+            "📋 *Copy, fill, and send the registration form below:*\n"
+            f"{copyable_form}"
+        )
+        await send_telegram_reply(chat_id, reg_msg)
+        return {"ok": True}
+    # =====================================================================
 
     # 1. Handle System Commands
     if text.startswith("/start"):
@@ -320,8 +337,19 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             if not groq_client:
                 raise Exception("Groq API client is not configured.")
 
+            # Calculate precise IST time dynamically
+            tz_ist = timezone(timedelta(hours=5, minutes=30))
+            current_dt = datetime.now(tz_ist)
+            current_date_str = current_dt.strftime("%Y-%m-%d")
+            current_day_str = current_dt.strftime("%A")
+
+            dynamic_system_prompt = SYSTEM_PROMPT.replace(
+                "{CURRENT_DATE}",
+                f"{current_date_str} ({current_day_str})"
+            )
+
             messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": dynamic_system_prompt},
                 {"role": "user", "content": text}
             ]
 
@@ -338,6 +366,20 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
             transactions_list = validated_data.transactions
             response_sections = []
             committed_items = []
+
+            # =====================================================================
+            # BUSINESS LOGIC: LOAN EXISTENCE VERIFICATION FOR EMIS
+            # =====================================================================
+            if validated_data.loan and validated_data.loan.intent == "loan_payment":
+                lender_name = validated_data.loan.lender
+                if lender_name:
+                    loan_check = supabase_admin.table('loans').select('*').eq('user_id', user_id).ilike('lender',
+                                                                                                        lender_name).execute()
+                    if not loan_check.data:
+                        await send_telegram_reply(chat_id,
+                                                  f"❌ *Loan Verification Failed*\n\nNo active loan record found for lender **'{lender_name}'**. Please register the loan in the system before logging an EMI payment.")
+                        return {"ok": True}
+            # =====================================================================
 
             if supabase and transactions_list:
                 cache_manager = CategoryCacheManager(supabase, user_id)
@@ -359,28 +401,38 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             continue
 
                         # =========================================================
+                        # BUSINESS LOGIC: SUFFICIENT BALANCE VALIDATION
+                        # =========================================================
+                        if tx.intent == "expense":
+                            source_acc = tx.source_account or "Default"
+                            acc_res = supabase_admin.table('accounts').select('balance').eq('user_id', user_id).ilike(
+                                'account_name', source_acc).execute()
+                            if acc_res.data:
+                                current_bal = Decimal(str(acc_res.data[0]['balance']))
+                                if current_bal < amount:
+                                    response_sections.append(
+                                        f"❌ *Insufficient Balance*\nAccount **'{source_acc}'** has ₹{current_bal:,.2f}, but required amount is ₹{amount:,.2f}.")
+                                    continue
+                        # =========================================================
+
+                        # =========================================================
                         # PHASE 4: DYNAMIC WATERFALL (RAM -> AI -> REBUILD)
                         # =========================================================
                         search_item_name = tx.item or description
                         category = None
                         subcategory = None
-                        source_origin = "Unresolved"
 
-                        # TIER 1: Check In-Memory JSONB RAM Cache
                         cached_match = cache_manager.search_item(search_item_name)
                         if cached_match and cached_match.get("category"):
                             category = cached_match["category"]
                             subcategory = cached_match.get("subcategory")
-                            source_origin = "Tier 1: In-Memory RAM Cache"
 
-                        # TIER 3: AI Fallback Fetch
                         if not category:
                             ai_classified = category_pull_service.classify_item(search_item_name)
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
 
                             normalized_taxonomy_item = ai_classified.get("normalized_item") or search_item_name
-                            source_origin = "Tier 3: AI Fallback"
 
                             if category:
                                 try:
@@ -394,10 +446,27 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                                 except Exception as e:
                                     print(f"Failed to persist AI fallback: {str(e)}")
 
-                        print(
-                            f"[CATEGORY SOURCE] Item: '{search_item_name}' | Category: '{category}' | Origin: {source_origin}")
+                        # Date calculation logic
+                        db_date = current_dt.isoformat()
+                        display_date_raw = "Today"
 
-                        # REVERTED DB PAYLOAD: Strictly matches original working schema to prevent PGRST204
+                        if tx.date:
+                            if tx.date.raw_expression:
+                                display_date_raw = str(tx.date.raw_expression).title()
+
+                            if tx.date.relative_date:
+                                try:
+                                    date_part = tx.date.relative_date.split("T")[0]
+                                    parsed_date = datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=tz_ist)
+                                    db_date = parsed_date.isoformat()
+                                    formatted_display = parsed_date.strftime("%d %b %Y")
+                                    if display_date_raw.lower() != "today":
+                                        display_date_raw = f"{formatted_display} ({display_date_raw})"
+                                    else:
+                                        display_date_raw = formatted_display
+                                except Exception:
+                                    pass
+
                         db_payload = {
                             "user_id": user_id,
                             "amount": float(amount),
@@ -405,18 +474,42 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             "description": description,
                             "intent": tx.intent,
                             "category": category,
+                            "date": db_date,
                             "soft_deleted": False
                         }
                         supabase.table("transactions").insert(db_payload).execute()
-                        cat_display = category if category else "Unassigned"
-                        committed_items.append(f"{description}: ₹{amount} [{cat_display}]")
+
+                        # =========================================================
+                        # COLOR-CODED UI BADGES & FORMATTING
+                        # =========================================================
+                        intent_lower = tx.intent.lower()
+                        if "income" in intent_lower or "credit" in intent_lower:
+                            color_badge = "🟢 *INCOME*"
+                        elif "expense" in intent_lower or "debit" in intent_lower:
+                            color_badge = "🔴 *EXPENSE*"
+                        elif "transfer" in intent_lower:
+                            color_badge = "🔵 *TRANSFER*"
+                        else:
+                            color_badge = "🟠 *TRANSACTION*"
+
+                        cat_display = f"{category} -> {subcategory}" if subcategory else (category or "Unassigned")
+
+                        commit_msg = (
+                            f"✅ *Transaction Saved Successfully*\n"
+                            f"{color_badge}\n"
+                            f"🔹 *Item:* {description}\n"
+                            f"🔹 *Amount:* ₹{float(amount):,.2f}\n"
+                            f"🔹 *Date:* {display_date_raw}\n"
+                            f"🔹 *Category:* {cat_display}"
+                        )
+                        committed_items.append(commit_msg)
 
             if committed_items:
-                response_sections.append("Committed to Ledger:\n" + "\n".join(committed_items))
+                response_sections.append("\n\n".join(committed_items))
 
             if validated_data.loan and validated_data.loan.intent:
                 response_sections.append(
-                    f"Loan intent detected: {validated_data.loan.intent} for {validated_data.loan.lender}")
+                    f"🏦 *Loan Alert:* {validated_data.loan.intent} for {validated_data.loan.lender}")
 
             if not response_sections:
                 reply_text = f"Processed command/text: '{text}'. No transactional intents committed to DB."
