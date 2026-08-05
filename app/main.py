@@ -339,7 +339,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         if added_count > 0:
             cache_manager = CategoryCacheManager(supabase, user_id)
             cache_manager.rebuild_cache()
-            success_msg = f"✅ Successfully pulled and mapped {added_count} items to the database and refreshed In-Memory Cache."
+            success_msg = f"✅ Successfully pulled and mapped {added_count} new items to the database and refreshed Cache."
             await send_telegram_reply(chat_id, success_msg)
         else:
             error_reason = pull_result.get("error", "Unknown logic failure")
@@ -411,15 +411,17 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             ai_classified = category_pull_service.classify_item(search_item_name)
                             category = ai_classified.get("category")
                             subcategory = ai_classified.get("subcategory") or "General"
+
+                            # Retrieve the normalized, generic item name from the AI to keep Taxonomy clean
+                            normalized_taxonomy_item = ai_classified.get("normalized_item") or search_item_name
                             source_origin = "Tier 3: AI Fallback"
 
-                            # IF FOUND BY AI -> Persist to DB JSONB ARRAY -> REBUILD RAM CACHE
                             if category:
                                 try:
                                     category_pull_service.add_single_item_to_taxonomy(
                                         cat_name=category,
                                         sub_name=subcategory,
-                                        item_name=search_item_name,
+                                        item_name=normalized_taxonomy_item,
                                         user_id=user_id
                                     )
                                     cache_manager.rebuild_cache()
@@ -433,6 +435,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                             "user_id": user_id,
                             "amount": float(amount),
                             "txn_type": tx.intent,
+                            # Save original raw text for the user's ledger view
                             "description": description,
                             "intent": tx.intent,
                             "category": category,

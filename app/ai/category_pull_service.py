@@ -14,16 +14,12 @@ class CategoryPullService:
             result["error"] = "System configuration missing."
             return result
 
-        # =====================================================================
-        # 1. FETCH EXISTING DB RECORDS FIRST (For Exclusion List & Merging)
-        # =====================================================================
         existing_res = self.admin_db.table('categories').select('*').eq('user_id', user_id).execute()
         existing_data = existing_res.data or []
 
         db_map = {}
         existing_items_set = set()
 
-        # Build case-insensitive map for merging AND collect all existing items
         for row in existing_data:
             cat_key = row['category_name'].strip().lower()
             db_map[cat_key] = row
@@ -31,15 +27,11 @@ class CategoryPullService:
                 for item in sub.get('items', []):
                     existing_items_set.add(item.strip().lower())
 
-        # Generate Exclusion Text if user already has items
         exclusion_text = ""
         if existing_items_set:
             existing_items_str = ", ".join(sorted(existing_items_set))
             exclusion_text = f"\n\nCRITICAL EXCLUSION LIST:\nThe user ALREADY HAS the following items. You MUST NOT generate any of these items. Generate completely NEW, unlisted items:\n[{existing_items_str}]\n"
 
-        # =====================================================================
-        # 2. CONSTRUCT AI PROMPT WITH EXCLUSION LIST
-        # =====================================================================
         base_rules_and_format = f"""
 RULES:
 1. Generate realistic day-to-day purchases.
@@ -74,9 +66,6 @@ OUTPUT FORMAT:
         else:
             system_prompt = f"You are the PocketMunim Taxonomy Engine. Generate 15-20 items STRICTLY RELATED TO: '{query}'.\n{base_rules_and_format}"
 
-        # =====================================================================
-        # 3. EXECUTE AI PULL
-        # =====================================================================
         try:
             completion = self.ai.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -98,9 +87,6 @@ OUTPUT FORMAT:
 
             db_errors = []
 
-            # =====================================================================
-            # 4. INTELLIGENT DEEP MERGE (CASE INSENSITIVE)
-            # =====================================================================
             for cat_obj in taxonomy_list:
                 raw_cat_name = cat_obj.get("category_name", "").strip()
                 new_subs = cat_obj.get("subcategories", [])
@@ -118,7 +104,6 @@ OUTPUT FORMAT:
 
                         sub_dict = {}
 
-                        # Load existing subcategories
                         for s in existing_subs:
                             s_key = s.get('subcategory_name', 'General').strip().lower()
                             sub_dict[s_key] = {
@@ -126,7 +111,6 @@ OUTPUT FORMAT:
                                 "items": {i.strip().lower(): i.strip() for i in s.get('items', [])}
                             }
 
-                        # Merge new AI subcategories and items safely
                         for ns in new_subs:
                             raw_s_name = ns.get('subcategory_name', 'General').strip()
                             s_key = raw_s_name.lower()
@@ -140,17 +124,14 @@ OUTPUT FORMAT:
                                 if i_key not in sub_dict[s_key]["items"]:
                                     sub_dict[s_key]["items"][i_key] = i.strip()
 
-                                    # Reconstruct JSONB array
                         merged_subs = [{"subcategory_name": v["original_name"], "items": list(v["items"].values())} for
                                        v in sub_dict.values()]
 
-                        # Push exact updated array to DB
                         self.admin_db.table('categories').update({"subcategories": merged_subs}).eq('user_id',
                                                                                                     user_id).eq(
                             'category_name', actual_cat_name).execute()
                         db_map[cat_key]['subcategories'] = merged_subs
                     else:
-                        # Insert completely new category row
                         clean_subs = []
                         for ns in new_subs:
                             raw_s_name = ns.get('subcategory_name', 'General').strip()
@@ -182,7 +163,6 @@ OUTPUT FORMAT:
             return result
 
     def add_single_item_to_taxonomy(self, cat_name: str, sub_name: str, item_name: str, user_id: str) -> None:
-        """Helper for Transaction AI Fallback to safely merge a single item into the JSONB array."""
         if not self.admin_db or not cat_name or not sub_name or not item_name: return
         try:
             res = self.admin_db.table('categories').select('*').eq('user_id', user_id).ilike('category_name',
@@ -215,10 +195,20 @@ OUTPUT FORMAT:
             print(f"Fallback insert error: {e}")
 
     def classify_item(self, item_name: str) -> dict:
-        if not self.ai: return {"category": None, "subcategory": None, "item": item_name}
+        if not self.ai: return {"category": None, "subcategory": None, "normalized_item": item_name}
+
         system_prompt = """You are the PocketMunim Category Classification Engine.
-Classify the given item into a day-to-day Category and most specific Subcategory. Return ONLY JSON.
-OUTPUT FORMAT MUST BE STRICT JSON: {"category": "...", "subcategory": "...", "item": "..."}"""
+Classify the given input into a day-to-day Category and most specific Subcategory.
+
+CRITICAL NORMALIZATION RULE:
+If the input is a full sentence or contains specific amounts, personal names, or hardcoded details (e.g., "received 50k from sushma" or "bought pizza for 500"), you MUST generalize it. Strip out the specific details and return a clean, generic, reusable item name for a taxonomy tree (e.g., "Personal Transfer" or "Pizza").
+
+OUTPUT FORMAT MUST BE STRICT JSON:
+{
+  "category": "string",
+  "subcategory": "string",
+  "normalized_item": "clean generic string"
+}"""
         try:
             completion = self.ai.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -231,7 +221,10 @@ OUTPUT FORMAT MUST BE STRICT JSON: {"category": "...", "subcategory": "...", "it
             )
             raw_content = completion.choices[0].message.content.strip()
             parsed = json.loads(raw_content)
-            return {"category": parsed.get("category"), "subcategory": parsed.get("subcategory"),
-                    "item": parsed.get("item") or item_name}
+            return {
+                "category": parsed.get("category"),
+                "subcategory": parsed.get("subcategory"),
+                "normalized_item": parsed.get("normalized_item") or item_name
+            }
         except Exception:
-            return {"category": None, "subcategory": None, "item": item_name}
+            return {"category": None, "subcategory": None, "normalized_item": item_name}
