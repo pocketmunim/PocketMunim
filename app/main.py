@@ -151,7 +151,7 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (STRICT RESTORATION)
+# FOUNDER FROZEN SYSTEM PROMPT (WITH RULES 8 & 13 REINSTATED)
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -419,7 +419,7 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     # =====================================================================
-    # ENHANCED MANDATORY REGISTRATION & SALARY STRUCTURING
+    # MANDATORY REGISTRATION GATEWAY & HARDENED VALIDATION
     # =====================================================================
     if not user_exists and not text.startswith("/register"):
         copyable_form = "```text\n/register\nName: [Your Name]\nCurrency: INR\nMonthly Salary: [Amount]\nBank Account: [Bank Name]\nCurrent Balance: [Amount]\n```"
@@ -428,17 +428,19 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
         return {"ok": True}
 
     if text.startswith("/register"):
-        if "[" in text or "]" in text or "Your Name" in text:
+        # Strict validation against placeholder brackets or blank forms
+        if "[" in text or "]" in text or "Your Name" in text or len(text.replace("/register", "").strip()) < 10:
+            copyable_form = "```text\n/register\nName: [Your Name]\nCurrency: INR\nMonthly Salary: [Amount]\nBank Account: [Bank Name]\nCurrent Balance: [Amount]\n```"
             await send_telegram_reply(chat_id,
-                                      "⚠️ *Invalid Data Detected*\n\nPlease replace the placeholder brackets (e.g. `[Your Name]`) with your actual information before sending.")
+                                      f"⚠️ *Invalid or Incomplete Registration Form*\n\nPlease fill in all required fields properly (do not leave placeholder brackets like `[Your Name]`).\n\n📋 *Copy and fill this form:*\n{copyable_form}")
             return {"ok": True}
 
         lines = text.split("\n")
-        name = "PocketMunim User"
+        name = ""
         currency = "INR"
-        monthly_salary = 0.0
-        bank_name = "Default"
-        current_balance = 0.0
+        monthly_salary = None
+        bank_name = ""
+        current_balance = None
 
         for line in lines:
             if "Name:" in line: name = line.split("Name:")[1].strip().title()
@@ -455,20 +457,23 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                 except:
                     pass
 
+        # Hardened check to ensure real information was provided
+        if not name or monthly_salary is None or not bank_name or current_balance is None:
+            await send_telegram_reply(chat_id,
+                                      "❌ *Registration Failed*\n\nMissing required fields (Name, Monthly Salary, Bank Account, or Current Balance). Please use the `/history` or registration template correctly.")
+            return {"ok": True}
+
         if not user_exists:
             try:
-                # Insert User
                 supabase_admin.table('users').insert(
                     {"id": user_id, "telegram_id": chat_id, "full_name": name, "currency": currency,
                      "security_strikes": 0}).execute()
 
-                # Insert Account Initial Record
                 acc_res = supabase_admin.table('accounts').insert({
                     "user_id": user_id, "account_name": bank_name, "balance": current_balance, "is_default": True
                 }).execute()
                 acc_id = acc_res.data[0]['id']
 
-                # Retroactive Salary Structuring
                 tz_ist = timezone(timedelta(hours=5, minutes=30))
                 current_dt = datetime.now(tz_ist)
                 current_year = current_dt.year
@@ -497,7 +502,6 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                         }).execute()
                         total_salary_added += monthly_salary
 
-                # Final Balance Update
                 final_balance = current_balance + total_salary_added
                 supabase_admin.table('accounts').update({"balance": final_balance}).eq("id", acc_id).execute()
 
@@ -875,13 +879,11 @@ Electricity for Jan 2025 was 2000 paid from SBI
                     amount = tx.amount if tx.amount else Decimal('0.00')
                     description = str(tx.item or tx.merchant or text).title()
 
-                    # EXACT ORIGINAL NESTING RESTORED
                     if amount > Decimal('0.00'):
                         if tx.future and tx.future.is_future:
                             response_sections.append(f"🗓️ '{description}' identified as a future plan.")
                             continue
 
-                        # EXACT ORIGINAL CLARIFICATION LOGIC RESTORED
                         if not tx.intent or tx.needs_clarification:
                             response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
                             continue
