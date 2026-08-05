@@ -23,7 +23,6 @@ GROQ_API_KEYS = os.getenv("GROQ_API_KEYS", "").split(",")
 
 # Initialize Supabase Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
-# Admin client to bypass RLS/Auth for background/manual seeding
 supabase_admin: Client = create_client(SUPABASE_URL,
                                        SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else supabase
 
@@ -284,7 +283,33 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
     if not text or not chat_id:
         return {"ok": True}
 
-    user_id = request.state.telegram_id
+    # =====================================================================
+    # CRITICAL FIX: RESOLVE SUPABASE UUID INSTEAD OF TELEGRAM ID
+    # =====================================================================
+    # 1. Attempt to grab the standard 'user_id' UUID set by your Auth Middleware
+    user_id = getattr(request.state, "user_id", None)
+
+    # 2. If it's stored inside a 'user' object instead, extract it
+    if not user_id and hasattr(request.state, "user"):
+        user_id = request.state.user.get("id")
+
+    # 3. If it's still missing or is just the Telegram ID, try a DB fallback lookup
+    if not user_id or str(user_id) == str(chat_id):
+        try:
+            # Assumes a typical 'users' table linking telegram_id to UUID
+            res = supabase_admin.table('users').select('id').eq('telegram_id', chat_id).execute()
+            if res.data:
+                user_id = res.data[0]['id']
+        except Exception:
+            pass
+
+    # 4. Final safety halt: If we still don't have a UUID, stop processing to prevent DB crash
+    if not user_id or "-" not in str(user_id):
+        await send_telegram_reply(chat_id,
+                                  f"❌ Database UUID Error: The system requires a Supabase UUID but received '{user_id}'. Please verify your auth middleware properly passes the UUID.")
+        return {"ok": True}
+    # =====================================================================
+
     reply_text = "System processing error."
 
     # 1. Handle System Commands
