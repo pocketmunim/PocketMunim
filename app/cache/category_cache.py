@@ -46,39 +46,34 @@ class CategoryCacheManager:
 
     def rebuild_cache(self) -> None:
         """
-        Queries relational `categories` table, builds JSON, saves to DB,
-        and REFRESHES IN-MEMORY RAM CACHE simultaneously.
+        Reads all items from `categories`, builds JSON tree, saves to DB,
+        and REFRESHES IN-MEMORY RAM CACHE dynamically.
         """
         try:
             response = self.db.table('categories').select('*').eq('user_id', self.user_id).execute()
             rows = response.data or []
 
             tree: Dict[str, Dict[str, list]] = {}
-            category_map = {row['id']: row for row in rows}
 
-            # Build Tree Logic
+            # Dynamic Flat-to-Tree Builder (Supports AI generated records)
             for row in rows:
-                if row['level'] == 'CATEGORY' and not row.get('parent_id'):
-                    tree[row['name']] = {}
-            for row in rows:
-                if row['level'] == 'SUBCATEGORY' and row.get('parent_id') in category_map:
-                    parent_name = category_map[row['parent_id']]['name']
-                    if parent_name not in tree:
-                        tree[parent_name] = {}
-                    tree[parent_name][row['name']] = []
-            for row in rows:
-                if row['level'] == 'ITEM' and row.get('parent_id') in category_map:
-                    sub_row = category_map[row['parent_id']]
-                    sub_name = sub_row['name']
-                    parent_id = sub_row['parent_id']
-                    if parent_id in category_map:
-                        cat_name = category_map[parent_id]['name']
-                        if cat_name in tree and sub_name in tree[cat_name]:
-                            tree[cat_name][sub_name].append(row['name'])
+                if row.get('level') == 'ITEM':
+                    cat = row.get('category') or "General"
+                    sub = "Uncategorized"  # Flattened AI items land here dynamically
 
-            # 1. Update Supabase DB JSONB
+                    if cat not in tree:
+                        tree[cat] = {}
+                    if sub not in tree[cat]:
+                        tree[cat][sub] = []
+
+                    item_name = row.get('name')
+                    if item_name and item_name not in tree[cat][sub]:
+                        tree[cat][sub].append(item_name)
+
+            # 1. Update Supabase DB JSONB Cache
             self.db.table('category_cache').upsert({"user_id": self.user_id, "cache_data": tree}).execute()
-            # 2. Update Python RAM In-Memory
+
+            # 2. Update Python RAM In-Memory Cache
             _MEMORY_DICT[self.user_id] = tree
 
         except Exception as e:
