@@ -77,7 +77,7 @@ async def send_telegram_reply(chat_id: int, text: str):
 
 
 # =====================================================================
-# FOUNDER FROZEN SYSTEM PROMPT (STRICT CLARIFICATION & DATES)
+# FOUNDER FROZEN SYSTEM PROMPT
 # =====================================================================
 SYSTEM_PROMPT = """SYSTEM ROLE:
 You are the PocketMunim Enterprise NLP Extraction Engine. Your exclusive mandate is to extract financial data, commands, and intents from unstructured multi-lingual text (English, Hindi, Marathi, Hinglish) and output a STRICT, heavily nested JSON object.
@@ -88,9 +88,9 @@ CRITICAL RULES (NON-NEGOTIABLE):
 3. MULTI-INTENT & SEQUENCING: A single message may contain multiple operations. Extract each as a separate object in the `transactions` array. Assign a chronological `execution_order`.
 4. BULK DETECTION: If the user lists MORE THAN 5 expense items (i.e., 6 or more), set `metadata.bulk_operation = true` and `operation_type = "bulk"`.
 5. UNKNOWN CATEGORIES: If you cannot confidently map an item to a standard category, set the transaction's `category` and `subcategory` to `null`, AND strictly set `metadata.category_lookup_required = true`.
-6. LOAN PAYMENTS: A loan payment MUST generate two intents: an `expense` (to deduct the bank balance) in the `transactions` array, AND a `loan_payment` intent in the `loan` object.
+6. LOANS: For paying a loan EMI, generate 'expense' in transactions AND 'loan_payment' in loan. For RECEIVING/ADDING a loan, generate 'income' in transactions AND 'loan_add' in loan.
 7. EXACT DATES & CURRENCY: TODAY IS {CURRENT_DATE}. Calculate relative dates strictly in YYYY-MM-DD. For "last month", "last year", or "last week", subtract exactly that interval from today (e.g., Aug 5 minus 1 month is Jul 5). DO NOT default to the 1st of the month.
-8. CLARIFICATION STRICTNESS: ONLY set `needs_clarification = true` if the AMOUNT or INTENT is completely unknown. NEVER ask for clarification for missing accounts, categories, items, or payment methods (the system handles defaults automatically).
+8. CLARIFICATION STRICTNESS: You MUST NOT set needs_clarification = true unless the AMOUNT is missing or Rule 12 applies. Never ask for missing accounts, categories, or payment methods.
 9. JSON ONLY: Output NOTHING but valid JSON. No markdown wrappers.
 10. PEER-TO-PEER TRANSFERS: If a user receives money (e.g., "got 10k from raj"), set intent to "income", item to "Received from [Name]".
 11. ACCOUNT ROUTING: 
@@ -499,156 +499,171 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
                     # <--- Title Casing applied to Item Description
                     description = str(tx.item or tx.merchant or text).title()
 
-                    if amount > Decimal('0.00'):
-                        if tx.future and tx.future.is_future:
-                            response_sections.append(f"🗓️ '{description}' identified as a future plan.")
+                    if amount <= Decimal('0.00'):
+                        response_sections.append(
+                            f"⚠️ Could not process '{description}'. Please specify a valid amount.")
+                        continue
+
+                    if tx.future and tx.future.is_future:
+                        response_sections.append(f"🗓️ '{description}' identified as a future plan.")
+                        continue
+
+                    if not tx.intent:
+                        response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
+                        continue
+
+                    # Filter false-positive clarifications from LLM
+                    if tx.needs_clarification:
+                        fields = " ".join(tx.clarification_fields).lower() if tx.clarification_fields else ""
+                        if "name" in fields or "person" in fields or "lender" in fields:
+                            missing = ", ".join(tx.clarification_fields) if tx.clarification_fields else "Name/Person"
+                            response_sections.append(f"⚠️ Could not process '{description}'. Please clarify: {missing}")
                             continue
 
-                        if not tx.intent or tx.needs_clarification:
-                            response_sections.append(f"⚠️ Could not process '{description}'. Please clarify intent.")
+                    # =========================================================
+                    # STRICT ACCOUNT ROUTING & BALANCE VALIDATION
+                    # =========================================================
+                    source_acc_obj = None
+                    dest_acc_obj = None
+
+                    if tx.intent in ["expense", "transfer_other"]:
+                        source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
+                        if not source_acc_obj:
+                            requested_acc = tx.source_account or "Default"
+                            response_sections.append(
+                                f"❌ *Account Not Found*\nCannot pay from '{requested_acc}', as it does not exist in your system.")
                             continue
 
-                        # =========================================================
-                        # STRICT ACCOUNT ROUTING & BALANCE VALIDATION
-                        # =========================================================
-                        source_acc_obj = None
-                        dest_acc_obj = None
+                    elif tx.intent == "income":
+                        dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
+                        if not dest_acc_obj:
+                            requested_acc = tx.destination_account or "Default"
+                            response_sections.append(
+                                f"❌ *Account Not Found*\nCannot receive into '{requested_acc}', as it does not exist.")
+                            continue
 
-                        if tx.intent in ["expense", "transfer_other"]:
-                            source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
-                            if not source_acc_obj:
-                                requested_acc = tx.source_account or "Default"
-                                response_sections.append(
-                                    f"❌ *Account Not Found*\nYou requested to pay from '{requested_acc}', but it does not exist in your system.")
-                                continue
+                    elif tx.intent == "transfer_own":
+                        source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
+                        dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
+                        if not source_acc_obj:
+                            response_sections.append(
+                                f"❌ *Source Account Not Found*\nCannot transfer from '{tx.source_account or 'Default'}'.")
+                            continue
+                        if not dest_acc_obj:
+                            response_sections.append(
+                                f"❌ *Destination Account Not Found*\nCannot transfer to '{tx.destination_account or 'Default'}'.")
+                            continue
 
-                        elif tx.intent == "income":
-                            dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
-                            if not dest_acc_obj:
-                                requested_acc = tx.destination_account or "Default"
-                                response_sections.append(
-                                    f"❌ *Account Not Found*\nYou requested to receive into '{requested_acc}', but it does not exist.")
-                                continue
+                    updates_to_make = []
+                    if source_acc_obj:
+                        current_bal = Decimal(str(source_acc_obj['balance']))
+                        if current_bal < amount:
+                            response_sections.append(
+                                f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but transaction requires ₹{amount:,.2f}.")
+                            continue
+                        updates_to_make.append((source_acc_obj['id'], float(current_bal - Decimal(amount)), "DEBIT"))
 
-                        elif tx.intent == "transfer_own":
-                            source_acc_obj = get_account_from_list(user_accounts, tx.source_account)
-                            dest_acc_obj = get_account_from_list(user_accounts, tx.destination_account)
-                            if not source_acc_obj:
-                                response_sections.append(
-                                    f"❌ *Source Account Not Found*\nCannot transfer from '{tx.source_account}'.")
-                                continue
-                            if not dest_acc_obj:
-                                response_sections.append(
-                                    f"❌ *Destination Account Not Found*\nCannot transfer to '{tx.destination_account}'.")
-                                continue
+                    if dest_acc_obj:
+                        current_bal = Decimal(str(dest_acc_obj['balance']))
+                        updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount)), "CREDIT"))
 
-                        updates_to_make = []
-                        if source_acc_obj:
-                            current_bal = Decimal(str(source_acc_obj['balance']))
-                            if current_bal < amount:
-                                response_sections.append(
-                                    f"❌ *Insufficient Balance*\nAccount **'{source_acc_obj['account_name']}'** has ₹{current_bal:,.2f}, but transaction requires ₹{amount:,.2f}.")
-                                continue
-                            updates_to_make.append(
-                                (source_acc_obj['id'], float(current_bal - Decimal(amount)), "DEBIT"))
+                    for acc_id, new_bal, log_type in updates_to_make:
+                        supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
 
-                        if dest_acc_obj:
-                            current_bal = Decimal(str(dest_acc_obj['balance']))
-                            updates_to_make.append((dest_acc_obj['id'], float(current_bal + Decimal(amount)), "CREDIT"))
+                        # --- ACCOUNT LOGGING ---
+                        try:
+                            supabase_admin.table('account_logs').insert({
+                                "account_id": acc_id,
+                                "user_id": user_id,
+                                "log_type": log_type,
+                                "amount": float(amount),
+                                "balance_after": new_bal,
+                                "description": description
+                            }).execute()
+                        except Exception:
+                            pass
 
-                        for acc_id, new_bal, log_type in updates_to_make:
-                            supabase_admin.table('accounts').update({"balance": new_bal}).eq("id", acc_id).execute()
+                        for a in user_accounts:
+                            if a['id'] == acc_id: a['balance'] = new_bal
 
-                            # --- ACCOUNT LOGGING ---
+                    search_item_name = description
+                    category = None
+                    subcategory = None
+
+                    cached_match = cache_manager.search_item(search_item_name)
+                    if cached_match and cached_match.get("category"):
+                        category = cached_match["category"]
+                        subcategory = cached_match.get("subcategory")
+
+                    if not category:
+                        ai_classified = category_pull_service.classify_item(search_item_name, intent=tx.intent)
+                        category = ai_classified.get("category")
+                        subcategory = ai_classified.get("subcategory") or "General"
+
+                        # <--- Title Casing applied to AI generated taxonomy normalization
+                        normalized_taxonomy_item = str(ai_classified.get("normalized_item") or search_item_name).title()
+
+                        if category:
                             try:
-                                supabase_admin.table('account_logs').insert({
-                                    "account_id": acc_id,
-                                    "user_id": user_id,
-                                    "log_type": log_type,
-                                    "amount": float(amount),
-                                    "balance_after": new_bal,
-                                    "description": description
-                                }).execute()
-                            except Exception as e:
+                                category_pull_service.add_single_item_to_taxonomy(
+                                    cat_name=category, sub_name=subcategory, item_name=normalized_taxonomy_item,
+                                    user_id=user_id
+                                )
+                                cache_manager.rebuild_cache()
+                            except Exception:
                                 pass
 
-                            for a in user_accounts:
-                                if a['id'] == acc_id: a['balance'] = new_bal
+                    db_date = current_dt.isoformat()
+                    display_date_raw = "Today"
+                    if tx.date:
+                        if tx.date.raw_expression: display_date_raw = str(tx.date.raw_expression).title()
+                        if tx.date.relative_date:
+                            try:
+                                parsed_date = datetime.strptime(tx.date.relative_date.split("T")[0],
+                                                                "%Y-%m-%d").replace(tzinfo=tz_ist)
+                                db_date = parsed_date.isoformat()
+                                display_date_raw = parsed_date.strftime("%d %b %Y")
+                            except Exception:
+                                pass
 
-                        search_item_name = description
-                        category = None
-                        subcategory = None
+                    db_payload = {
+                        "user_id": user_id,
+                        "amount": float(amount),
+                        "txn_type": tx.intent,
+                        "description": description,
+                        "intent": tx.intent,
+                        "category": category,
+                        "subcategory": subcategory,
+                        "date": db_date,
+                        "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
+                        "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
+                        "soft_deleted": False
+                    }
 
-                        cached_match = cache_manager.search_item(search_item_name)
-                        if cached_match and cached_match.get("category"):
-                            category = cached_match["category"]
-                            subcategory = cached_match.get("subcategory")
-
-                        if not category:
-                            ai_classified = category_pull_service.classify_item(search_item_name, intent=tx.intent)
-                            category = ai_classified.get("category")
-                            subcategory = ai_classified.get("subcategory") or "General"
-
-                            # <--- Title Casing applied to AI generated taxonomy normalization
-                            normalized_taxonomy_item = str(
-                                ai_classified.get("normalized_item") or search_item_name).title()
-
-                            if category:
-                                try:
-                                    category_pull_service.add_single_item_to_taxonomy(
-                                        cat_name=category, sub_name=subcategory, item_name=normalized_taxonomy_item,
-                                        user_id=user_id
-                                    )
-                                    cache_manager.rebuild_cache()
-                                except Exception as e:
-                                    pass
-
-                        db_date = current_dt.isoformat()
-                        display_date_raw = "Today"
-                        if tx.date:
-                            if tx.date.raw_expression: display_date_raw = str(tx.date.raw_expression).title()
-                            if tx.date.relative_date:
-                                try:
-                                    parsed_date = datetime.strptime(tx.date.relative_date.split("T")[0],
-                                                                    "%Y-%m-%d").replace(tzinfo=tz_ist)
-                                    db_date = parsed_date.isoformat()
-                                    display_date_raw = parsed_date.strftime("%d %b %Y")
-                                except Exception:
-                                    pass
-
-                        db_payload = {
-                            "user_id": user_id,
-                            "amount": float(amount),
-                            "txn_type": tx.intent,
-                            "description": description,
-                            "intent": tx.intent,
-                            "category": category,
-                            "subcategory": subcategory,
-                            "date": db_date,
-                            "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
-                            "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
-                            "soft_deleted": False
-                        }
+                    try:
                         supabase.table("transactions").insert(db_payload).execute()
+                    except Exception as e:
+                        response_sections.append(f"❌ Failed to save '{description}': Database error.")
+                        continue
 
-                        intent_lower = tx.intent.lower()
-                        if "income" in intent_lower or "credit" in intent_lower:
-                            color_badge = "🟢 *INCOME*"
-                            acc_text = f"🔹 *To Account:* {dest_acc_obj['account_name']}"
-                        elif "expense" in intent_lower or "debit" in intent_lower:
-                            color_badge = "🔴 *EXPENSE*"
-                            acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}"
-                        elif "transfer_own" in intent_lower:
-                            color_badge = "🔵 *TRANSFER (SELF)*"
-                            acc_text = f"🔹 *From:* {source_acc_obj['account_name']} ➡️ *To:* {dest_acc_obj['account_name']}"
-                        else:
-                            color_badge = "🔵 *TRANSFER*"
-                            acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}" if source_acc_obj else ""
+                    intent_lower = tx.intent.lower()
+                    if "income" in intent_lower or "credit" in intent_lower:
+                        color_badge = "🟢 *INCOME*"
+                        acc_text = f"🔹 *To Account:* {dest_acc_obj['account_name']}"
+                    elif "expense" in intent_lower or "debit" in intent_lower:
+                        color_badge = "🔴 *EXPENSE*"
+                        acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}"
+                    elif "transfer_own" in intent_lower:
+                        color_badge = "🔵 *TRANSFER (SELF)*"
+                        acc_text = f"🔹 *From:* {source_acc_obj['account_name']} ➡️ *To:* {dest_acc_obj['account_name']}"
+                    else:
+                        color_badge = "🔵 *TRANSFER*"
+                        acc_text = f"🔹 *From Account:* {source_acc_obj['account_name']}" if source_acc_obj else ""
 
-                        cat_display = f"{category} -> {subcategory}" if subcategory else (category or "Unassigned")
-                        committed_items.append(
-                            f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* ₹{float(amount):,.2f}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
-                        )
+                    cat_display = f"{category} -> {subcategory}" if subcategory else (category or "Unassigned")
+                    committed_items.append(
+                        f"✅ *Transaction Saved Successfully*\n{color_badge}\n🔹 *Item:* {description}\n🔹 *Amount:* ₹{float(amount):,.2f}\n{acc_text}\n🔹 *Date:* {display_date_raw}\n🔹 *Category:* {cat_display}"
+                    )
 
             if committed_items:
                 response_sections.append("\n\n".join(committed_items))
