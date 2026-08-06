@@ -129,10 +129,12 @@ class NLPHandler:
                         p["amount"] for p in result["unique"] if p["source_account"] == default_acc['account_name'])
                     total_addition = sum(p["amount"] for p in result["unique"] if
                                          p["destination_account"] == default_acc['account_name'])
+                    current_bal = float(default_acc.get('balance', 0.0))  # 🚀 FIX: Grab the current balance
 
                     try:
+                        # 🚀 FIX: Pass current_bal as the 5th argument
                         bulk_service.dao.execute_bulk_commit(default_acc['id'], result["unique"], total_deduction,
-                                                             total_addition)
+                                                             total_addition, current_bal)
                     except Exception as e:
                         if 'INSUFFICIENT_BALANCE' in str(e):
                             await send_telegram_reply(chat_id, f"⚠️ *Insufficient Balance* to cover bulk expenses.")
