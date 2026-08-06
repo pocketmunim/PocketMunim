@@ -1,9 +1,10 @@
 import os
 import re
-from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from supabase import create_client, Client
+
 from app.security.auth import authenticate_telegram_request
 from app.ai.category_pull_service import CategoryPullService
 from app.telegram.telegram_utils import send_telegram_reply
@@ -30,7 +31,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def health_check():
-    return {"status": "PocketMunim Enterprise API is live (Modular Architecture)", "status_code": 200}
+    return {"status": "PocketMunim Enterprise API is live (Vercel-Safe Synchronous Mode)", "status_code": 200}
 
 @app.get("/report/view/{token}", response_class=HTMLResponse)
 async def view_report(token: str):
@@ -44,11 +45,14 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await UserHandler.prompt_registration(chat_id)
         return
 
+    # REGEX FIX: Now supports "deduct all for jan", "deduct all amount of jan", "deduct all jan"
+    deduct_all_regex = r"^deduct\s+all\s+(?:amount\s+of\s+|for\s+)?([a-zA-Z]+)$"
+
     if text.startswith("/register"):
         await UserHandler.register(supabase_admin, chat_id, user_id, text, user_exists)
     elif text.startswith("/setsalary"):
         await SalaryHandler.set_salary(supabase_admin, chat_id, user_id, text)
-    elif deduct_all_match := re.match(r"^deduct all amount of ([a-zA-Z]+)$", text, re.IGNORECASE):
+    elif deduct_all_match := re.match(deduct_all_regex, text, re.IGNORECASE):
         await SalaryHandler.deduct_all(supabase_admin, chat_id, user_id, deduct_all_match)
     elif text.startswith("/report"):
         await ReportHandler.generate_report_link(request_url, chat_id, user_id, supabase_admin)
@@ -68,7 +72,7 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, text, category_pull_service)
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request, background_tasks: BackgroundTasks, authorized: bool = Depends(authenticate_telegram_request)):
+async def telegram_webhook(request: Request, authorized: bool = Depends(authenticate_telegram_request)):
     try:
         payload = await request.json()
     except Exception:
@@ -86,8 +90,12 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks, 
 
     user_id = str(request.state.telegram_id)
 
-    background_tasks.add_task(
-        execute_telegram_command,
-        chat_id, text, user_id, str(request.url)
-    )
+    # VERCEL FIX: We must explicitly `await` the execution here.
+    # BackgroundTasks are dropped instantly in serverless environments.
+    try:
+        await execute_telegram_command(chat_id, text, user_id, str(request.url))
+    except Exception as e:
+        print(f"Execution Error: {str(e)}")
+        # We still catch errors so Telegram gets a 200 OK and doesn't infinitely retry
+
     return {"ok": True}
