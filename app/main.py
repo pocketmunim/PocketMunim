@@ -4,7 +4,6 @@ from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from supabase import create_client, Client
-
 from app.security.auth import authenticate_telegram_request
 from app.ai.category_pull_service import CategoryPullService
 from app.telegram.telegram_utils import send_telegram_reply
@@ -21,7 +20,6 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else supabase
-
 category_pull_service = CategoryPullService(None, supabase_admin)
 
 @asynccontextmanager
@@ -39,11 +37,9 @@ async def view_report(token: str):
     html_content = await ReportHandler.get_html_report(token, supabase_admin)
     return HTMLResponse(content=html_content)
 
-# The Async Fire-and-Forget Router Core
 async def execute_telegram_command(chat_id: int, text: str, user_id: str, request_url: str):
     is_safe, user_exists = await UserHandler.security_check(supabase_admin, chat_id, text)
     if not is_safe: return
-
     if not user_exists and not text.startswith("/register"):
         await UserHandler.prompt_registration(chat_id)
         return
@@ -55,7 +51,7 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
     elif deduct_all_match := re.match(r"^deduct all amount of ([a-zA-Z]+)$", text, re.IGNORECASE):
         await SalaryHandler.deduct_all(supabase_admin, chat_id, user_id, deduct_all_match)
     elif text.startswith("/report"):
-        await ReportHandler.generate_report_link(request_url, chat_id, user_id)
+        await ReportHandler.generate_report_link(request_url, chat_id, user_id, supabase_admin)
     elif text.startswith("/addaccount"):
         await AccountHandler.add_account(supabase_admin, chat_id, user_id, text)
     elif text.startswith("/setdefault"):
@@ -65,7 +61,7 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
     elif text.startswith("/categorypull"):
         await NLPHandler.pull_categories(supabase_admin, chat_id, user_id, text, category_pull_service)
     elif text.startswith("/history"):
-        await send_telegram_reply(chat_id, "📋 *Historical Data Auto-Template*\n...")
+        await send_telegram_reply(chat_id, "📜 *Historical Data Auto-Template*\n...")
     elif text.startswith("/monthly"):
         await ReportHandler.monthly_summary(supabase_admin, chat_id, user_id, text)
     else:
@@ -90,10 +86,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks, 
 
     user_id = str(request.state.telegram_id)
 
-    # SECURE DEPLOYMENT: Return 200 OK to Telegram immediately, push processing to Background Thread
     background_tasks.add_task(
         execute_telegram_command,
         chat_id, text, user_id, str(request.url)
     )
-
     return {"ok": True}

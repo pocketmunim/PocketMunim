@@ -1,28 +1,33 @@
 from typing import Optional, Dict
 
-_MEMORY_DICT: Dict[str, Dict] = {}
-
 
 class CategoryCacheManager:
     def __init__(self, db_client, user_id: str):
         self.db = db_client
-        self.user_id = user_id
-        if self.user_id not in _MEMORY_DICT:
-            self.rebuild_cache()
+        self.user_id = str(user_id)
 
     def search_item(self, item_name: str) -> Optional[Dict[str, str]]:
-        """O(1) Memory Traversal for Classification"""
-        user_cache = _MEMORY_DICT.get(self.user_id, {})
-        search_key = item_name.strip().lower()
+        """Stateless category lookup querying category_cache / categories table."""
+        try:
+            res = self.db.table('category_cache').select('cache_data').eq('user_id', self.user_id).execute()
+            user_cache = res.data[0]['cache_data'] if res.data and 'cache_data' in res.data[0] else {}
+            if not user_cache:
+                tree = self.rebuild_cache()
+                user_cache = tree
+            search_key = item_name.strip().lower()
+            for category, subcategories in user_cache.items():
+                if isinstance(subcategories, dict):
+                    for subcategory, items in subcategories.items():
+                        if isinstance(items, list) and any(
+                                isinstance(i, str) and i.strip().lower() == search_key for i in items):
+                            return {"category": category, "subcategory": subcategory, "item": item_name}
+            return None
+        except Exception as e:
+            print(f"CategoryCacheManager search_item error: {e}")
+            return None
 
-        for category, subcategories in user_cache.items():
-            for subcategory, items in subcategories.items():
-                if any(i.strip().lower() == search_key for i in items if isinstance(i, str)):
-                    return {"category": category, "subcategory": subcategory, "item": item_name}
-        return None
-
-    def rebuild_cache(self) -> None:
-        """Pulls JSONB arrays from DB and maps them to RAM instantly."""
+    def rebuild_cache(self) -> Dict:
+        """Pulls categories from DB, constructs taxonomy tree, and updates category_cache table."""
         try:
             res = self.db.table('categories').select('category_name, subcategories').eq('user_id',
                                                                                         self.user_id).execute()
@@ -33,7 +38,11 @@ class CategoryCacheManager:
                 for sub in row.get('subcategories', []):
                     tree[cat][sub.get('subcategory_name', 'General')] = sub.get('items', [])
 
-            _MEMORY_DICT[self.user_id] = tree
+            self.db.table('category_cache').upsert({
+                "user_id": self.user_id,
+                "cache_data": tree
+            }).execute()
+            return tree
         except Exception as e:
-            print(f"Cache memory rebuild failed: {str(e)}")
-            _MEMORY_DICT[self.user_id] = {}
+            print(f"Cache database rebuild failed: {str(e)}")
+            return {}
