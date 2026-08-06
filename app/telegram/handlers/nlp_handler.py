@@ -1,3 +1,4 @@
+import re
 import json
 import uuid
 import asyncio
@@ -20,7 +21,6 @@ RULES:
 3. IF MULTIPLE ITEMS, SET metadata.bulk_operation = true and extract EACH item into the array.
 4. If generic/unknown category, set category/subcategory to null.
 5. TODAY IS {CURRENT_DATE}.
-6. ANTI-LAZINESS MANDATE: You MUST extract and process EVERY SINGLE ITEM provided in the user's input. Do NOT truncate, stop early, skip, or group items. If the user lists 35 items, your array MUST contain exactly 35 objects. Failure to process the entire list is forbidden.
 
 JSON SCHEMA:
   "metadata": {"operation_type": "string", "bulk_operation": false},
@@ -63,6 +63,18 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
     return dates
 
 
+def smart_chunk_text(text: str, items_per_chunk: int = 15) -> list[str]:
+    """Splits raw text by commas and newlines to prevent AI token truncation."""
+    raw_items = re.split(r'[,\n]+', text)
+    items = [item.strip() for item in raw_items if item.strip()]
+    if not items:
+        return [text]
+    chunks = []
+    for i in range(0, len(items), items_per_chunk):
+        chunks.append("\n".join(items[i:i + items_per_chunk]))
+    return chunks
+
+
 class NLPHandler:
     @staticmethod
     async def pull_categories(supabase_admin, chat_id, user_id, text, category_pull_service):
@@ -84,25 +96,41 @@ class NLPHandler:
                 f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            try:
-                # 🚀 GRAB BOTH THE TEXT AND THE FINISH REASON
-                raw_response_text, finish_reason = await asyncio.wait_for(
+            # 🚀 PARALLEL CHUNKING
+            chunks = smart_chunk_text(text, items_per_chunk=15)
+            tasks = []
+            for chunk in chunks:
+                tasks.append(
                     execute_resilient_ai(
                         system_prompt=dynamic_system_prompt,
-                        user_prompt=text,
+                        user_prompt=chunk,
                         db_client=supabase_admin,
                         is_json=True
-                    ),
-                    timeout=8.5
+                    )
                 )
+
+            try:
+                # Execute all chunks at the exact same time
+                results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=8.5)
             except asyncio.TimeoutError:
                 await send_telegram_reply(chat_id,
-                                          "⚠️ *Error: List too large.*\nYour list timed out. Please split it into smaller messages.")
+                                          "⚠️ *Error: Request timed out.*\nYour list was too large for the 8.5s serverless safety limit.")
                 return
 
-            raw_json = json.loads(raw_response_text)
-            validated_data = AITransactionExtraction(**raw_json)
-            transactions_list = validated_data.transactions or []
+            transactions_list = []
+            hit_limit = False
+
+            # Aggregate all JSON responses
+            for raw_response_text, finish_reason in results:
+                if finish_reason == "length":
+                    hit_limit = True
+                try:
+                    raw_json = json.loads(raw_response_text)
+                    validated_data = AITransactionExtraction(**raw_json)
+                    if validated_data.transactions:
+                        transactions_list.extend(validated_data.transactions)
+                except Exception:
+                    pass
 
             acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
             user_accounts = acc_res.data or []
@@ -129,35 +157,42 @@ class NLPHandler:
                         p["amount"] for p in result["unique"] if p["source_account"] == default_acc['account_name'])
                     total_addition = sum(p["amount"] for p in result["unique"] if
                                          p["destination_account"] == default_acc['account_name'])
-                    current_bal = float(default_acc.get('balance', 0.0))  # 🚀 FIX: Grab the current balance
+                    current_bal = float(default_acc.get('balance', 0.0))
 
                     try:
-                        # 🚀 FIX: Pass current_bal as the 5th argument
                         bulk_service.dao.execute_bulk_commit(default_acc['id'], result["unique"], total_deduction,
                                                              total_addition, current_bal)
                     except Exception as e:
                         if 'INSUFFICIENT_BALANCE' in str(e):
                             await send_telegram_reply(chat_id, f"⚠️ *Insufficient Balance* to cover bulk expenses.")
                         else:
-                            # 🚀 EXPOSE EXACT ERROR HERE
                             await send_telegram_reply(chat_id,
                                                       f"⚠️ *Database Error saving bulk transaction:*\n`{str(e)}`")
                         return
 
                     bd_text = "\n".join(result["breakdown"]) if result["breakdown"] else "No unique items."
+
+                    # 🚀 DYNAMIC RECEIPT HEADER
+                    header_parts = []
+                    if result['totals']['expenses'] > 0:
+                        header_parts.append(f"🔴 *EXPENSE:* ₹{result['totals']['expenses']:,.2f}")
+                    if result['totals']['income'] > 0:
+                        header_parts.append(f"🟢 *INCOME:* ₹{result['totals']['income']:,.2f}")
+                    if result['totals']['transfers'] > 0:
+                        header_parts.append(f"🔵 *TRANSFER:* ₹{result['totals']['transfers']:,.2f}")
+
+                    dynamic_header = " | ".join(header_parts) if header_parts else "⚪ *NO FINANCIAL MOVEMENT*"
+
                     receipt = (
                         f"🧾 *BULK TRANSACTION SAVED*\n"
-                        f"🔴 *EXPENSE* | 🟢 *INCOME* | 🔵 *TRANSFER*\n\n"
-                        f"📊 *Expenses:* ₹{result['totals']['expenses']:,.2f} ({result['counts'].get('expenses', 0)} items)\n"
+                        f"{dynamic_header}\n\n"
                         f"🏦 *Primary Account:* {default_acc['account_name']}\n"
                         f"📜 *Receipt Breakdown:*\n{bd_text}"
                     )
 
-                    # 🚀 INJECT TOKEN TRUNCATION WARNING
-                    if finish_reason == "length":
-                        receipt += "\n\n⚠️ *WARNING: LIMIT EXCEEDED*\nYour list was extremely long. The AI hit its maximum output limit and dropped the remaining items. Please submit the missing items in a new message."
+                    if hit_limit:
+                        receipt += "\n\n⚠️ *WARNING: LIMIT EXCEEDED*\nYour list was extremely long. The AI dropped some items. Please verify the receipt."
 
-                    # 🚀 INJECT LOGICALLY IGNORED ITEMS
                     if result.get("ignored"):
                         receipt += f"\n\n⚠️ *Unprocessed Items:*\n" + "\n".join(result["ignored"])
 
@@ -175,8 +210,7 @@ class NLPHandler:
             # ================= SINGLE TRANSACTION =================
             response_sections, committed_items = [], []
 
-            # 🚀 INJECT SINGLE ITEM TOKEN WARNING
-            if finish_reason == "length":
+            if hit_limit:
                 response_sections.append(
                     "⚠️ *WARNING: The AI hit its maximum capacity and may not have processed your entire message.*")
 
@@ -246,7 +280,6 @@ class NLPHandler:
                             if 'INSUFFICIENT_BALANCE' in str(e):
                                 response_sections.append(f"⚠️ *Insufficient Balance* for '{description}'.")
                             else:
-                                # 🚀 EXPOSE EXACT ERROR HERE
                                 response_sections.append(
                                     f"⚠️ *Database Error* updating balance for '{description}':\n`{str(e)}`")
                             break
@@ -286,5 +319,4 @@ class NLPHandler:
             if response_sections:
                 await send_telegram_reply(chat_id, "\n\n".join(response_sections))
         except Exception as e:
-            # 🚀 EXPOSE EXACT SYSTEM ERROR HERE
             await send_telegram_reply(chat_id, f"⚠️ *System Error:*\nCould not process request.\n`{str(e)}`")
