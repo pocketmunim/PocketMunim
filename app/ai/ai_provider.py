@@ -4,8 +4,9 @@ import asyncio
 from groq import AsyncGroq
 
 
-async def execute_resilient_ai(system_prompt: str, user_prompt: str, db_client=None, is_json: bool = True) -> str:
-    """Fully Asynchronous Groq Execution"""
+async def execute_resilient_ai(system_prompt: str, user_prompt: str, db_client=None, is_json: bool = True) -> tuple[
+    str, str]:
+    """Fully Asynchronous Groq Execution returning (content, finish_reason)"""
     groq_keys = [k.strip() for k in os.getenv("GROQ_API_KEYS", "").split(",") if k.strip()]
     single_key = os.getenv("GROQ_API_KEY")
     if single_key and single_key.strip() not in groq_keys:
@@ -23,14 +24,14 @@ async def execute_resilient_ai(system_prompt: str, user_prompt: str, db_client=N
                 "model": "llama-3.3-70b-versatile",
                 "messages": messages,
                 "temperature": 0.0,
-                "max_tokens": 4096  # 🚀 THIS IS THE FIX: Expands output capacity by 4x
+                "max_tokens": 4096
             }
             if is_json:
                 kwargs["response_format"] = {"type": "json_object"}
 
-            # Non-blocking async execution
             completion = await client.chat.completions.create(**kwargs)
-            return completion.choices[0].message.content.strip()
+            # 🚀 RETURN BOTH THE CONTENT AND THE FINISH REASON
+            return completion.choices[0].message.content.strip(), completion.choices[0].finish_reason
         except Exception as e:
             error_msg = f"Key #{idx + 1} [{key}] failed: {str(e)}"
             all_errors.append(error_msg)
