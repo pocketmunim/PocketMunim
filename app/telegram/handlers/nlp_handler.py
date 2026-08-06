@@ -20,7 +20,7 @@ RULES:
 3. IF MULTIPLE ITEMS, SET metadata.bulk_operation = true and extract EACH item into the transactions array.
 4. If generic/unknown category, set category/subcategory to null.
 5. TODAY IS {CURRENT_DATE}.
-6. ANTI-LAZINESS MANDATE: You MUST extract and process EVERY SINGLE ITEM provided in the user's input. Do NOT truncate, stop early, skip, or group items. If the user lists 100 items, your array MUST contain exactly 100 objects.
+6. ANTI-LAZINESS MANDATE: You MUST extract and process EVERY SINGLE ITEM provided in the user's input. Do NOT truncate, stop early, skip, or group items. If the user lists 35 items, your array MUST contain exactly 35 objects.
 
 JSON SCHEMA:
   "metadata": {"operation_type": "string", "bulk_operation": false},
@@ -138,7 +138,6 @@ class NLPHandler:
                         bulk_service.dao.execute_bulk_commit(default_acc['id'], result["unique"], total_deduction,
                                                              total_addition, current_bal)
                     except Exception as e:
-                        # 🚀 EXACT ERROR MESSAGE DISPLAYED WITHOUT GENERIC WRAPPERS
                         await send_telegram_reply(chat_id, f"⚠️ `{str(e)}`")
                         return
 
@@ -248,22 +247,27 @@ class NLPHandler:
                             }).execute()
                         except Exception as e:
                             db_failure = True
-                            # 🚀 EXACT ERROR MESSAGE DISPLAYED
                             response_sections.append(f"⚠️ `{str(e)}`")
                             break
 
                     if db_failure: continue
 
+                    # 🚀 ROBUST SINGLE-TRANSACTION CATEGORY RESOLUTION
                     category = tx.category
                     subcategory = tx.subcategory
-                    if not category:
+
+                    if not category or not subcategory:
                         cached = cache_manager.search_item(description)
                         if cached and cached.get("category"):
-                            category, subcategory = cached["category"], cached.get("subcategory")
-                        else:
-                            ai_cls = await category_pull_service.classify_item(description, intent=tx.intent)
-                            category, subcategory = ai_cls.get("category", "General"), ai_cls.get("subcategory",
-                                                                                                  "Miscellaneous")
+                            category = category or cached["category"]
+                            subcategory = subcategory or cached.get("subcategory")
+
+                    if not category:
+                        ai_cls = await category_pull_service.classify_item(description, intent=tx.intent)
+                        category = ai_cls.get("category", "General")
+                        subcategory = subcategory or ai_cls.get("subcategory", "Miscellaneous")
+                    if not subcategory:
+                        subcategory = "Miscellaneous"
 
                     db_payloads = [
                         {"user_id": user_id, "amount": float(amount), "txn_type": tx.intent, "description": description,
@@ -276,7 +280,8 @@ class NLPHandler:
                             supabase.table("transactions").insert(db_payloads[0]).execute()
                         elif len(db_payloads) > 1:
                             supabase.table("transactions").insert(db_payloads).execute()
-                        committed_items.append(f"✅ *Transaction Saved*\n  {description}: ₹{float(amount):,.2f}")
+                        committed_items.append(
+                            f"✅ *Transaction Saved*\n  {description}: ₹{float(amount):,.2f} ({category} -> {subcategory})")
                     except Exception as e:
                         response_sections.append(f"⚠️ `{str(e)}`")
                 else:
@@ -287,5 +292,4 @@ class NLPHandler:
             if response_sections:
                 await send_telegram_reply(chat_id, "\n\n".join(response_sections))
         except Exception as e:
-            # 🚀 EXACT SYSTEM ERROR MESSAGE DISPLAYED
             await send_telegram_reply(chat_id, f"⚠️ `{str(e)}`")

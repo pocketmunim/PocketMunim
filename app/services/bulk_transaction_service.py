@@ -2,6 +2,7 @@ from decimal import Decimal
 from datetime import datetime
 from app.utils.constants import TZ_IST
 
+
 class BulkTransactionService:
     def __init__(self, db_client, user_id: str, cache_manager, category_pull_service):
         self.db = db_client
@@ -42,21 +43,29 @@ class BulkTransactionService:
                 continue
 
             intent = tx.intent.lower()
+
+            # 🚀 CATEGORY RESOLUTION PRIORITY
+            # 1. Trust the AI's direct extraction first
             category = tx.category
             subcategory = tx.subcategory
 
-            if not category:
+            # 2. If AI missed it, check user cache
+            if not category or not subcategory:
                 cached = self.cache_manager.search_item(description)
                 if cached and cached.get("category"):
-                    category, subcategory = cached["category"], cached.get("subcategory")
-                else:
-                    category = "Groceries" if "kg" in description.lower() or "l" in description.lower() or "milk" in description.lower() else "General"
-                    subcategory = "Miscellaneous"
+                    category = category or cached["category"]
+                    subcategory = subcategory or cached.get("subcategory")
 
-            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own"] else None
+            # 3. Clean fallback if completely missing
+            if not category:
+                category = "Groceries"
+            if not subcategory:
+                subcategory = "General Purchases"
+
+            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other",
+                                                                       "transfer_own"] else None
             dest_acc = default_account['account_name'] if intent in ["income", "transfer_own"] else None
 
-            # 🚀 STRICT IST TIMESTAMP FOR BULK TRANSACTIONS
             payload = {
                 "user_id": self.user_id,
                 "amount": float(amount),
@@ -72,7 +81,8 @@ class BulkTransactionService:
             }
 
             is_salary_or_income = intent == "income" or (category and category.lower() == "income")
-            is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(float(amount), description, intent)
+            is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(float(amount),
+                                                                                               description, intent)
 
             if is_duplicate:
                 pending_duplicates.append({
