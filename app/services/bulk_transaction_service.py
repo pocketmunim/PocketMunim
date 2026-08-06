@@ -10,18 +10,28 @@ class BulkTransactionService:
         self.cache_manager = cache_manager
         self.category_pull_service = category_pull_service
 
-    # THIS IS NOW ASYNC
     async def process_bulk_payload(self, transactions_list: list, default_account: dict) -> dict:
-        unique_payloads, pending_duplicates, breakdown, ignored = [], [], [], []
-        totals = {"expenses": Decimal('0.00'), "income": Decimal('0.00'), "transfers": Decimal('0.00')}
-        counts = {"expenses": 0, "income": 0, "transfers": 0}
+        unique_payloads = []
+        pending_duplicates = []
+        breakdown = []
+        ignored = []
+        totals = {
+            "expenses": Decimal('0.00'),
+            "income": Decimal('0.00'),
+            "transfers": Decimal('0.00')
+        }
+        counts = {
+            "expenses": 0,
+            "income": 0,
+            "transfers": 0
+        }
 
         for tx in transactions_list:
             description = str(tx.item or "Item").title()
             amount = tx.amount if tx.amount else Decimal('0.00')
 
             if amount <= Decimal('0.00'):
-                ignored.append(f"  {description} (Zero amount)")
+                ignored.append(f"  {description} (Zero or missing amount)")
                 continue
             if tx.future and tx.future.is_future:
                 ignored.append(f"  {description} (Future item skipped)")
@@ -34,19 +44,14 @@ class BulkTransactionService:
             category = tx.category
             subcategory = tx.subcategory
 
+            # Fast O(1) memory lookup; fallback to General/Miscellaneous to prevent slow loops
             if not category:
                 cached = self.cache_manager.search_item(description)
                 if cached and cached.get("category"):
                     category, subcategory = cached["category"], cached.get("subcategory")
                 else:
-                    # AWAIT THE CLASSIFICATION
-                    ai_cls = await self.category_pull_service.classify_item(description, intent=intent)
-                    category, subcategory = ai_cls.get("category", "Expenses"), ai_cls.get("subcategory", "General")
-                    try:
-                        await self.category_pull_service.add_single_item_to_taxonomy(category, subcategory, description, self.user_id)
-                        self.cache_manager.rebuild_cache()
-                    except Exception:
-                        pass
+                    category = "Groceries" if "kg" in description.lower() or "l" in description.lower() or "milk" in description.lower() else "General"
+                    subcategory = "Miscellaneous"
 
             source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own"] else None
             dest_acc = default_account['account_name'] if intent in ["income", "transfer_own"] else None
@@ -62,7 +67,10 @@ class BulkTransactionService:
             is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(float(amount), description, intent)
 
             if is_duplicate:
-                pending_duplicates.append({"payload": payload, "selected": False, "desc": description, "amount": float(amount), "txn_type": intent})
+                pending_duplicates.append({
+                    "payload": payload, "selected": False, "desc": description, "amount": float(amount),
+                    "txn_type": intent
+                })
             else:
                 unique_payloads.append(payload)
                 cat_disp = f"{category} -> {subcategory}" if subcategory else category
@@ -77,4 +85,11 @@ class BulkTransactionService:
                     counts["transfers"] += 1
                 breakdown.append(f"  {description}: ₹{float(amount):,.2f} ({cat_disp})")
 
-        return {"unique": unique_payloads, "duplicates": pending_duplicates, "totals": totals, "counts": counts, "breakdown": breakdown, "ignored": ignored}
+        return {
+            "unique": unique_payloads,
+            "duplicates": pending_duplicates,
+            "totals": totals,
+            "counts": counts,
+            "breakdown": breakdown,
+            "ignored": ignored
+        }

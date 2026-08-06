@@ -84,7 +84,7 @@ class NLPHandler:
                 f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            # 🚀 SINGLE-SHOT EXECUTION (Called exactly 1 time)
+            # 🚀 EXACTLY ONE AI REQUEST CALL
             try:
                 raw_response_text, finish_reason = await asyncio.wait_for(
                     execute_resilient_ai(
@@ -96,8 +96,7 @@ class NLPHandler:
                     timeout=8.5
                 )
             except asyncio.TimeoutError:
-                await send_telegram_reply(chat_id,
-                                          "⚠️ *Error: Request timed out.*\nYour list took too long to process.")
+                await send_telegram_reply(chat_id, "⚠️ Error: Request timed out.\nYour list took too long to process.")
                 return
 
             try:
@@ -105,7 +104,7 @@ class NLPHandler:
                 validated_data = AITransactionExtraction(**raw_json)
                 transactions_list = validated_data.transactions or []
             except Exception as e:
-                await send_telegram_reply(chat_id, f"⚠️ *AI Parsing Error:*\n`{str(e)}`")
+                await send_telegram_reply(chat_id, f"⚠️ AI Parsing Error:\n`{str(e)}`")
                 return
 
             acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
@@ -139,16 +138,12 @@ class NLPHandler:
                         bulk_service.dao.execute_bulk_commit(default_acc['id'], result["unique"], total_deduction,
                                                              total_addition, current_bal)
                     except Exception as e:
-                        if 'INSUFFICIENT_BALANCE' in str(e):
-                            await send_telegram_reply(chat_id, f"⚠️ *Insufficient Balance* to cover bulk expenses.")
-                        else:
-                            await send_telegram_reply(chat_id,
-                                                      f"⚠️ *Database Error saving bulk transaction:*\n`{str(e)}`")
+                        # 🚀 EXACT ERROR MESSAGE DISPLAYED WITHOUT GENERIC WRAPPERS
+                        await send_telegram_reply(chat_id, f"⚠️ `{str(e)}`")
                         return
 
                     bd_text = "\n".join(result["breakdown"]) if result["breakdown"] else "No unique items."
 
-                    # 🚀 DYNAMIC RECEIPT HEADER (Shows only active flows with exact totals)
                     header_parts = []
                     if result['totals']['expenses'] > 0:
                         header_parts.append(f"🔴 *EXPENSE:* ₹{result['totals']['expenses']:,.2f}")
@@ -253,11 +248,8 @@ class NLPHandler:
                             }).execute()
                         except Exception as e:
                             db_failure = True
-                            if 'INSUFFICIENT_BALANCE' in str(e):
-                                response_sections.append(f"⚠️ *Insufficient Balance* for '{description}'.")
-                            else:
-                                response_sections.append(
-                                    f"⚠️ *Database Error* updating balance for '{description}':\n`{str(e)}`")
+                            # 🚀 EXACT ERROR MESSAGE DISPLAYED
+                            response_sections.append(f"⚠️ `{str(e)}`")
                             break
 
                     if db_failure: continue
@@ -285,8 +277,8 @@ class NLPHandler:
                         elif len(db_payloads) > 1:
                             supabase.table("transactions").insert(db_payloads).execute()
                         committed_items.append(f"✅ *Transaction Saved*\n  {description}: ₹{float(amount):,.2f}")
-                    except:
-                        pass
+                    except Exception as e:
+                        response_sections.append(f"⚠️ `{str(e)}`")
                 else:
                     response_sections.append(f"⚠️ Could not process '{description}'. (Missing or Zero Amount)")
 
@@ -295,4 +287,5 @@ class NLPHandler:
             if response_sections:
                 await send_telegram_reply(chat_id, "\n\n".join(response_sections))
         except Exception as e:
-            await send_telegram_reply(chat_id, f"⚠️ *System Error:*\nCould not process request.\n`{str(e)}`")
+            # 🚀 EXACT SYSTEM ERROR MESSAGE DISPLAYED
+            await send_telegram_reply(chat_id, f"⚠️ `{str(e)}`")
