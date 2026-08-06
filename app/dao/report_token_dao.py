@@ -1,37 +1,32 @@
 from datetime import datetime
-from typing import Optional, Dict, Any
+
 
 class ReportTokenDAO:
     def __init__(self, db_client):
         self.db = db_client
 
-    def create_token(self, token: str, user_id: str, expires_at: datetime) -> bool:
-        try:
-            payload = {
-                "token": str(token),
-                "user_id": str(user_id),
-                "expires_at": expires_at.isoformat()
-            }
-            self.db.table("report_tokens").insert(payload).execute()
-            return True
-        except Exception as e:
-            print(f"Failed to insert report token {token}: {e}")
-            return False
+    def create_token(self, token: str, user_id: str, expires_at: datetime):
+        # 🚀 Convert datetime object to ISO string so Supabase accepts it
+        expires_at_str = expires_at.isoformat() if isinstance(expires_at, datetime) else str(expires_at)
 
-    def get_token(self, token: str) -> Optional[Dict[str, Any]]:
+        self.db.table('report_tokens').insert({
+            "token": token,
+            "user_id": user_id,
+            "expires_at": expires_at_str
+        }).execute()
+
+    def get_token(self, token: str):
         try:
-            res = self.db.table("report_tokens").select("*").eq("token", str(token)).execute()
-            if res.data:
+            res = self.db.table('report_tokens').select('*').eq('token', token).execute()
+            if res.data and len(res.data) > 0:
                 return res.data[0]
             return None
         except Exception as e:
-            print(f"Failed to fetch report token {token}: {e}")
+            print(f"Error fetching token: {e}")
             return None
 
-    def delete_token(self, token: str) -> bool:
+    def delete_token(self, token: str):
         try:
-            self.db.table("report_tokens").delete().eq("token", str(token)).execute()
-            return True
+            self.db.table('report_tokens').delete().eq('token', token).execute()
         except Exception as e:
-            print(f"Failed to delete report token {token}: {e}")
-            return False
+            print(f"Error deleting token: {e}")
