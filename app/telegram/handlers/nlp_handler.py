@@ -65,6 +65,17 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
 
 class NLPHandler:
     @staticmethod
+    async def pull_categories(supabase_admin, chat_id, user_id, text, category_pull_service):
+        query = text.replace("/categorypull", "").strip()
+        await send_telegram_reply(chat_id, f"🔄 Pulling categories...")
+        pull_result = await category_pull_service.manual_category_pull(query, user_id)
+        if pull_result.get("added", 0) > 0:
+            CategoryCacheManager(supabase_admin, user_id).rebuild_cache()
+            await send_telegram_reply(chat_id, f"✅ Successfully pulled {pull_result['added']} items.")
+        else:
+            await send_telegram_reply(chat_id, f"❌ Failed to pull categories: {pull_result.get('error')}")
+
+    @staticmethod
     async def process_text(supabase_admin, supabase, chat_id, user_id, text, category_pull_service):
         try:
             current_dt = datetime.now(TZ_IST)
@@ -126,7 +137,9 @@ class NLPHandler:
                         if 'INSUFFICIENT_BALANCE' in str(e):
                             await send_telegram_reply(chat_id, f"⚠️ *Insufficient Balance* to cover bulk expenses.")
                         else:
-                            await send_telegram_reply(chat_id, f"⚠️ *System Error* saving bulk transaction.")
+                            # 🚀 EXPOSE EXACT ERROR HERE
+                            await send_telegram_reply(chat_id,
+                                                      f"⚠️ *Database Error saving bulk transaction:*\n`{str(e)}`")
                         return
 
                     bd_text = "\n".join(result["breakdown"]) if result["breakdown"] else "No unique items."
@@ -142,7 +155,7 @@ class NLPHandler:
                     if finish_reason == "length":
                         receipt += "\n\n⚠️ *WARNING: LIMIT EXCEEDED*\nYour list was extremely long. The AI hit its maximum output limit and dropped the remaining items. Please submit the missing items in a new message."
 
-                    # 🚀 INJECT LOGICALLY IGNORED ITEMS (e.g. amount missing)
+                    # 🚀 INJECT LOGICALLY IGNORED ITEMS
                     if result.get("ignored"):
                         receipt += f"\n\n⚠️ *Unprocessed Items:*\n" + "\n".join(result["ignored"])
 
@@ -231,7 +244,9 @@ class NLPHandler:
                             if 'INSUFFICIENT_BALANCE' in str(e):
                                 response_sections.append(f"⚠️ *Insufficient Balance* for '{description}'.")
                             else:
-                                response_sections.append(f"⚠️ *System Error* updating balance for '{description}'.")
+                                # 🚀 EXPOSE EXACT ERROR HERE
+                                response_sections.append(
+                                    f"⚠️ *Database Error* updating balance for '{description}':\n`{str(e)}`")
                             break
 
                     if db_failure: continue
@@ -262,7 +277,6 @@ class NLPHandler:
                     except:
                         pass
                 else:
-                    # 🚀 INJECT SINGLE ITEM ZERO-AMOUNT WARNING
                     response_sections.append(f"⚠️ Could not process '{description}'. (Missing or Zero Amount)")
 
             if committed_items:
@@ -270,4 +284,5 @@ class NLPHandler:
             if response_sections:
                 await send_telegram_reply(chat_id, "\n\n".join(response_sections))
         except Exception as e:
-            await send_telegram_reply(chat_id, f"⚠️ *System Error:*\nCould not process request. {str(e)}")
+            # 🚀 EXPOSE EXACT SYSTEM ERROR HERE
+            await send_telegram_reply(chat_id, f"⚠️ *System Error:*\nCould not process request.\n`{str(e)}`")
