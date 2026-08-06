@@ -10,7 +10,7 @@ class ReportHandler:
     @staticmethod
     async def generate_report_link(request_url, chat_id, user_id, supabase_admin):
         token = str(uuid.uuid4())
-        expires_at = datetime.now(TZ_IST) + timedelta(hours=1)
+        expires_at = datetime.now(TZ_IST) + timedelta(minutes=15)
 
         token_dao = ReportTokenDAO(supabase_admin)
         token_dao.create_token(token, user_id, expires_at)
@@ -21,7 +21,7 @@ class ReportHandler:
             f"📊 *Next-Level AI Financial Report Generated*\n\n"
             f"Your interactive HTML report is ready with phase-by-phase analytics.\n\n"
             f"🔗 [View Downloadable Report]({report_url})\n\n"
-            f"⏰ *Note:* This secure link will automatically expire in **1 hour**."
+            f"⏰ *Note:* This secure link will automatically expire in **15 minutes**."
         )
         await send_telegram_reply(chat_id, response_msg)
 
@@ -33,8 +33,25 @@ class ReportHandler:
             raise HTTPException(status_code=404, detail="Report link expired or invalid.")
 
         expires_at_str = token_data["expires_at"]
-        expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
-        if datetime.now(TZ_IST) > expires_at:
+
+        # 🚀 ROBUST PARSAF SAFEGUARD FOR SUPABASE TIMESTAMPS
+        try:
+            if isinstance(expires_at_str, str):
+                cleaned_str = expires_at_str.replace("Z", "+00:00")
+                expires_at = datetime.fromisoformat(cleaned_str)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=TZ_IST)
+            elif isinstance(expires_at_str, datetime):
+                expires_at = expires_at_str
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=TZ_IST)
+            else:
+                raise ValueError("Invalid expires_at format")
+        except Exception:
+            raise HTTPException(status_code=404, detail="Report link format error.")
+
+        # 🚀 EPOCH TIMESTAMP COMPARISON (Eliminates Timezone Offset Bugs)
+        if datetime.now(TZ_IST).timestamp() > expires_at.timestamp():
             token_dao.delete_token(token)
             raise HTTPException(status_code=410, detail="Report link has expired.")
 
@@ -51,12 +68,26 @@ class ReportHandler:
         total_income = sum(float(t['amount']) for t in txns if t['txn_type'] == 'income')
         total_expense = sum(float(t['amount']) for t in txns if t['txn_type'] == 'expense')
         net_savings = total_income - total_expense
+
         accounts_html = "".join([
-                                    f'<div class="bg-slate-950 border border-slate-800 p-4 rounded-xl flex justify-between items-center"><span class="font-semibold text-slate-200">{acc["account_name"]}</span><span class="font-mono text-emerald-400">₹{float(acc["balance"]):,.2f}</span></div>'
-                                    for acc in accounts])
+            f'<div class="bg-slate-950 border border-slate-800 p-4 rounded-xl flex justify-between items-center"><span class="font-semibold text-slate-200">{acc["account_name"]}</span><span class="font-mono text-emerald-400">₹{float(acc["balance"]):,.2f}</span></div>'
+            for acc in accounts
+        ])
+
+        def parse_txn_date(date_str):
+            try:
+                dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TZ_IST)
+                return dt.astimezone(TZ_IST).strftime("%d %b %Y")
+            except Exception:
+                return "Recent"
+
         txns_html = "".join([
-                                f'<tr class="hover:bg-slate-800/50"><td class="py-3 px-4 text-slate-400">{datetime.fromisoformat(t["date"].replace("Z", "+00:00")).astimezone(TZ_IST).strftime("%d %b %Y")}</td><td class="py-3 px-4 font-medium text-white">{t["description"]}</td><td class="py-3 px-4 text-slate-400">{t["category"] or "Unassigned"}</td><td class="py-3 px-4"><span class="px-2 py-1 rounded-full text-xs font-semibold {"bg-emerald-500/20 text-emerald-300" if t["txn_type"] == "income" else "bg-rose-500/20 text-rose-300"}">{t["txn_type"].upper()}</span></td><td class="py-3 px-4 text-right font-mono {"text-emerald-400" if t["txn_type"] == "income" else "text-rose-400"}">{"+" if t["txn_type"] == "income" else "-"} ₹{float(t["amount"]):,.2f}</td></tr>'
-                                for t in txns[:50]])
+            f'<tr class="hover:bg-slate-800/50"><td class="py-3 px-4 text-slate-400">{parse_txn_date(t["date"])}</td><td class="py-3 px-4 font-medium text-white">{t["description"]}</td><td class="py-3 px-4 text-slate-400">{t["category"] or "Unassigned"}</td><td class="py-3 px-4"><span class="px-2 py-1 rounded-full text-xs font-semibold {"bg-emerald-500/20 text-emerald-300" if t["txn_type"] == "income" else "bg-rose-500/20 text-rose-300"}">{t["txn_type"].upper()}</span></td><td class="py-3 px-4 text-right font-mono {"text-emerald-400" if t["txn_type"] == "income" else "text-rose-400"}">{"+" if t["txn_type"] == "income" else "-"} ₹{float(t["amount"]):,.2f}</td></tr>'
+            for t in txns[:50]
+        ])
+
         return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
