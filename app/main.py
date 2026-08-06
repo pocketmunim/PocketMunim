@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
+@app.head("/")
 def health_check():
     return {"status": "PocketMunim Enterprise API is live (Vercel-Safe Synchronous Mode)", "status_code": 200}
 
