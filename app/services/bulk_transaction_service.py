@@ -1,5 +1,6 @@
 from decimal import Decimal
 from datetime import datetime
+from app.utils.constants import TZ_IST
 
 class BulkTransactionService:
     def __init__(self, db_client, user_id: str, cache_manager, category_pull_service):
@@ -44,7 +45,6 @@ class BulkTransactionService:
             category = tx.category
             subcategory = tx.subcategory
 
-            # Fast O(1) memory lookup; fallback to General/Miscellaneous to prevent slow loops
             if not category:
                 cached = self.cache_manager.search_item(description)
                 if cached and cached.get("category"):
@@ -56,11 +56,19 @@ class BulkTransactionService:
             source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own"] else None
             dest_acc = default_account['account_name'] if intent in ["income", "transfer_own"] else None
 
+            # 🚀 STRICT IST TIMESTAMP FOR BULK TRANSACTIONS
             payload = {
-                "user_id": self.user_id, "amount": float(amount), "txn_type": intent,
-                "description": description, "intent": intent, "category": category,
-                "subcategory": subcategory, "date": datetime.now().isoformat(),
-                "source_account": source_acc, "destination_account": dest_acc, "soft_deleted": False
+                "user_id": self.user_id,
+                "amount": float(amount),
+                "txn_type": intent,
+                "description": description,
+                "intent": intent,
+                "category": category,
+                "subcategory": subcategory,
+                "date": datetime.now(TZ_IST).isoformat(),
+                "source_account": source_acc,
+                "destination_account": dest_acc,
+                "soft_deleted": False
             }
 
             is_salary_or_income = intent == "income" or (category and category.lower() == "income")
