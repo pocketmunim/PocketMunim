@@ -49,19 +49,24 @@ def test_report_token_dao_crud(mock_supabase):
     assert result["token"] == token
     assert result["user_id"] == user_id
 
+
 def test_category_cache_stateless_lookup(mock_supabase):
     user_id = "user_101"
     cache_manager = CategoryCacheManager(mock_supabase, user_id)
 
+    # UPDATED MOCK: Now mimics the master 'categories' table structure instead of the old cache table
     mock_supabase.table().select().eq().execute.return_value = MagicMock(data=[{
-        "cache_data": {
-            "Groceries": {
-                "Dairy": ["milk", "paneer"]
+        "category_name": "Groceries",
+        "subcategories": [
+            {
+                "subcategory_name": "Dairy",
+                "items": ["milk", "paneer"]
             }
-        }
+        ]
     }])
 
     match = cache_manager.search_item("milk")
+
     assert match is not None
     assert match["category"] == "Groceries"
     assert match["subcategory"] == "Dairy"
