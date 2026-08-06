@@ -22,7 +22,8 @@ async def execute_resilient_ai(system_prompt: str, user_prompt: str, db_client=N
             kwargs = {
                 "model": "llama-3.3-70b-versatile",
                 "messages": messages,
-                "temperature": 0.0
+                "temperature": 0.0,
+                "max_tokens": 4096  # 🚀 THIS IS THE FIX: Expands output capacity by 4x
             }
             if is_json:
                 kwargs["response_format"] = {"type": "json_object"}
