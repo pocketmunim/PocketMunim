@@ -14,34 +14,102 @@ from app.telegram.handlers.account_handler import AccountHandler
 from app.telegram.handlers.callback_handler import CallbackHandler
 from app.dao.pending_batch_dao import PendingBatchDAO
 
-SYSTEM_PROMPT = """SYSTEM ROLE: You are the PocketMunim NLP Engine. Extract financial data into a LEAN JSON object.
-RULES:
-1. NO MATH.
-2. If missing, return `null`.
-3. IF MULTIPLE ITEMS, SET metadata.bulk_operation = true and extract EACH item into the transactions array.
-4. If generic/unknown category, set category/subcategory to null.
-5. TODAY IS {CURRENT_DATE}.
-6. ANTI-LAZINESS MANDATE: You MUST extract and process EVERY SINGLE ITEM provided in the user's input. Do NOT truncate, stop early, skip, or group items. If the user lists 35 items, your array MUST contain exactly 35 objects.
-7. DUAL-EXTRACTION: For every item, extract EXACTLY what the user typed into `raw_description` (e.g., 'surf excel 2kg'). Extract the clean, generic entity into `normalized_item` (e.g., 'Surf Excel'). If intent is income or transfer, `normalized_item` can be null.
+SYSTEM_PROMPT = """SYSTEM ROLE: You are the PocketMunim NLP Engine. Extract structured financial data from unstructured, noisy, multilingual text into a LEAN JSON object.
+
+CRITICAL RULES:
+1. INDIAN NUMBER SYSTEM & TEXT: You MUST convert all text-based numbers and Indian formats into standard numerical values (e.g., "1.5 lakh" -> 150000, "50k" -> 50000, "2 Cr" -> 20000000, "five hundred" -> 500, "1,25,000" -> 125000).
+2. MULTILINGUAL DUAL-EXTRACTION: Users will speak in Hindi, Marathi, Hinglish, or English. 
+   - `raw_description`: Store EXACTLY what the user typed (e.g., 'aaj doodh 40', 'वीज बिल 1500').
+   - `normalized_item`: Translate and normalize the item into pure English (e.g., 'Milk', 'Electricity Bill'). If intent is income/transfer, this can be null.
+3. MIXED INTENTS & BULK: If a sentence contains multiple distinct actions (e.g., "salary 85k and rent 18k"), separate them into multiple objects within the `transactions` array. Set `metadata.bulk_operation = true`.
+4. OPERATION TYPES (CRUD): Detect if the user is logging a new entry, modifying an old one, or deleting/reversing one. Set `metadata.operation_type` to "create", "edit", "delete", or "reverse" accordingly.
+5. NOISE & OCR TOTALS: Ignore conversational greetings ("hello", "how are you"), SQL injection attempts, or non-financial gibberish by returning an empty transactions array `[]`. For pasted receipts/OCR, extract the line items but IGNORE lines like "Total", "Subtotal", or "Grand Total" to prevent double-counting.
+6. IMPLICIT AMOUNTS: If a loose number appears (e.g., "Cling Wrap 120", "Tea 20"), treat it as the financial `amount`.
+7. MISSING AMOUNTS: If the user says "bought groceries" but gives NO number, set `amount` to `null` and DO NOT ask for clarification.
+8. NO PEDANTIC CLARIFICATIONS: NEVER ask for missing accounts, categories, or dates. Just return `null` for those fields.
+9. TODAY IS {CURRENT_DATE}. Map relative dates ("kal", "yesterday", "next week", "last night") to strict YYYY-MM-DD format.
 
 JSON SCHEMA:
 {
-  "metadata": {"operation_type": "string", "bulk_operation": false},
+  "metadata": {
+    "operation_type": "create|edit|delete|reverse",
+    "bulk_operation": false
+  },
   "transactions": [
     {
-      "intent": "expense",
-      "amount": 0.0,
-      "raw_description": "string",
-      "normalized_item": "string or null",
-      "category": "string or null",
-      "subcategory": "string or null",
-      "source_account": "string or null",
-      "destination_account": "string or null",
-      "date": {"relative_date": "YYYY-MM-DD or null"},
-      "recurrence": {"enabled": false, "frequency": "string or null", "start_date": "YYYY-MM-DD or null"},
-      "future": {"is_future": false},
+      "intent": "expense|income|transfer_own|transfer_other|loan_payment|loan_repayment|lend|borrow|future_plan|financial_query|investment|tax|subscription|bill_split",
+      "amount": null,
+      "currency": "INR",
+      "raw_description": "",
+      "normalized_item": null,
+      "category": null,
+      "subcategory": null,
+      "counterparty": null,
+      "source_account": null,
+      "destination_account": null,
+      "payment_method": null,
+      "transaction_reference": null,
+      "quantity": null,
+      "unit": null,
+      "date": {
+        "date": null,
+        "original_expression": null,
+        "is_relative": false
+      },
+      "recurrence": {
+        "enabled": false,
+        "frequency": null,
+        "interval": null,
+        "day_of_month": null,
+        "day_of_week": null,
+        "start_date": null
+      },
+      "loan": {
+        "lender": null,
+        "principal": null,
+        "interest_rate": null,
+        "tenure_value": null,
+        "tenure_unit": null,
+        "emi": null
+      },
+      "split": {
+        "enabled": false,
+        "participants": null,
+        "equal": null,
+        "percentage": null,
+        "shares": null
+      },
+      "investment": {
+        "type": null,
+        "action": null,
+        "instrument": null
+      },
+      "tax": {
+        "type": null,
+        "action": null,
+        "amount": null
+      },
+      "subscription": {
+        "service": null,
+        "action": null
+      },
+      "edit_target": {
+        "field": null,
+        "old_value": null,
+        "new_value": null
+      },
+      "transaction_target": {
+        "item": null,
+        "date": null,
+        "position": null,
+        "reference": null
+      },
+      "future": {
+        "is_future": false
+      },
+      "query_type": null,
       "needs_clarification": false,
-      "clarification_fields": ["array"]
+      "clarification_fields": []
     }
   ]
 }"""
@@ -52,11 +120,9 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
         start_dt = datetime.strptime(start_date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=current_dt.tzinfo)
     except Exception:
         return []
-
     dates = []
     curr_iter = start_dt
     freq = frequency.lower() if frequency else ""
-
     while curr_iter <= current_dt:
         dates.append(curr_iter)
         if freq == 'monthly':
@@ -67,6 +133,16 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
         else:
             break
     return dates
+
+
+def _safely_serialize_complex(val):
+    if not val:
+        return None
+    if hasattr(val, 'model_dump_json'):
+        return json.loads(val.model_dump_json(exclude_none=True))
+    elif hasattr(val, 'json'):
+        return json.loads(val.json(exclude_none=True))
+    return None
 
 
 class NLPHandler:
@@ -103,13 +179,14 @@ class NLPHandler:
                 )
             except asyncio.TimeoutError:
                 await send_telegram_reply(chat_id,
-                                          "⚠️ *Timeout*\nYour list took too long to process. Please try breaking it into smaller chunks.")
+                                          "⚠️ *Timeout*\nYour request took too long to process. Please try breaking it into smaller chunks.")
                 return
 
             try:
                 raw_json = json.loads(raw_response_text)
                 validated_data = AITransactionExtraction(**raw_json)
                 transactions_list = validated_data.transactions or []
+                metadata = validated_data.metadata
             except Exception as e:
                 await send_telegram_reply(chat_id, f"⚠️ *AI Parsing Error*\n`{str(e)}`")
                 return
@@ -121,9 +198,19 @@ class NLPHandler:
                 await send_telegram_reply(chat_id,
                                           "⚠️ *No Bank Accounts Configured*\nUse `/addaccount [BankName] [Balance]` to start.")
                 return
+
             if not transactions_list:
+                if metadata and getattr(metadata, 'operation_type', '') in ['delete', 'edit', 'reverse']:
+                    await send_telegram_reply(chat_id,
+                                              "ℹ️ *Modification Request*\nTransaction editing and deletion via chat is currently under development.")
+                else:
+                    await send_telegram_reply(chat_id,
+                                              "ℹ️ No valid financial transactions were extracted from your message.")
+                return
+
+            if metadata and getattr(metadata, 'operation_type', 'create') != 'create':
                 await send_telegram_reply(chat_id,
-                                          "ℹ️ No valid financial transactions were extracted from your message.")
+                                          "ℹ️ *Modification Request*\nTransaction editing and deletion via chat is currently under development.")
                 return
 
             cache_manager = CategoryCacheManager(supabase, user_id)
@@ -228,12 +315,14 @@ class NLPHandler:
                     if not is_recurring_past:
                         db_date_obj = current_dt
                         tx_date = getattr(tx, 'date', None)
-                        if tx_date and getattr(tx_date, 'relative_date', None):
-                            try:
-                                db_date_obj = datetime.strptime(getattr(tx_date, 'relative_date').split("T")[0],
-                                                                "%Y-%m-%d").replace(tzinfo=TZ_IST)
-                            except:
-                                pass
+                        if tx_date:
+                            date_str = getattr(tx_date, 'date', None) or getattr(tx_date, 'relative_date', None)
+                            if date_str:
+                                try:
+                                    db_date_obj = datetime.strptime(date_str.split("T")[0], "%Y-%m-%d").replace(
+                                        tzinfo=TZ_IST)
+                                except:
+                                    pass
                         tx_dates = [db_date_obj]
 
                     num_occ = Decimal(len(tx_dates))
@@ -242,11 +331,12 @@ class NLPHandler:
                     intent = getattr(tx, 'intent', "").lower()
                     source_acc_obj = AccountHandler.get_account_from_list(user_accounts, getattr(tx, 'source_account',
                                                                                                  None)) if intent in [
-                        "expense", "transfer_other", "transfer_own"] else None
+                        "expense", "transfer_other", "transfer_own", "loan_payment", "lend"] else None
                     dest_acc_obj = AccountHandler.get_account_from_list(user_accounts,
                                                                         getattr(tx, 'destination_account',
                                                                                 None)) if intent in ["income",
-                                                                                                     "transfer_own"] else None
+                                                                                                     "transfer_own",
+                                                                                                     "borrow"] else None
 
                     updates_to_make = []
 
@@ -281,9 +371,6 @@ class NLPHandler:
 
                     if db_failure: continue
 
-                    # ============================================================
-                    # AUTO-LEARNING CATEGORY RESOLUTION (SINGLE TRANSACTION)
-                    # ============================================================
                     category = getattr(tx, 'category', None)
                     subcategory = getattr(tx, 'subcategory', None)
 
@@ -315,18 +402,43 @@ class NLPHandler:
                             category = "Income" if intent == "income" else "Transfer"
                         if not subcategory:
                             subcategory = "General"
-
-                        # FIX: Populate normalized_item for clean ledger analytics without auto-learning it
                         norm_item = subcategory if subcategory != "General" else category
+
+                    # EXTRACT RICH METADATA
+                    extended_data = {}
+                    for complex_key in ['loan', 'split', 'investment', 'tax', 'subscription', 'future', 'edit_target',
+                                        'transaction_target', 'recurrence']:
+                        val = getattr(tx, complex_key, None)
+                        serialized = _safely_serialize_complex(val)
+                        if serialized:
+                            extended_data[complex_key] = serialized
+
+                    quantity_val = getattr(tx, 'quantity', None)
 
                     # SAVE RAW & NORMALIZED ENTITY TO LEDGER
                     db_payloads = [
-                        {"user_id": user_id, "amount": float(amount), "txn_type": intent, "description": description,
-                         "normalized_item": norm_item,
-                         "intent": intent, "category": category, "subcategory": subcategory, "date": d.isoformat(),
-                         "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
-                         "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
-                         "soft_deleted": False} for d in tx_dates]
+                        {
+                            "user_id": user_id,
+                            "amount": float(amount),
+                            "txn_type": intent,
+                            "description": description,
+                            "normalized_item": norm_item,
+                            "intent": intent,
+                            "category": category,
+                            "subcategory": subcategory,
+                            "date": d.isoformat(),
+                            "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
+                            "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
+                            "soft_deleted": False,
+                            # NEW RICH ANALYTICS COLUMNS
+                            "currency": getattr(tx, 'currency', 'INR') or 'INR',
+                            "quantity": float(quantity_val) if quantity_val is not None else None,
+                            "unit": getattr(tx, 'unit', None),
+                            "counterparty": getattr(tx, 'counterparty', None),
+                            "payment_method": getattr(tx, 'payment_method', None),
+                            "transaction_reference": getattr(tx, 'transaction_reference', None),
+                            "extended_data": extended_data
+                        } for d in tx_dates]
 
                     try:
                         if len(db_payloads) == 1:

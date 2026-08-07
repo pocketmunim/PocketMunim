@@ -1,6 +1,18 @@
+import json
 from decimal import Decimal
 from datetime import datetime
 from app.utils.constants import TZ_IST
+
+
+def _safely_serialize_complex(val):
+    """Safely converts Pydantic objects to dicts, handling Decimals cleanly for Supabase."""
+    if not val:
+        return None
+    if hasattr(val, 'model_dump_json'):  # Pydantic V2
+        return json.loads(val.model_dump_json(exclude_none=True))
+    elif hasattr(val, 'json'):  # Pydantic V1
+        return json.loads(val.json(exclude_none=True))
+    return None
 
 
 class BulkTransactionService:
@@ -106,13 +118,22 @@ class BulkTransactionService:
                     category = "Income" if intent == "income" else "Transfer"
                 if not subcategory:
                     subcategory = "General"
-
-                # FIX: Populate normalized_item for clean ledger analytics without auto-learning it
                 norm_item = subcategory if subcategory != "General" else category
 
-            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other",
-                                                                       "transfer_own"] else None
-            dest_acc = default_account['account_name'] if intent in ["income", "transfer_own"] else None
+            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own",
+                                                                       "loan_payment", "lend"] else None
+            dest_acc = default_account['account_name'] if intent in ["income", "transfer_own", "borrow"] else None
+
+            # EXTRACT RICH METADATA
+            extended_data = {}
+            for complex_key in ['loan', 'split', 'investment', 'tax', 'subscription', 'future', 'edit_target',
+                                'transaction_target', 'recurrence']:
+                val = getattr(tx, complex_key, None)
+                serialized = _safely_serialize_complex(val)
+                if serialized:
+                    extended_data[complex_key] = serialized
+
+            quantity_val = getattr(tx, 'quantity', None)
 
             payload = {
                 "user_id": self.user_id,
@@ -126,7 +147,15 @@ class BulkTransactionService:
                 "date": datetime.now(TZ_IST).isoformat(),
                 "source_account": source_acc,
                 "destination_account": dest_acc,
-                "soft_deleted": False
+                "soft_deleted": False,
+                # NEW RICH ANALYTICS COLUMNS
+                "currency": getattr(tx, 'currency', 'INR') or 'INR',
+                "quantity": str(quantity_val) if quantity_val is not None else None,
+                "unit": getattr(tx, 'unit', None),
+                "counterparty": getattr(tx, 'counterparty', None),
+                "payment_method": getattr(tx, 'payment_method', None),
+                "transaction_reference": getattr(tx, 'transaction_reference', None),
+                "extended_data": extended_data
             }
 
             is_salary_or_income = intent == "income" or (category and category.lower() == "income")
@@ -141,9 +170,9 @@ class BulkTransactionService:
             else:
                 unique_payloads.append(payload)
                 cat_disp = f"{category} -> {subcategory}" if subcategory else category
-                if intent in ["expense", "transfer_other"]:
+                if intent in ["expense", "transfer_other", "loan_payment", "lend"]:
                     totals["expenses"] += amount
-                elif intent == "income":
+                elif intent in ["income", "borrow"]:
                     totals["income"] += amount
                 elif intent == "transfer_own":
                     totals["transfers"] += amount
