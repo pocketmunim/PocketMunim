@@ -65,8 +65,8 @@ class ReportHandler:
                                                                                              False).order('date',
                                                                                                           desc=True).execute()
         txns = txn_res.data or []
-        total_income = sum(float(t['amount']) for t in txns if t['txn_type'] == 'income')
-        total_expense = sum(float(t['amount']) for t in txns if t['txn_type'] == 'expense')
+        total_income = sum(float(t['amount']) for t in txns if t['txn_type'] in ['income', 'borrow'])
+        total_expense = sum(float(t['amount']) for t in txns if t['txn_type'] in ['expense', 'loan_payment'])
         net_savings = total_income - total_expense
 
         accounts_html = "".join([
