@@ -35,16 +35,22 @@ class BulkTransactionService:
         # =========================================================
         unknown_item_names = set()
         for tx in transactions_list:
-            amount = tx.amount if tx.amount else Decimal('0.00')
-            intent = (tx.intent or "").lower()
+            amount = getattr(tx, 'amount', None) or Decimal('0.00')
+            intent = (getattr(tx, 'intent', "") or "").lower()
 
-            if intent == "expense" and amount > Decimal('0.00') and not tx.needs_clarification and not (
-                    tx.future and tx.future.is_future):
-                raw_desc = str(tx.raw_description or "Item").title()
-                norm_item = str(tx.normalized_item or raw_desc).title()
+            if intent == "expense" and amount > Decimal('0.00') and not getattr(tx, 'needs_clarification', False):
+                tx_future = getattr(tx, 'future', None)
+                if not (tx_future and getattr(tx_future, 'is_future', False)):
 
-                if not self.cache_manager.search_item(norm_item):
-                    unknown_item_names.add(norm_item)
+                    # SAFE FETCH: Fallback to tx.item if raw_description is missing
+                    raw_desc = getattr(tx, 'raw_description', None) or getattr(tx, 'item', "Item")
+                    raw_desc = str(raw_desc).title()
+
+                    norm_item = getattr(tx, 'normalized_item', None) or raw_desc
+                    norm_item = str(norm_item).title()
+
+                    if not self.cache_manager.search_item(norm_item):
+                        unknown_item_names.add(norm_item)
 
         if unknown_item_names:
             query_string = ", ".join(list(unknown_item_names)[:10])
@@ -58,25 +64,30 @@ class BulkTransactionService:
         # PHASE 2: NORMAL TRANSACTION PROCESSING
         # =========================================================
         for tx in transactions_list:
-            description = str(tx.raw_description or "Item").title()
-            norm_item = str(tx.normalized_item or description).title()
-            amount = tx.amount if tx.amount else Decimal('0.00')
+            raw_desc = getattr(tx, 'raw_description', None) or getattr(tx, 'item', "Item")
+            description = str(raw_desc).title()
+
+            norm_val = getattr(tx, 'normalized_item', None) or description
+            norm_item = str(norm_val).title()
+
+            amount = getattr(tx, 'amount', None) or Decimal('0.00')
 
             if amount <= Decimal('0.00'):
                 ignored.append(f"  {description} (Zero or missing amount)")
                 continue
 
-            if tx.future and tx.future.is_future:
+            tx_future = getattr(tx, 'future', None)
+            if tx_future and getattr(tx_future, 'is_future', False):
                 ignored.append(f"  {description} (Future item skipped)")
                 continue
 
-            if not tx.intent or tx.needs_clarification:
+            if not getattr(tx, 'intent', None) or getattr(tx, 'needs_clarification', False):
                 ignored.append(f"  {description} (Needs Clarification)")
                 continue
 
-            intent = tx.intent.lower()
-            category = tx.category
-            subcategory = tx.subcategory
+            intent = getattr(tx, 'intent', "").lower()
+            category = getattr(tx, 'category', None)
+            subcategory = getattr(tx, 'subcategory', None)
 
             cached = self.cache_manager.search_item(norm_item)
 
@@ -97,7 +108,6 @@ class BulkTransactionService:
                     category = "Income" if intent == "income" else "Transfer"
                 if not subcategory:
                     subcategory = "General"
-                # Income/Transfers shouldn't clutter the normalized_item column
                 norm_item = None
 
             source_acc = default_account['account_name'] if intent in ["expense", "transfer_other",
@@ -109,7 +119,7 @@ class BulkTransactionService:
                 "amount": str(amount),
                 "txn_type": intent,
                 "description": description,
-                "normalized_item": norm_item,  # <--- NEW FIELD INJECTED
+                "normalized_item": norm_item,
                 "intent": intent,
                 "category": category,
                 "subcategory": subcategory,
