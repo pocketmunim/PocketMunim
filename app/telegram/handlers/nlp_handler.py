@@ -365,7 +365,7 @@ class NLPHandler:
                         db_client=supabase_admin,
                         is_json=True
                     ),
-                    timeout=8.5
+                    timeout=60
                 )
             except asyncio.TimeoutError:
                 await send_telegram_reply(chat_id,
