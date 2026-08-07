@@ -21,7 +21,7 @@ class LoanService:
     async def create_loan(self, loan_data) -> dict:
         if not loan_data.principal or not loan_data.lender_name:
             raise ValueError(
-                "⚠️ Loan Processing Error\nCould not determine the principal amount or lender name. Please specify details clearly (e.g., taken 5L from Sushma at 11% for 3 years).")
+                f"⚠️ Loan Processing Error\nCould not determine principal or lender for '{loan_data.lender_name or 'Unknown'}'.")
 
         principal = Decimal(str(loan_data.principal))
         rate = Decimal(str(loan_data.annual_interest_rate or 10.0))
@@ -32,13 +32,15 @@ class LoanService:
         if not emi or emi <= 0:
             emi = self.calculate_emi(principal, rate, tenure_months)
 
+        disbursement_str = loan_data.disbursement_date or datetime.now(TZ_IST).date().isoformat()
+
         loan_payload = {
             "user_id": self.user_id,
             "lender": loan_data.lender_name.title(),
             "principal_amount": float(principal),
             "annual_interest_rate": float(rate),
             "tenure_months": tenure_months,
-            "start_date": str(loan_data.disbursement_date or datetime.now(TZ_IST).date()),
+            "start_date": str(disbursement_str),
             "is_active": True
         }
         res = self.db.table("loans").insert(loan_payload).execute()
@@ -47,7 +49,7 @@ class LoanService:
 
         loan_id = res.data[0]['loan_id']
 
-        start_date_str = loan_data.first_emi_date or datetime.now(TZ_IST).date().isoformat()
+        start_date_str = loan_data.first_emi_date or disbursement_str
         start_date = datetime.strptime(str(start_date_str), "%Y-%m-%d").date()
         balance = principal
         monthly_rate = rate / Decimal('12') / Decimal('100')

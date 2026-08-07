@@ -23,7 +23,6 @@ class LoanHandler:
 
             progress = (completed_emi / total_emi * 100) if total_emi > 0 else 0
 
-            # Color-coded progress bar rules
             if progress < 50:
                 bar_color = "🟩"
             elif progress < 85:
@@ -52,24 +51,29 @@ class LoanHandler:
         loan_service = LoanService(supabase_admin, user_id)
 
         try:
-            parsed = await extractor.parse_loan_text(text)
-            if parsed.action == "CREATE":
-                res = await loan_service.create_loan(parsed)
-                await send_telegram_reply(
-                    chat_id,
-                    f"✅ Loan Registered Successfully\n"
-                    f"Lender: {parsed.lender_name.title()}\n"
-                    f"Principal: ₹{float(parsed.principal):,.2f}\n"
-                    f"Calculated EMI: ₹{res['emi']:,.2f}\n"
-                    f"Tenure: {parsed.tenure_years} Years ({res['tenure_months']} months)"
-                )
-            elif parsed.action == "PAY_EMI":
-                result_msg = await loan_service.process_emi_payment(
-                    lender_name=parsed.lender_name,
-                    payment_amount=parsed.payment_amount,
-                    target_period=parsed.target_period
-                )
-                await send_telegram_reply(chat_id, result_msg)
+            parsed_actions = await extractor.parse_loan_text(text)
+            response_messages = []
+
+            for parsed in parsed_actions:
+                if parsed.action == "CREATE":
+                    res = await loan_service.create_loan(parsed)
+                    response_messages.append(
+                        f"✅ Loan Registered Successfully\n"
+                        f"Lender: {parsed.lender_name.title()}\n"
+                        f"Principal: ₹{float(parsed.principal):,.2f}\n"
+                        f"Calculated EMI: ₹{res['emi']:,.2f}\n"
+                        f"Tenure: {parsed.tenure_years} Years ({res['tenure_months']} months)"
+                    )
+                elif parsed.action == "PAY_EMI":
+                    result_msg = await loan_service.process_emi_payment(
+                        lender_name=parsed.lender_name,
+                        payment_amount=parsed.payment_amount,
+                        target_period=parsed.target_period
+                    )
+                    response_messages.append(result_msg)
+
+            if response_messages:
+                await send_telegram_reply(chat_id, "\n\n".join(response_messages))
         except ValueError as ve:
             await send_telegram_reply(chat_id, str(ve))
         except Exception as e:

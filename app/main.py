@@ -74,8 +74,8 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         # Inside execute_telegram_command()
     elif text.startswith("/getloans"):
         await LoanHandler.get_loans(supabase_admin, chat_id, user_id)
-    elif any(keyword in text.lower() for keyword in ["taken", "borrowed", "emi", "lender"]):
-        # Intercept loan statements or EMI payments safely
+    elif any(kw in text.lower() for kw in ["taken", "borrowed", "emi", "lender", "gave me", "loan"]) or (
+                    "@" in text and ("%" in text )):        # Intercept loan statements or EMI payments safely
         await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
     elif text.startswith("/start"):
         await send_telegram_reply(chat_id,

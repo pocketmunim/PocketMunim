@@ -1,7 +1,6 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from decimal import Decimal
-from datetime import date
 
 class LoanNLPData(BaseModel):
     action: str  # "CREATE" or "PAY_EMI"
@@ -13,4 +12,7 @@ class LoanNLPData(BaseModel):
     first_emi_date: Optional[str] = None
     emi_amount: Optional[Decimal] = None
     payment_amount: Optional[Decimal] = None
-    target_period: Optional[str] = None  # e.g., "last month", "current month"
+    target_period: Optional[str] = None
+
+class LoanBatchExtractionSchema(BaseModel):
+    actions: List[LoanNLPData] = []
