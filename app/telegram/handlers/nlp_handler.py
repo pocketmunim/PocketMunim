@@ -44,6 +44,7 @@ JSON SCHEMA:
   ]
 }"""
 
+
 def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: datetime) -> list:
     try:
         start_dt = datetime.strptime(start_date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=current_dt.tzinfo)
@@ -64,6 +65,7 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
         else:
             break
     return dates
+
 
 class NLPHandler:
     @staticmethod
@@ -87,7 +89,6 @@ class NLPHandler:
                 f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            #   EXACTLY ONE AI REQUEST CALL
             try:
                 raw_response_text, finish_reason = await asyncio.wait_for(
                     execute_resilient_ai(
@@ -130,12 +131,12 @@ class NLPHandler:
                 result = await bulk_service.process_bulk_payload(transactions_list, default_acc)
 
                 if result["unique"]:
-                    # Exact precision calculation using Decimal instead of float
-                    total_deduction = sum(Decimal(str(p["amount"])) for p in result["unique"] if p["source_account"] == default_acc['account_name'])
-                    total_addition = sum(Decimal(str(p["amount"])) for p in result["unique"] if p["destination_account"] == default_acc['account_name'])
+                    total_deduction = sum(Decimal(str(p["amount"])) for p in result["unique"] if
+                                          p["source_account"] == default_acc['account_name'])
+                    total_addition = sum(Decimal(str(p["amount"])) for p in result["unique"] if
+                                         p["destination_account"] == default_acc['account_name'])
 
                     try:
-                        # Current balance reading removed. Delegated to DB locking layer.
                         bulk_service.dao.execute_bulk_commit(
                             default_acc['id'], result["unique"], total_deduction, total_addition
                         )
@@ -252,7 +253,6 @@ class NLPHandler:
                                 "account_id": acc_id, "user_id": user_id, "log_type": log_type,
                                 "amount": txn_amount, "balance_after": new_bal, "description": description
                             }).execute()
-
                         except Exception as e:
                             db_failure = True
                             response_sections.append(f"  `{str(e)}`")
@@ -260,23 +260,36 @@ class NLPHandler:
 
                     if db_failure: continue
 
-                    #   ROBUST SINGLE-TRANSACTION CATEGORY RESOLUTION
+                    # ============================================================
+                    # AUTO-LEARNING CATEGORY RESOLUTION (SINGLE TRANSACTION)
+                    # ============================================================
                     category = tx.category
                     subcategory = tx.subcategory
+                    cached = cache_manager.search_item(description)
+                    is_new_taxonomy = False
 
-                    if not category or not subcategory:
-                        cached = cache_manager.search_item(description)
-                        if cached and cached.get("category"):
-                            category = category or cached["category"]
-                            subcategory = subcategory or cached.get("subcategory")
+                    if not cached:
+                        # INTERNALLY TRIGGER THE /categorypull LOGIC
+                        try:
+                            await category_pull_service.manual_category_pull(description, user_id)
+                            # Rebuild cache immediately to use the new taxonomy
+                            cache_manager.rebuild_cache()
+                            cached = cache_manager.search_item(description)
+                        except Exception as e:
+                            print(f"Auto-learning failed for {description}: {e}")
 
-                    if not category:
-                        ai_cls = await category_pull_service.classify_item(description, intent=tx.intent)
-                        category = ai_cls.get("category", "General")
-                        subcategory = subcategory or ai_cls.get("subcategory", "Miscellaneous")
-
-                    if not subcategory:
-                        subcategory = "Miscellaneous"
+                    if cached and cached.get("category"):
+                        category = category or cached["category"]
+                        subcategory = subcategory or cached.get("subcategory")
+                    else:
+                        # FALLBACK: If LLM missed the exact word during the pull
+                        is_new_taxonomy = True
+                        if not category:
+                            ai_cls = await category_pull_service.classify_item(description, intent=tx.intent)
+                            category = ai_cls.get("category", "General")
+                            subcategory = subcategory or ai_cls.get("subcategory", "Miscellaneous")
+                        if not subcategory:
+                            subcategory = "Miscellaneous"
 
                     db_payloads = [
                         {"user_id": user_id, "amount": float(amount), "txn_type": tx.intent, "description": description,
@@ -293,6 +306,11 @@ class NLPHandler:
 
                         committed_items.append(
                             f"  *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
+
+                        # SAVE TO TAXONOMY AS ULTIMATE FALLBACK
+                        if is_new_taxonomy:
+                            await category_pull_service.add_single_item_to_taxonomy(category, subcategory, description,
+                                                                                    user_id)
                     except Exception as e:
                         response_sections.append(f"  `{str(e)}`")
 
