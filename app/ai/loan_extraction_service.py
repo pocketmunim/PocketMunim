@@ -1,16 +1,51 @@
 import json
+from typing import List
 from app.ai.ai_provider import execute_resilient_ai
 from app.schemas.loan_schema import LoanNLPData
+
 
 class LoanExtractionService:
     def __init__(self, admin_db_client):
         self.db = admin_db_client
 
-    async def parse_loan_text(self, text: str) -> list[LoanNLPData]:
-        raw, _ = await execute_resilient_ai(
-            system_prompt="Extract loan actions to JSON format: {'actions': [{'action': 'CREATE'|'PAY_EMI', ...}]}",
-            user_prompt=text, db_client=self.db, is_json=True
+    async def parse_loan_text(self, text: str) -> List[LoanNLPData]:
+        system_prompt = """You are the PocketMunim Loan NLP Engine.
+        Analyze the user text and extract all loan creations and EMI payments into an array.
+
+        VALIDATION GUIDELINES:
+        - For loan creations, extract explicit lender names (e.g., "HDFC", "SBI", "ICICI", "Bajaj Finserv", "Sushma"). If the lender is generic or missing (e.g., "friend", "car loan" without a bank), set `lender_name` to null.
+        - For EMI payments, extract the specific lender name. If the counterparty is generic (e.g., "friend"), set `lender_name` to null so it can be flagged and eliminated with a warning.
+
+        Return ONLY valid JSON matching this schema:
+        {
+          "actions": [
+            {
+              "action": "CREATE|PAY_EMI",
+              "lender_name": "string or null",
+              "principal": number or null,
+              "annual_interest_rate": number or null,
+              "tenure_years": integer or null,
+              "disbursement_date": "YYYY-MM-DD or null",
+              "first_emi_date": "YYYY-MM-DD or null",
+              "emi_amount": number or null,
+              "payment_amount": number or null,
+              "target_period": "string or null"
+            }
+          ]
+        }
+        Current date is 2026. Resolve relative dates accurately.
+        """
+        raw_json, _ = await execute_resilient_ai(
+            system_prompt=system_prompt,
+            user_prompt=text,
+            db_client=self.db,
+            is_json=True
         )
-        data = json.loads(raw)
-        items = data.get("actions", [data] if "action" in data else [])
-        return [LoanNLPData(**i) for i in items]
+        data = json.loads(raw_json)
+
+        if isinstance(data, list):
+            return [LoanNLPData(**item) for item in data]
+        elif isinstance(data, dict) and "actions" in data:
+            return [LoanNLPData(**item) for item in data["actions"]]
+        else:
+            return [LoanNLPData(**data)]
