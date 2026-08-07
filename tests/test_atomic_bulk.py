@@ -19,7 +19,8 @@ def test_atomic_bulk_commit_precision(mock_supabase):
 
     payloads = [{"amount": Decimal('12.01')}, {"amount": Decimal('10.33')}]
 
-    mock_supabase.rpc().execute.return_value = MagicMock(data="1017.23")
+    # FIX: Use .return_value instead of calling () during mock setup
+    mock_supabase.rpc.return_value.execute.return_value = MagicMock(data="1017.23")
 
     result = dao.execute_bulk_commit(account_id, payloads, total_deduction, total_addition)
 
