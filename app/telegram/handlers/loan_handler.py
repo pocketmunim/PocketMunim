@@ -1,3 +1,5 @@
+from datetime import datetime
+from app.utils.constants import TZ_IST
 from app.telegram.telegram_utils import send_telegram_reply
 from app.services.loan_service import LoanService
 from app.ai.loan_extraction_service import LoanExtractionService
@@ -5,14 +7,24 @@ from app.ai.loan_extraction_service import LoanExtractionService
 
 class LoanHandler:
     @staticmethod
-    async def get_loans(supabase_admin, chat_id, user_id):
-        loans_res = supabase_admin.table('loans').select('*, emi_schedules(*)').eq('user_id', user_id).eq('is_active',
-                                                                                                          True).execute()
+    async def get_loans(supabase_admin, chat_id, user_id, text=""):
+        query_arg = text.replace("/getloans", "").strip()
+        db_query = supabase_admin.table('loans').select('*, emi_schedules(*)').eq('user_id', user_id).eq('is_active',
+                                                                                                         True)
+        if query_arg:
+            db_query = db_query.ilike('lender', f"%{query_arg}%")
+        loans_res = db_query.execute()
         loans = loans_res.data
 
         if not loans:
-            await send_telegram_reply(chat_id, "ℹ️ You have no active loans.")
+            if query_arg:
+                await send_telegram_reply(chat_id, f"ℹ️ No active loans found matching '{query_arg}'.")
+            else:
+                await send_telegram_reply(chat_id, "ℹ️ You have no active loans.")
             return
+
+        current_dt = datetime.now(TZ_IST)
+        curr_year_month = current_dt.strftime("%Y-%m")
 
         for loan in loans:
             schedules = sorted(loan.get('emi_schedules', []), key=lambda x: x['installment_number'])
@@ -32,7 +44,6 @@ class LoanHandler:
             filled_blocks = int(progress / 10)
             progress_bar = f"{bar_color} {'█' * filled_blocks}{'░' * (10 - filled_blocks)}"
 
-            # Calculate remaining principal from last paid or initial principal
             paid_emis = [e for e in schedules if e['status'] == 'PAID']
             if paid_emis:
                 last_paid = max(paid_emis, key=lambda x: x['installment_number'])
@@ -41,6 +52,13 @@ class LoanHandler:
                 remaining_principal = float(loan['principal_amount'])
 
             pending_tenure_months = len(pending_emis)
+
+            # Check if current month EMI is paid
+            current_month_paid = False
+            for sched in schedules:
+                if sched['due_date'].startswith(curr_year_month) and sched['status'] == 'PAID':
+                    current_month_paid = True
+                    break
 
             msg = [
                 f"🏦 **{loan['lender']}**",
@@ -54,14 +72,17 @@ class LoanHandler:
                 next_emi = pending_emis[0]
                 msg.append(f"📅 **Next Due**: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
 
-            # Interactive Pay EMI button linked directly to this loan ID
-            keyboard = {
-                "inline_keyboard": [
-                    [{
-                         "text": f"💳 Pay EMI (₹{float(pending_emis[0]['emi_amount']):,.2f})" if pending_emis else "💳 Pay EMI",
-                         "callback_data": f"payemi_{loan['loan_id']}"}]
-                ]
-            } if pending_emis else None
+            # Omit Pay EMI button if current month EMI is already paid
+            keyboard = None
+            if pending_emis and not current_month_paid:
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": f"💳 Pay EMI (₹{float(pending_emis[0]['emi_amount']):,.2f})",
+                          "callback_data": f"payemi_{loan['loan_id']}"}]
+                    ]
+                }
+            elif current_month_paid:
+                msg.append("✅ *Current month EMI already paid.*")
 
             await send_telegram_reply(chat_id, "\n".join(msg), reply_markup=keyboard)
 

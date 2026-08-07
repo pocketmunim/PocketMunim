@@ -94,8 +94,27 @@ class CallbackHandler:
             loan_id = data.split("_")[1]
             from app.services.loan_service import LoanService
             service = LoanService(supabase_admin, user_id)
-            result_msg, success = await service.process_emi_payment_by_id(loan_id)
+            result_msg, status = await service.process_emi_payment_by_id(loan_id)
+            if status == "CONFIRM_REQUIRED":
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "✅ Yes, Pay Again", "callback_data": f"forcepay_{loan_id}"}],
+                        [{"text": "❌ Cancel", "callback_data": "cancelpay"}]
+                    ]
+                }
+                await edit_telegram_message(chat_id, message_id, text=result_msg, reply_markup=keyboard)
+            else:
+                await edit_telegram_message(chat_id, message_id, text=result_msg)
+            return {"ok": True}
+        elif data.startswith("forcepay_"):
+            loan_id = data.split("_")[1]
+            from app.services.loan_service import LoanService
+            service = LoanService(supabase_admin, user_id)
+            result_msg, success = await service.process_emi_payment_by_id(loan_id, force=True)
             await edit_telegram_message(chat_id, message_id, text=result_msg)
+            return {"ok": True}
+        elif data == "cancelpay":
+            await edit_telegram_message(chat_id, message_id, text="ℹ️ EMI payment cancelled.")
             return {"ok": True}
 
         return {"ok": True}
