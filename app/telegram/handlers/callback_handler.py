@@ -15,8 +15,8 @@ class CallbackHandler:
             keyboard.append([{"text": f"{icon} {item['desc']} ( {float(item['amount']):,.2f})",
                               "callback_data": f"btog_{batch_id}_{i}"}])
 
-        keyboard.append([{"text": "  Confirm Selected", "callback_data": f"bconf_{batch_id}"},
-                         {"text": "  Cancel All", "callback_data": f"bcanc_{batch_id}"}])
+        keyboard.append([{"text": "✅ Confirm Selected", "callback_data": f"bconf_{batch_id}"},
+                         {"text": "🚫 Cancel All", "callback_data": f"bcanc_{batch_id}"}])
         return {"inline_keyboard": keyboard}
 
     @staticmethod
@@ -61,7 +61,7 @@ class CallbackHandler:
                 selected_items = [item for item in batch["items"] if item.get("selected")]
 
                 if not selected_items:
-                    await edit_telegram_message(chat_id, message_id, text="  No duplicates selected. Batch discarded.")
+                    await edit_telegram_message(chat_id, message_id, text="ℹ️ No duplicates selected. Batch discarded.")
                 else:
                     dao = BulkTransactionDAO(supabase_admin, user_id)
                     selected_payloads = [i["payload"] for i in selected_items]
@@ -70,7 +70,6 @@ class CallbackHandler:
                     if acc_res.data:
                         default_acc_name = acc_res.data[0]['account_name']
 
-                        # Exact precision calculation using Decimal instead of float
                         total_deduction = sum(Decimal(str(p["amount"])) for p in selected_payloads if
                                               p.get("source_account") == default_acc_name)
                         total_addition = sum(Decimal(str(p["amount"])) for p in selected_payloads if
@@ -81,22 +80,23 @@ class CallbackHandler:
                                 batch["account_id"], selected_payloads, total_deduction, total_addition
                             )
                             await edit_telegram_message(chat_id, message_id,
-                                                        text=f"  {len(selected_payloads)} duplicate transactions confirmed and saved.")
+                                                        text=f"✅ {len(selected_payloads)} duplicate transactions confirmed and saved.")
                         except Exception as e:
-                            error_msg = str(e)
-                            if "Insufficient balance" in error_msg:
+                            # ROBUST ERROR CATCHING FOR CALLBACKS
+                            error_msg = str(e).lower()
+                            if "insufficient" in error_msg or "p0001" in error_msg:
                                 await edit_telegram_message(chat_id, message_id,
-                                                            text="  Insufficient balance to save selected duplicates.")
+                                                            text="🚫 Insufficient balance to save selected duplicates.")
                             else:
-                                await edit_telegram_message(chat_id, message_id, text=f"  Database Error: {error_msg}")
+                                await edit_telegram_message(chat_id, message_id, text=f"⚠️ Database Error: `{str(e)}`")
 
                 batch_dao.delete_batch(batch_id)
             else:
-                await edit_telegram_message(chat_id, message_id, text="  Batch session expired or already processed.")
+                await edit_telegram_message(chat_id, message_id, text="⏳ Batch session expired or already processed.")
 
         elif data.startswith("bcanc_"):
             batch_id = data.split("_")[1]
             batch_dao.delete_batch(batch_id)
-            await edit_telegram_message(chat_id, message_id, text="  All duplicate transactions discarded.")
+            await edit_telegram_message(chat_id, message_id, text="🚫 All duplicate transactions discarded.")
 
         return {"ok": True}

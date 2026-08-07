@@ -102,7 +102,8 @@ class NLPHandler:
                     timeout=8.5
                 )
             except asyncio.TimeoutError:
-                await send_telegram_reply(chat_id, "  Error: Request timed out.\nYour list took too long to process.")
+                await send_telegram_reply(chat_id,
+                                          "⚠️ *Timeout*\nYour list took too long to process. Please try breaking it into smaller chunks.")
                 return
 
             try:
@@ -110,7 +111,7 @@ class NLPHandler:
                 validated_data = AITransactionExtraction(**raw_json)
                 transactions_list = validated_data.transactions or []
             except Exception as e:
-                await send_telegram_reply(chat_id, f"  AI Parsing Error:\n`{str(e)}`")
+                await send_telegram_reply(chat_id, f"⚠️ *AI Parsing Error*\n`{str(e)}`")
                 return
 
             acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
@@ -118,10 +119,11 @@ class NLPHandler:
 
             if not user_accounts and transactions_list:
                 await send_telegram_reply(chat_id,
-                                          "  *No Bank Accounts Configured*\nUse `/addaccount [BankName] [Balance]`")
+                                          "⚠️ *No Bank Accounts Configured*\nUse `/addaccount [BankName] [Balance]` to start.")
                 return
             if not transactions_list:
-                await send_telegram_reply(chat_id, "  No valid financial transactions were extracted.")
+                await send_telegram_reply(chat_id,
+                                          "ℹ️ No valid financial transactions were extracted from your message.")
                 return
 
             cache_manager = CategoryCacheManager(supabase, user_id)
@@ -143,11 +145,13 @@ class NLPHandler:
                             default_acc['id'], result["unique"], total_deduction, total_addition
                         )
                     except Exception as e:
-                        error_msg = str(e)
-                        if "Insufficient balance" in error_msg:
-                            await send_telegram_reply(chat_id, "  *Insufficient Balance*")
+                        # ROBUST ERROR PARSING: Captures dict string and uppercase variations
+                        error_msg = str(e).lower()
+                        if "insufficient" in error_msg or "p0001" in error_msg:
+                            await send_telegram_reply(chat_id,
+                                                      f"🚫 *Transaction Failed*\n\nYou do not have sufficient balance in **{default_acc['account_name']}** to complete this bulk transaction.")
                         else:
-                            await send_telegram_reply(chat_id, f"  `{error_msg}`")
+                            await send_telegram_reply(chat_id, f"⚠️ *System Error*\n`{str(e)}`")
                         return
 
                     bd_text = "\n".join(result["breakdown"]) if result["breakdown"] else "No unique items."
@@ -163,16 +167,16 @@ class NLPHandler:
                     dynamic_header = "\n".join(header_parts) if header_parts else "  *NO FINANCIAL MOVEMENT*"
 
                     receipt = (
-                        f"  *BULK TRANSACTION SAVED*\n"
+                        f"✅ *BULK TRANSACTION SAVED*\n"
                         f"{dynamic_header}\n\n"
-                        f"  *Primary Account:* {default_acc['account_name']}\n"
-                        f"  *Receipt Breakdown:*\n{bd_text}"
+                        f"🏦 *Primary Account:* {default_acc['account_name']}\n"
+                        f"📝 *Receipt Breakdown:*\n{bd_text}"
                     )
 
                     if finish_reason == "length":
-                        receipt += "\n\n  *WARNING: LIMIT EXCEEDED*\nYour list was extremely long. The AI hit its maximum output limit."
+                        receipt += "\n\n⚠️ *WARNING: LIMIT EXCEEDED*\nYour list was extremely long. The AI hit its maximum output limit."
                     if result.get("ignored"):
-                        receipt += f"\n\n  *Unprocessed Items:*\n" + "\n".join(result["ignored"])
+                        receipt += f"\n\nℹ️ *Unprocessed Items:*\n" + "\n".join(result["ignored"])
 
                     await send_telegram_reply(chat_id, receipt)
 
@@ -181,7 +185,7 @@ class NLPHandler:
                     batch_dao = PendingBatchDAO(supabase_admin)
                     batch_dao.create_batch(batch_id, user_id, default_acc['id'], result["duplicates"])
                     keyboard = CallbackHandler.generate_duplicate_keyboard(batch_id, result["duplicates"])
-                    await send_telegram_reply(chat_id, f"  *Duplicate Entries Found*\nTap to select/save duplicates.",
+                    await send_telegram_reply(chat_id, f"⚠️ *Duplicate Entries Found*\nTap to select/save duplicates.",
                                               reply_markup=keyboard)
                 return
 
@@ -189,12 +193,11 @@ class NLPHandler:
             response_sections, committed_items = [], []
             if finish_reason == "length":
                 response_sections.append(
-                    "  *WARNING: The AI hit its maximum capacity and may not have processed your entire message.*")
+                    "⚠️ *WARNING: The AI hit its maximum capacity and may not have processed your entire message.*")
 
             for tx in transactions_list:
                 amount = getattr(tx, 'amount', None) or Decimal('0.00')
 
-                # SAFE FETCH for Dual Extraction
                 raw_desc = getattr(tx, 'raw_description', None) or getattr(tx, 'item', text)
                 description = str(raw_desc).title()
 
@@ -204,13 +207,13 @@ class NLPHandler:
                 if amount > Decimal('0.00'):
                     tx_future = getattr(tx, 'future', None)
                     if tx_future and getattr(tx_future, 'is_future', False):
-                        response_sections.append(f"  '{description}' identified as future plan.")
+                        response_sections.append(f"ℹ️ '{description}' identified as future plan.")
                         continue
 
                     if not getattr(tx, 'intent', None) or getattr(tx, 'needs_clarification', False):
                         cf = getattr(tx, 'clarification_fields', [])
                         missing_fields = ",".join(cf) if cf else "Intent/Details"
-                        response_sections.append(f"  Could not process '{description}'. Clarify: {missing_fields}")
+                        response_sections.append(f"❓ Could not process '{description}'. Clarify: {missing_fields}")
                         continue
 
                     tx_dates = []
@@ -269,7 +272,12 @@ class NLPHandler:
                             }).execute()
                         except Exception as e:
                             db_failure = True
-                            response_sections.append(f"  `{str(e)}`")
+                            error_msg = str(e).lower()
+                            if "insufficient" in error_msg or "p0001" in error_msg:
+                                response_sections.append(
+                                    f"🚫 *Transaction Failed*\nCould not process '{description}' due to **Insufficient Balance**.")
+                            else:
+                                response_sections.append(f"⚠️ *System Error*\n`{str(e)}`")
                             break
 
                     if db_failure: continue
@@ -326,16 +334,16 @@ class NLPHandler:
                             supabase.table("transactions").insert(db_payloads).execute()
 
                         committed_items.append(
-                            f"  *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
+                            f"✅ *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
 
                         if is_new_taxonomy and intent == "expense":
                             await category_pull_service.add_single_item_to_taxonomy(category, subcategory, norm_item,
                                                                                     user_id)
                     except Exception as e:
-                        response_sections.append(f"  `{str(e)}`")
+                        response_sections.append(f"⚠️ *Database Error*\n`{str(e)}`")
 
                 else:
-                    response_sections.append(f"  Could not process '{description}'. (Missing or Zero Amount)")
+                    response_sections.append(f"ℹ️ Could not process '{description}'. (Missing or Zero Amount)")
 
             if committed_items:
                 response_sections.append("\n\n".join(committed_items))
@@ -344,4 +352,4 @@ class NLPHandler:
                 await send_telegram_reply(chat_id, "\n\n".join(response_sections))
 
         except Exception as e:
-            await send_telegram_reply(chat_id, f"  `{str(e)}`")
+            await send_telegram_reply(chat_id, f"⚠️ *Critical Error*\n`{str(e)}`")
