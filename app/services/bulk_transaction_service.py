@@ -2,6 +2,7 @@ from decimal import Decimal
 from datetime import datetime
 from app.utils.constants import TZ_IST
 
+
 class BulkTransactionService:
     def __init__(self, db_client, user_id: str, cache_manager, category_pull_service):
         self.db = db_client
@@ -30,24 +31,25 @@ class BulkTransactionService:
         }
 
         # =========================================================
-        # PHASE 1: PRE-FLIGHT AUTO-LEARNING (Prevent Timeouts)
-        # Scan for all unknown items and learn them in ONE AI call.
+        # PHASE 1: PRE-FLIGHT AUTO-LEARNING
         # =========================================================
         unknown_item_names = set()
         for tx in transactions_list:
             amount = tx.amount if tx.amount else Decimal('0.00')
-            if amount > Decimal('0.00') and not tx.needs_clarification and not (tx.future and tx.future.is_future):
-                description = str(tx.item or "Item").title()
-                if not self.cache_manager.search_item(description):
-                    unknown_item_names.add(description)
+            intent = (tx.intent or "").lower()
+
+            if intent == "expense" and amount > Decimal('0.00') and not tx.needs_clarification and not (
+                    tx.future and tx.future.is_future):
+                raw_desc = str(tx.raw_description or "Item").title()
+                norm_item = str(tx.normalized_item or raw_desc).title()
+
+                if not self.cache_manager.search_item(norm_item):
+                    unknown_item_names.add(norm_item)
 
         if unknown_item_names:
-            # Combine up to 10 unknown items into a single query to train the DB in one shot
             query_string = ", ".join(list(unknown_item_names)[:10])
             try:
-                # Internally trigger the /categorypull functionality
                 await self.category_pull_service.manual_category_pull(query_string, self.user_id)
-                # Immediately rebuild the cache so Phase 2 can use the newly learned data
                 self.cache_manager.rebuild_cache()
             except Exception as e:
                 print(f"Auto-learning pre-flight failed: {e}")
@@ -56,7 +58,8 @@ class BulkTransactionService:
         # PHASE 2: NORMAL TRANSACTION PROCESSING
         # =========================================================
         for tx in transactions_list:
-            description = str(tx.item or "Item").title()
+            description = str(tx.raw_description or "Item").title()
+            norm_item = str(tx.normalized_item or description).title()
             amount = tx.amount if tx.amount else Decimal('0.00')
 
             if amount <= Decimal('0.00'):
@@ -75,20 +78,30 @@ class BulkTransactionService:
             category = tx.category
             subcategory = tx.subcategory
 
-            # Search the freshly updated cache
-            cached = self.cache_manager.search_item(description)
+            cached = self.cache_manager.search_item(norm_item)
 
-            # Core Taxonomy Resolution
-            if cached and cached.get("category"):
-                category = category or cached["category"]
-                subcategory = subcategory or cached.get("subcategory")
+            if intent == "expense":
+                if not category or not subcategory:
+                    if cached and cached.get("category"):
+                        category = category or cached["category"]
+                        subcategory = subcategory or cached.get("subcategory")
+                    else:
+                        category = category or "Groceries"
+                        subcategory = subcategory or "General Purchases"
+                        new_taxonomy_items.append({"category": category, "subcategory": subcategory, "item": norm_item})
+                else:
+                    if not cached:
+                        new_taxonomy_items.append({"category": category, "subcategory": subcategory, "item": norm_item})
             else:
-                # ULTIMATE FALLBACK: If the LLM failed to include the exact word in the bulk pull
-                category = category or "Groceries"
-                subcategory = subcategory or "General Purchases"
-                new_taxonomy_items.append({"category": category, "subcategory": subcategory, "item": description})
+                if not category:
+                    category = "Income" if intent == "income" else "Transfer"
+                if not subcategory:
+                    subcategory = "General"
+                # Income/Transfers shouldn't clutter the normalized_item column
+                norm_item = None
 
-            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own"] else None
+            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other",
+                                                                       "transfer_own"] else None
             dest_acc = default_account['account_name'] if intent in ["income", "transfer_own"] else None
 
             payload = {
@@ -96,6 +109,7 @@ class BulkTransactionService:
                 "amount": str(amount),
                 "txn_type": intent,
                 "description": description,
+                "normalized_item": norm_item,  # <--- NEW FIELD INJECTED
                 "intent": intent,
                 "category": category,
                 "subcategory": subcategory,
@@ -106,29 +120,25 @@ class BulkTransactionService:
             }
 
             is_salary_or_income = intent == "income" or (category and category.lower() == "income")
-            is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(str(amount), description, intent)
+            is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(str(amount), description,
+                                                                                               intent)
 
             if is_duplicate:
                 pending_duplicates.append({
-                    "payload": payload, "selected": False, "desc": description, "amount": str(amount), "txn_type": intent
+                    "payload": payload, "selected": False, "desc": description, "amount": str(amount),
+                    "txn_type": intent
                 })
             else:
                 unique_payloads.append(payload)
                 cat_disp = f"{category} -> {subcategory}" if subcategory else category
-
                 if intent in ["expense", "transfer_other"]:
                     totals["expenses"] += amount
-                    counts["expenses"] += 1
                 elif intent == "income":
                     totals["income"] += amount
-                    counts["income"] += 1
                 elif intent == "transfer_own":
                     totals["transfers"] += amount
-                    counts["transfers"] += 1
-
                 breakdown.append(f"  {description}:  {float(amount):,.2f} ({cat_disp})")
 
-        # COMMIT ANY RESIDUAL UNKNOWN ITEMS DIRECTLY AS A SAFETY NET
         if new_taxonomy_items:
             await self.category_pull_service.bulk_add_items_to_taxonomy(new_taxonomy_items, self.user_id)
 

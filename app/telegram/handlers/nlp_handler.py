@@ -22,6 +22,7 @@ RULES:
 4. If generic/unknown category, set category/subcategory to null.
 5. TODAY IS {CURRENT_DATE}.
 6. ANTI-LAZINESS MANDATE: You MUST extract and process EVERY SINGLE ITEM provided in the user's input. Do NOT truncate, stop early, skip, or group items. If the user lists 35 items, your array MUST contain exactly 35 objects.
+7. DUAL-EXTRACTION: For every item, extract EXACTLY what the user typed into `raw_description` (e.g., 'surf excel 2kg'). Extract the clean, generic entity into `normalized_item` (e.g., 'Surf Excel'). If intent is income or transfer, `normalized_item` can be null.
 
 JSON SCHEMA:
 {
@@ -30,7 +31,8 @@ JSON SCHEMA:
     {
       "intent": "expense",
       "amount": 0.0,
-      "item": "string",
+      "raw_description": "string",
+      "normalized_item": "string or null",
       "category": "string or null",
       "subcategory": "string or null",
       "source_account": "string or null",
@@ -191,7 +193,10 @@ class NLPHandler:
 
             for tx in transactions_list:
                 amount = tx.amount if tx.amount else Decimal('0.00')
-                description = str(tx.item or text).title()
+
+                # USE DUAL EXTRACTION
+                description = str(tx.raw_description or tx.item or text).title()
+                norm_item = str(tx.normalized_item or description).title()
 
                 if amount > Decimal('0.00'):
                     if tx.future and tx.future.is_future:
@@ -224,13 +229,14 @@ class NLPHandler:
                     num_occ = Decimal(len(tx_dates))
                     tot_amt = amount * num_occ
 
+                    intent = tx.intent.lower()
                     source_acc_obj = AccountHandler.get_account_from_list(user_accounts,
-                                                                          tx.source_account) if tx.intent in ["expense",
-                                                                                                              "transfer_other",
-                                                                                                              "transfer_own"] else None
+                                                                          tx.source_account) if intent in ["expense",
+                                                                                                           "transfer_other",
+                                                                                                           "transfer_own"] else None
                     dest_acc_obj = AccountHandler.get_account_from_list(user_accounts,
-                                                                        tx.destination_account) if tx.intent in [
-                        "income", "transfer_own"] else None
+                                                                        tx.destination_account) if intent in ["income",
+                                                                                                              "transfer_own"] else None
 
                     updates_to_make = []
 
@@ -265,35 +271,44 @@ class NLPHandler:
                     # ============================================================
                     category = tx.category
                     subcategory = tx.subcategory
-                    cached = cache_manager.search_item(description)
+
+                    # Search cache with CLEAN NORMALIZED item
+                    cached = cache_manager.search_item(norm_item)
                     is_new_taxonomy = False
 
-                    if not cached:
-                        # INTERNALLY TRIGGER THE /categorypull LOGIC
-                        try:
-                            await category_pull_service.manual_category_pull(description, user_id)
-                            # Rebuild cache immediately to use the new taxonomy
-                            cache_manager.rebuild_cache()
-                            cached = cache_manager.search_item(description)
-                        except Exception as e:
-                            print(f"Auto-learning failed for {description}: {e}")
+                    if intent == "expense":
+                        if not cached:
+                            try:
+                                await category_pull_service.manual_category_pull(norm_item, user_id)
+                                cache_manager.rebuild_cache()
+                                cached = cache_manager.search_item(norm_item)
+                            except Exception as e:
+                                print(f"Auto-learning failed for {norm_item}: {e}")
 
-                    if cached and cached.get("category"):
-                        category = category or cached["category"]
-                        subcategory = subcategory or cached.get("subcategory")
+                        if cached and cached.get("category"):
+                            category = category or cached["category"]
+                            subcategory = subcategory or cached.get("subcategory")
+                        else:
+                            is_new_taxonomy = True
+                            if not category:
+                                ai_cls = await category_pull_service.classify_item(norm_item, intent=intent)
+                                category = ai_cls.get("category", "General")
+                                subcategory = subcategory or ai_cls.get("subcategory", "Miscellaneous")
+                            if not subcategory:
+                                subcategory = "Miscellaneous"
                     else:
-                        # FALLBACK: If LLM missed the exact word during the pull
-                        is_new_taxonomy = True
                         if not category:
-                            ai_cls = await category_pull_service.classify_item(description, intent=tx.intent)
-                            category = ai_cls.get("category", "General")
-                            subcategory = subcategory or ai_cls.get("subcategory", "Miscellaneous")
+                            category = "Income" if intent == "income" else "Transfer"
                         if not subcategory:
-                            subcategory = "Miscellaneous"
+                            subcategory = "General"
+                        # Set to null to keep income/transfer ledgers clean
+                        norm_item = None
 
+                        # SAVE RAW & NORMALIZED ENTITY TO LEDGER
                     db_payloads = [
-                        {"user_id": user_id, "amount": float(amount), "txn_type": tx.intent, "description": description,
-                         "intent": tx.intent, "category": category, "subcategory": subcategory, "date": d.isoformat(),
+                        {"user_id": user_id, "amount": float(amount), "txn_type": intent, "description": description,
+                         "normalized_item": norm_item,
+                         "intent": intent, "category": category, "subcategory": subcategory, "date": d.isoformat(),
                          "source_account": source_acc_obj['account_name'] if source_acc_obj else None,
                          "destination_account": dest_acc_obj['account_name'] if dest_acc_obj else None,
                          "soft_deleted": False} for d in tx_dates]
@@ -307,9 +322,9 @@ class NLPHandler:
                         committed_items.append(
                             f"  *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
 
-                        # SAVE TO TAXONOMY AS ULTIMATE FALLBACK
-                        if is_new_taxonomy:
-                            await category_pull_service.add_single_item_to_taxonomy(category, subcategory, description,
+                        # SAVE NORMALIZED ITEM TO TAXONOMY
+                        if is_new_taxonomy and intent == "expense":
+                            await category_pull_service.add_single_item_to_taxonomy(category, subcategory, norm_item,
                                                                                     user_id)
                     except Exception as e:
                         response_sections.append(f"  `{str(e)}`")
