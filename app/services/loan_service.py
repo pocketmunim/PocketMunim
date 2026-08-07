@@ -19,9 +19,13 @@ class LoanService:
         return emi.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
     async def create_loan(self, loan_data) -> dict:
+        if not loan_data.principal or not loan_data.lender_name:
+            raise ValueError(
+                "⚠️ Loan Processing Error\nCould not determine the principal amount or lender name. Please specify details clearly (e.g., taken 5L from Sushma at 11% for 3 years).")
+
         principal = Decimal(str(loan_data.principal))
-        rate = Decimal(str(loan_data.annual_interest_rate))
-        tenure_years = loan_data.tenure_years
+        rate = Decimal(str(loan_data.annual_interest_rate or 10.0))
+        tenure_years = loan_data.tenure_years or 1
         tenure_months = tenure_years * 12
 
         emi = loan_data.emi_amount
@@ -34,7 +38,7 @@ class LoanService:
             "principal_amount": float(principal),
             "annual_interest_rate": float(rate),
             "tenure_months": tenure_months,
-            "start_date": str(loan_data.disbursement_date),
+            "start_date": str(loan_data.disbursement_date or datetime.now(TZ_IST).date()),
             "is_active": True
         }
         res = self.db.table("loans").insert(loan_payload).execute()
@@ -43,7 +47,8 @@ class LoanService:
 
         loan_id = res.data[0]['loan_id']
 
-        start_date = datetime.strptime(str(loan_data.first_emi_date), "%Y-%m-%d").date()
+        start_date_str = loan_data.first_emi_date or datetime.now(TZ_IST).date().isoformat()
+        start_date = datetime.strptime(str(start_date_str), "%Y-%m-%d").date()
         balance = principal
         monthly_rate = rate / Decimal('12') / Decimal('100')
 
@@ -74,11 +79,14 @@ class LoanService:
 
     async def process_emi_payment(self, lender_name: str, payment_amount: Decimal = None,
                                   target_period: str = None) -> str:
+        if not lender_name:
+            return "❌ Please specify the lender name for the EMI payment."
+
         loans_res = self.db.table("loans").select("*").eq("user_id", self.user_id).ilike("lender",
                                                                                          lender_name.strip()).eq(
             "is_active", True).execute()
         if not loans_res.data:
-            return f"❌ Lender '{lender_name}' not available or has no active loans."
+            return f"❌ Lender '{lender_name.title()}' not available or has no active loans. Please check the lender name or use /getloans to view active records."
 
         loan = loans_res.data[0]
         loan_id = loan['loan_id']
@@ -111,7 +119,7 @@ class LoanService:
         current_balance = Decimal(str(default_acc['balance']))
 
         if current_balance < amt_to_pay:
-            return f"🚫 Insufficient balance in **{default_acc['account_name']}** to pay EMI of ₹{amt_to_pay:,.2f}."
+            return f"🚫 Transaction Failed\nYou do not have sufficient balance in {default_acc['account_name']} to complete this EMI payment."
 
         new_balance = current_balance - amt_to_pay
 
@@ -123,7 +131,7 @@ class LoanService:
             "log_type": "DEBIT",
             "amount": float(amt_to_pay),
             "balance_after": float(new_balance),
-            "description": f"Loan EMI Payment to {loan['lender']} (Inst #{target_sched['installment_number']})"
+            "description": f"Loan EMI Payment to {loan['lender']} (Installment #{target_sched['installment_number']})"
         }).execute()
 
         self.db.table("transactions").insert({
@@ -144,10 +152,13 @@ class LoanService:
 
         remaining_check = self.db.table("emi_schedules").select("schedule_id", count="exact").eq("loan_id", loan_id).eq(
             "status", "PENDING").execute()
+
+        success_header = "✅ EMI Payment Successful"
+        payment_line = f"Paid ₹{amt_to_pay:,.2f} to {loan['lender']} (Installment #{target_sched['installment_number']})."
+        balance_line = f"New Balance in {default_acc['account_name']}: ₹{new_balance:,.2f}"
+
         if not remaining_check.count or remaining_check.count == 0:
             self.db.table("loans").update({"is_active": False}).eq("loan_id", loan_id).execute()
-            loan_status_msg = f"\n🎉 Congratulations! Loan from **{loan['lender']}** is now fully paid off and closed!"
-        else:
-            loan_status_msg = ""
+            return f"{success_header}\n{payment_line}\n{balance_line}\n🎉 Congratulations! Loan from {loan['lender']} is now fully paid off and closed!"
 
-        return f"✅ *EMI Payment Successful*\nPaid ₹{amt_to_pay:,.2f} to *{loan['lender']}* (Installment #{target_sched['installment_number']}).\nNew Balance in {default_acc['account_name']}: ₹{new_balance:,.2f}{loan_status_msg}"
+        return f"{success_header}\n{payment_line}\n{balance_line}"

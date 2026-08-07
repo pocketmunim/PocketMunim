@@ -14,15 +14,16 @@ class LoanHandler:
             await send_telegram_reply(chat_id, "ℹ️ You have no active loans.")
             return
 
-        msg = ["🏦 *Active Loans Dashboard*\n"]
+        msg = ["🏦 Active Loans Dashboard\n"]
         for loan in loans:
-            schedules = loan.get('emi_schedules', [])
+            schedules = sorted(loan.get('emi_schedules', []), key=lambda x: x['installment_number'])
             pending_emis = [e for e in schedules if e['status'] == 'PENDING']
             total_emi = len(schedules)
             completed_emi = total_emi - len(pending_emis)
 
             progress = (completed_emi / total_emi * 100) if total_emi > 0 else 0
 
+            # Color-coded progress bar rules
             if progress < 50:
                 bar_color = "🟩"
             elif progress < 85:
@@ -33,13 +34,14 @@ class LoanHandler:
             filled_blocks = int(progress / 10)
             progress_bar = f"{bar_color} {'█' * filled_blocks}{'░' * (10 - filled_blocks)}"
 
-            msg.append(f"🏦 *{loan['lender']}*")
-            msg.append(f"{progress_bar} *{int(progress)}% Paid* ({completed_emi}/{total_emi} EMIs)")
-            msg.append(f"💰 Principal: ₹{float(loan['principal_amount']):,.2f} | Rate: {loan['annual_interest_rate']}%")
+            msg.append(f"🏦 {loan['lender']}")
+            msg.append(f"{progress_bar} {int(progress)}% Paid ({completed_emi}/{total_emi} EMIs)")
+            msg.append(
+                f"💰 Principal: ₹{float(loan['principal_amount']):,.2f} | Rate: {float(loan['annual_interest_rate'])}%")
 
             if pending_emis:
                 next_emi = pending_emis[0]
-                msg.append(f"📅 *Next Due*: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
+                msg.append(f"📅 Next Due: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
             msg.append("────────────────────────")
 
         await send_telegram_reply(chat_id, "\n".join(msg))
@@ -55,8 +57,8 @@ class LoanHandler:
                 res = await loan_service.create_loan(parsed)
                 await send_telegram_reply(
                     chat_id,
-                    f"✅ *Loan Registered Successfully*\n"
-                    f"Lender: *{parsed.lender_name.title()}*\n"
+                    f"✅ Loan Registered Successfully\n"
+                    f"Lender: {parsed.lender_name.title()}\n"
                     f"Principal: ₹{float(parsed.principal):,.2f}\n"
                     f"Calculated EMI: ₹{res['emi']:,.2f}\n"
                     f"Tenure: {parsed.tenure_years} Years ({res['tenure_months']} months)"
@@ -68,5 +70,7 @@ class LoanHandler:
                     target_period=parsed.target_period
                 )
                 await send_telegram_reply(chat_id, result_msg)
+        except ValueError as ve:
+            await send_telegram_reply(chat_id, str(ve))
         except Exception as e:
-            await send_telegram_reply(chat_id, f"⚠️ *Loan Processing Error*\n`{str(e)}`")
+            await send_telegram_reply(chat_id, f"⚠️ Loan Processing Error\n`{str(e)}`")
