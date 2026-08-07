@@ -2,7 +2,7 @@ import json
 import uuid
 import asyncio
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.ai.ai_provider import execute_resilient_ai
 from app.ai.schemas import AITransactionExtraction
@@ -129,7 +129,14 @@ loan_repayment MUST preserve the direction of repayment whenever explicitly iden
 Extract explicitly stated quantities and units. Do not infer quantity.
 
 21. RECURRENCE
-Recognize daily, weekly, monthly, yearly and explicit intervals.
+Recognize frequency mapping:
+- daily
+- weekly
+- biweekly (every 2 weeks, fortnightly)
+- monthly
+- quarterly (every 3 months)
+- semi_annually (half yearly, every 6 months)
+- yearly (annually, per annum)
 
 22. EDIT TARGET
 For edit operations identify field, old value, new value.
@@ -203,7 +210,7 @@ Return ONLY this JSON structure.
       },
       "recurrence": {
         "enabled": false,
-        "frequency": null,
+        "frequency": "daily|weekly|biweekly|monthly|quarterly|semi_annually|yearly|null",
         "interval": null,
         "day_of_month": null,
         "day_of_week": null,
@@ -267,23 +274,54 @@ Return ONLY valid JSON. Use the fixed schema. Do not output anything outside the
 END OF POCKETMUNIM NLP ENGINE CONSTITUTION"""
 
 
+def _add_months(date_obj: datetime, months_to_add: int) -> datetime:
+    """Safely adds months to a datetime object, handling leap years and end-of-month rollover."""
+    m = date_obj.month - 1 + months_to_add
+    y = date_obj.year + m // 12
+    m = m % 12 + 1
+    d = date_obj.day
+    while True:
+        try:
+            return date_obj.replace(year=y, month=m, day=d)
+        except ValueError:
+            # E.g., Feb 29th goes to Feb 28th if not a leap year
+            d -= 1
+
+
 def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: datetime) -> list:
     try:
         start_dt = datetime.strptime(start_date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=current_dt.tzinfo)
     except Exception:
         return []
+
     dates = []
     curr_iter = start_dt
     freq = frequency.lower() if frequency else ""
-    while curr_iter <= current_dt:
+
+    # SAFETY GUARDRAIL: Max 500 iterations to prevent infinite loops / db explosion
+    max_iterations = 500
+
+    while curr_iter <= current_dt and len(dates) < max_iterations:
         dates.append(curr_iter)
-        if freq == 'monthly':
-            try:
-                curr_iter = curr_iter.replace(month=curr_iter.month + 1)
-            except ValueError:
-                curr_iter = curr_iter.replace(month=curr_iter.month + 1, day=28)
+
+        if freq == 'daily':
+            curr_iter += timedelta(days=1)
+        elif freq == 'weekly':
+            curr_iter += timedelta(weeks=1)
+        elif freq in ['biweekly', 'fortnightly']:
+            curr_iter += timedelta(weeks=2)
+        elif freq == 'monthly':
+            curr_iter = _add_months(curr_iter, 1)
+        elif freq == 'quarterly':
+            curr_iter = _add_months(curr_iter, 3)
+        elif freq in ['semi_annually', 'half_yearly']:
+            curr_iter = _add_months(curr_iter, 6)
+        elif freq in ['yearly', 'annually']:
+            curr_iter = _add_months(curr_iter, 12)
         else:
+            # Fallback for unrecognizable frequencies
             break
+
     return dates
 
 
@@ -607,8 +645,13 @@ class NLPHandler:
                         elif len(db_payloads) > 1:
                             supabase.table("transactions").insert(db_payloads).execute()
 
-                        committed_items.append(
-                            f"✅ *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
+                        # If recurring, modify the response message to show total impact!
+                        if is_recurring_past:
+                            committed_items.append(
+                                f"✅ *Recurring Saved*\n  {description}: {float(amount):,.2f} x {len(tx_dates)} = *{float(tot_amt):,.2f}*\n  ({category} -> {subcategory})")
+                        else:
+                            committed_items.append(
+                                f"✅ *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
 
                         if is_new_taxonomy and intent == "expense":
                             await category_pull_service.add_single_item_to_taxonomy(category, subcategory, norm_item,
