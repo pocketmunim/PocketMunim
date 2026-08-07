@@ -20,35 +20,43 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
-supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else supabase
+supabase_admin: Client = create_client(SUPABASE_URL,
+                                       SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY else supabase
+
 category_pull_service = CategoryPullService(None, supabase_admin)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 @app.head("/")
 def health_check():
     return {"status": "PocketMunim Enterprise API is live (Vercel-Safe Synchronous Mode)", "status_code": 200}
 
+
 @app.get("/report/view/{token}", response_class=HTMLResponse)
 async def view_report(token: str):
     html_content = await ReportHandler.get_html_report(token, supabase_admin)
     return HTMLResponse(content=html_content)
 
+
 async def execute_telegram_command(chat_id: int, text: str, user_id: str, request_url: str):
     is_safe, user_exists = await UserHandler.security_check(supabase_admin, chat_id, text)
     if not is_safe: return
+
     if not user_exists and not text.startswith("/register"):
         await UserHandler.prompt_registration(chat_id)
         return
 
-    # REGEX FIX: Now supports "deduct all for jan", "deduct all amount of jan", "deduct all jan"
     deduct_all_regex = r"^deduct\s+all\s+(?:amount\s+of\s+|for\s+)?([a-zA-Z]+)$"
 
+    # ================= COMMAND ROUTING =================
     if text.startswith("/register"):
         await UserHandler.register(supabase_admin, chat_id, user_id, text, user_exists)
     elif text.startswith("/setsalary"):
@@ -61,16 +69,20 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await AccountHandler.add_account(supabase_admin, chat_id, user_id, text)
     elif text.startswith("/setdefault"):
         await AccountHandler.set_default(supabase_admin, chat_id, user_id, text)
+    elif text.startswith("/showaccount"):
+        await AccountHandler.show_accounts(supabase_admin, chat_id, user_id)
     elif text.startswith("/start"):
-        await send_telegram_reply(chat_id, "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
+        await send_telegram_reply(chat_id,
+                                  "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
     elif text.startswith("/categorypull"):
         await NLPHandler.pull_categories(supabase_admin, chat_id, user_id, text, category_pull_service)
     elif text.startswith("/history"):
-        await send_telegram_reply(chat_id, "📜 *Historical Data Auto-Template*\n...")
+        await send_telegram_reply(chat_id, "  *Historical Data Auto-Template*\n...")
     elif text.startswith("/monthly"):
         await ReportHandler.monthly_summary(supabase_admin, chat_id, user_id, text)
     else:
         await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, text, category_pull_service)
+
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request, authorized: bool = Depends(authenticate_telegram_request)):
@@ -91,12 +103,9 @@ async def telegram_webhook(request: Request, authorized: bool = Depends(authenti
 
     user_id = str(request.state.telegram_id)
 
-    # VERCEL FIX: We must explicitly `await` the execution here.
-    # BackgroundTasks are dropped instantly in serverless environments.
     try:
         await execute_telegram_command(chat_id, text, user_id, str(request.url))
     except Exception as e:
         print(f"Execution Error: {str(e)}")
-        # We still catch errors so Telegram gets a 200 OK and doesn't infinitely retry
 
     return {"ok": True}

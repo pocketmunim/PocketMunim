@@ -35,9 +35,8 @@ class AccountHandler:
             supabase_admin.table('accounts').insert({
                 "user_id": user_id, "account_name": acc_name, "balance": acc_bal, "is_default": is_first
             }).execute()
-            await send_telegram_reply(chat_id, f"✅ *Account Added*\nName: {acc_name}\nBalance: ₹{acc_bal:,.2f}")
+            await send_telegram_reply(chat_id, f"✅ *Account Added*\nName: {acc_name}\nBalance:  {acc_bal:,.2f}")
         except Exception as e:
-            # 🚀 EXACT ERROR EXPOSURE
             await send_telegram_reply(chat_id, f"⚠️ Failed to add account:\n`{str(e)}`")
 
     @staticmethod
@@ -56,7 +55,37 @@ class AccountHandler:
 
             supabase_admin.table('accounts').update({"is_default": False}).eq('user_id', user_id).execute()
             supabase_admin.table('accounts').update({"is_default": True}).eq('id', acc_res.data[0]['id']).execute()
+
             await send_telegram_reply(chat_id, f"✅ '{acc_res.data[0]['account_name']}' is now your default account.")
         except Exception as e:
-            # 🚀 EXACT ERROR EXPOSURE
             await send_telegram_reply(chat_id, f"⚠️ Failed to set default:\n`{str(e)}`")
+
+    @staticmethod
+    async def show_accounts(supabase_admin, chat_id, user_id):
+        try:
+            acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).order('is_default',
+                                                                                                desc=True).execute()
+            accounts = acc_res.data or []
+
+            if not accounts:
+                await send_telegram_reply(chat_id,
+                                          "⚠️ *No Bank Accounts Configured*\nUse `/addaccount [BankName] [Balance]` to start.")
+                return
+
+            total_balance = sum(float(acc['balance']) for acc in accounts)
+
+            msg_lines = ["🏦 *Your Linked Accounts*\n"]
+
+            for acc in accounts:
+                # Highlight default account
+                icon = "⭐" if acc.get('is_default') else "💳"
+                name = acc['account_name']
+                bal = float(acc['balance'])
+                msg_lines.append(f"{icon} *{name}*:  {bal:,.2f}")
+
+            msg_lines.append(f"\n💰 *Total Net Worth:*  {total_balance:,.2f}")
+            msg_lines.append("\n_Use `/setdefault [BankName]` to change your default account._")
+
+            await send_telegram_reply(chat_id, "\n".join(msg_lines))
+        except Exception as e:
+            await send_telegram_reply(chat_id, f"⚠️ *System Error*\n`{str(e)}`")
