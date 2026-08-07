@@ -14,7 +14,7 @@ from app.telegram.handlers.salary_handler import SalaryHandler
 from app.telegram.handlers.report_handler import ReportHandler
 from app.telegram.handlers.callback_handler import CallbackHandler
 from app.telegram.handlers.nlp_handler import NLPHandler
-
+from app.telegram.handlers.loan_handler import LoanHandler
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -71,6 +71,12 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await AccountHandler.set_default(supabase_admin, chat_id, user_id, text)
     elif text.startswith("/showaccount"):
         await AccountHandler.show_accounts(supabase_admin, chat_id, user_id)
+        # Inside execute_telegram_command()
+    elif text.startswith("/getloans"):
+        await LoanHandler.get_loans(supabase_admin, chat_id, user_id)
+    elif any(keyword in text.lower() for keyword in ["taken", "borrowed", "emi", "lender"]):
+        # Intercept loan statements or EMI payments safely
+        await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
     elif text.startswith("/start"):
         await send_telegram_reply(chat_id,
                                   "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
