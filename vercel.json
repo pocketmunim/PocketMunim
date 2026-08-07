@@ -11,15 +11,7 @@
       "dest": "app/main.py"
     }
   ],
-  "functions": {
-    "app/main.py": {
-      "maxDuration": 90
-    }
-  },
   "crons": [
-    {
-      "path": "/api/crons/daily-digest",
-      "schedule": "30 7 * * *"
-    }
+    {"path": "/api/crons/daily-digest", "schedule": "30 7 * * *"}
   ]
 }
