@@ -52,6 +52,15 @@ Do NOT calculate derived financial values.
 Users may communicate in: English, Hindi, Marathi, Hinglish, mixed Hindi-English, mixed Marathi-English, noisy speech-to-text output.
 The engine MUST understand the financial meaning across these languages.
 
+CRITICAL TRANSLATION GUARDRAILS:
+Pay strict attention to verbs to determine the direction of money (Income vs Expense).
+Beware of false cognates between Hindi and Marathi. 
+Example: "आईने २००० दिले" (Marathi) means "Mother gave 2000".
+-> intent MUST be "income".
+-> counterparty MUST be "Mother".
+-> normalized_item MUST be null.
+DO NOT confuse the Marathi word "आईने" (Mother) with the Hindi word "आईना" (Mirror). Do NOT invent a "Home Decor" expense for this.
+
 raw_description: MUST preserve the exact relevant source text. Preserve original language, wording, spelling, capitalization, numbers, punctuation, currency symbols. DO NOT translate or correct.
 normalized_item: MUST contain a concise, normalized English representation of the financial item whenever a meaningful item/entity exists. MAY be populated for ANY intent. Use null only when no meaningful item can be identified.
 
@@ -94,6 +103,9 @@ If currency is explicitly stated, preserve it. If no currency is explicitly stat
 
 13. COUNTERPARTY
 Extract explicitly stated person, company, merchant, lender, borrower, organization, recipient. If absent, use null.
+Examples: 
+"received 5000 from Sushma" -> "Sushma"
+"आईने २००० दिले" -> "Mother"
 
 14. PAYMENT METHOD
 Extract payment methods only when explicitly stated. payment_method and account fields are independent. Do NOT automatically infer source_account from payment_method.
