@@ -60,16 +60,16 @@ class LoanHandler:
                     break
 
             msg = [
-                f"🏦 **{loan['lender']}**",
-                f"{progress_bar} **{int(progress)}% Paid** ({completed_emi}/{total_emi} EMIs)",
-                f"⏳ **Remaining Tenure:** {pending_tenure_months} Months",
-                f"📉 **Remaining Principal:** ₹{remaining_principal:,.2f}",
+                f"🏦 *{loan['lender']}*",
+                f"{progress_bar} *{int(progress)}% Paid* ({completed_emi}/{total_emi} EMIs)",
+                f"⏳ *Remaining Tenure:* {pending_tenure_months} Months",
+                f"📉 *Remaining Principal:* ₹{remaining_principal:,.2f}",
                 f"💰 Original: ₹{float(loan['principal_amount']):,.2f} | Rate: {float(loan['annual_interest_rate'])}%"
             ]
 
             if pending_emis:
                 next_emi = pending_emis[0]
-                msg.append(f"📅 **Next Due**: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
+                msg.append(f"📅 *Next Due*: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
 
             keyboard = None
             if pending_emis and not current_month_paid:
@@ -104,7 +104,6 @@ class LoanHandler:
                         target_period=parsed.target_period
                     )
 
-                    # Handle confirmation state triggered via text command
                     if isinstance(res_status, dict) and res_status.get("status") == "NEXT_EMI_CONFIRM":
                         next_sched_id = res_status["next_schedule_id"]
                         loan_id = res_status["loan_id"]
@@ -122,4 +121,4 @@ class LoanHandler:
             if response_messages:
                 await send_telegram_reply(chat_id, "\n\n".join(response_messages))
         except Exception as e:
-            await send_telegram_reply(chat_id, f"⚠️ **Batch Processing Error**\n`{str(e)}`")
+            await send_telegram_reply(chat_id, f"⚠️ *Batch Processing Error*\n`{str(e)}`")
