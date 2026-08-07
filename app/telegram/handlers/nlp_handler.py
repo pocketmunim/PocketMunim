@@ -192,35 +192,43 @@ class NLPHandler:
                     "  *WARNING: The AI hit its maximum capacity and may not have processed your entire message.*")
 
             for tx in transactions_list:
-                amount = tx.amount if tx.amount else Decimal('0.00')
+                amount = getattr(tx, 'amount', None) or Decimal('0.00')
 
-                # USE DUAL EXTRACTION
-                description = str(tx.raw_description or tx.item or text).title()
-                norm_item = str(tx.normalized_item or description).title()
+                # SAFE FETCH for Dual Extraction
+                raw_desc = getattr(tx, 'raw_description', None) or getattr(tx, 'item', text)
+                description = str(raw_desc).title()
+
+                norm_val = getattr(tx, 'normalized_item', None) or description
+                norm_item = str(norm_val).title()
 
                 if amount > Decimal('0.00'):
-                    if tx.future and tx.future.is_future:
+                    tx_future = getattr(tx, 'future', None)
+                    if tx_future and getattr(tx_future, 'is_future', False):
                         response_sections.append(f"  '{description}' identified as future plan.")
                         continue
-                    if not tx.intent or tx.needs_clarification:
-                        missing_fields = ",".join(
-                            tx.clarification_fields) if tx.clarification_fields else "Intent/Details"
+
+                    if not getattr(tx, 'intent', None) or getattr(tx, 'needs_clarification', False):
+                        cf = getattr(tx, 'clarification_fields', [])
+                        missing_fields = ",".join(cf) if cf else "Intent/Details"
                         response_sections.append(f"  Could not process '{description}'. Clarify: {missing_fields}")
                         continue
 
                     tx_dates = []
                     is_recurring_past = False
+                    tx_recurrence = getattr(tx, 'recurrence', None)
 
-                    if tx.recurrence and tx.recurrence.enabled and tx.recurrence.start_date:
-                        tx_dates = generate_recurrence_dates(tx.recurrence.start_date,
-                                                             tx.recurrence.frequency or "monthly", current_dt)
+                    if tx_recurrence and getattr(tx_recurrence, 'enabled', False) and getattr(tx_recurrence,
+                                                                                              'start_date', None):
+                        tx_dates = generate_recurrence_dates(getattr(tx_recurrence, 'start_date'),
+                                                             getattr(tx_recurrence, 'frequency', "monthly"), current_dt)
                         if tx_dates: is_recurring_past = True
 
                     if not is_recurring_past:
                         db_date_obj = current_dt
-                        if tx.date and tx.date.relative_date:
+                        tx_date = getattr(tx, 'date', None)
+                        if tx_date and getattr(tx_date, 'relative_date', None):
                             try:
-                                db_date_obj = datetime.strptime(tx.date.relative_date.split("T")[0],
+                                db_date_obj = datetime.strptime(getattr(tx_date, 'relative_date').split("T")[0],
                                                                 "%Y-%m-%d").replace(tzinfo=TZ_IST)
                             except:
                                 pass
@@ -229,14 +237,14 @@ class NLPHandler:
                     num_occ = Decimal(len(tx_dates))
                     tot_amt = amount * num_occ
 
-                    intent = tx.intent.lower()
-                    source_acc_obj = AccountHandler.get_account_from_list(user_accounts,
-                                                                          tx.source_account) if intent in ["expense",
-                                                                                                           "transfer_other",
-                                                                                                           "transfer_own"] else None
+                    intent = getattr(tx, 'intent', "").lower()
+                    source_acc_obj = AccountHandler.get_account_from_list(user_accounts, getattr(tx, 'source_account',
+                                                                                                 None)) if intent in [
+                        "expense", "transfer_other", "transfer_own"] else None
                     dest_acc_obj = AccountHandler.get_account_from_list(user_accounts,
-                                                                        tx.destination_account) if intent in ["income",
-                                                                                                              "transfer_own"] else None
+                                                                        getattr(tx, 'destination_account',
+                                                                                None)) if intent in ["income",
+                                                                                                     "transfer_own"] else None
 
                     updates_to_make = []
 
@@ -269,10 +277,9 @@ class NLPHandler:
                     # ============================================================
                     # AUTO-LEARNING CATEGORY RESOLUTION (SINGLE TRANSACTION)
                     # ============================================================
-                    category = tx.category
-                    subcategory = tx.subcategory
+                    category = getattr(tx, 'category', None)
+                    subcategory = getattr(tx, 'subcategory', None)
 
-                    # Search cache with CLEAN NORMALIZED item
                     cached = cache_manager.search_item(norm_item)
                     is_new_taxonomy = False
 
@@ -301,7 +308,6 @@ class NLPHandler:
                             category = "Income" if intent == "income" else "Transfer"
                         if not subcategory:
                             subcategory = "General"
-                        # Set to null to keep income/transfer ledgers clean
                         norm_item = None
 
                         # SAVE RAW & NORMALIZED ENTITY TO LEDGER
@@ -322,7 +328,6 @@ class NLPHandler:
                         committed_items.append(
                             f"  *Transaction Saved*\n  {description}:  {float(amount):,.2f} ({category} -> {subcategory})")
 
-                        # SAVE NORMALIZED ITEM TO TAXONOMY
                         if is_new_taxonomy and intent == "expense":
                             await category_pull_service.add_single_item_to_taxonomy(category, subcategory, norm_item,
                                                                                     user_id)
