@@ -94,11 +94,14 @@ class CallbackHandler:
             loan_id = data.split("_")[1]
             from app.services.loan_service import LoanService
             service = LoanService(supabase_admin, user_id)
-            result_msg, status = await service.process_emi_payment_by_id(loan_id)
-            if status == "CONFIRM_REQUIRED":
+            result_msg, res_status = await service.process_emi_payment_by_id(loan_id)
+
+            if isinstance(res_status, dict) and res_status.get("status") == "NEXT_EMI_CONFIRM":
+                next_sched_id = res_status["next_schedule_id"]
                 keyboard = {
                     "inline_keyboard": [
-                        [{"text": "✅ Yes, Pay Again", "callback_data": f"forcepay_{loan_id}"}],
+                        [{"text": "✅ Yes, Pay Next Month's EMI",
+                          "callback_data": f"paynext_{loan_id}_{next_sched_id}"}],
                         [{"text": "❌ Cancel", "callback_data": "cancelpay"}]
                     ]
                 }
@@ -106,11 +109,12 @@ class CallbackHandler:
             else:
                 await edit_telegram_message(chat_id, message_id, text=result_msg)
             return {"ok": True}
-        elif data.startswith("forcepay_"):
-            loan_id = data.split("_")[1]
+        elif data.startswith("paynext_"):
+            parts = data.split("_")
+            loan_id, next_sched_id = parts[1], parts[2]
             from app.services.loan_service import LoanService
             service = LoanService(supabase_admin, user_id)
-            result_msg, success = await service.process_emi_payment_by_id(loan_id, force=True)
+            result_msg, success = await service.process_emi_payment_by_id(loan_id, force_schedule_id=next_sched_id)
             await edit_telegram_message(chat_id, message_id, text=result_msg)
             return {"ok": True}
         elif data == "cancelpay":
