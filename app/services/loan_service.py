@@ -30,7 +30,7 @@ class LoanService:
 
         loan_payload = {
             "user_id": self.user_id,
-            "lender_name": loan_data.lender_name.title(),
+            "lender": loan_data.lender_name.title(),
             "principal_amount": float(principal),
             "annual_interest_rate": float(rate),
             "tenure_months": tenure_months,
@@ -74,7 +74,7 @@ class LoanService:
 
     async def process_emi_payment(self, lender_name: str, payment_amount: Decimal = None,
                                   target_period: str = None) -> str:
-        loans_res = self.db.table("loans").select("*").eq("user_id", self.user_id).ilike("lender_name",
+        loans_res = self.db.table("loans").select("*").eq("user_id", self.user_id).ilike("lender",
                                                                                          lender_name.strip()).eq(
             "is_active", True).execute()
         if not loans_res.data:
@@ -87,7 +87,7 @@ class LoanService:
             "installment_number").execute()
         pending_schedules = sched_res.data or []
         if not pending_schedules:
-            return f"ℹ️ No pending EMIs found for loan from {loan['lender_name']}."
+            return f"ℹ️ No pending EMIs found for loan from {loan['lender']}."
 
         target_sched = pending_schedules[0]
         current_dt = datetime.now(TZ_IST)
@@ -123,7 +123,7 @@ class LoanService:
             "log_type": "DEBIT",
             "amount": float(amt_to_pay),
             "balance_after": float(new_balance),
-            "description": f"Loan EMI Payment to {loan['lender_name']} (Inst #{target_sched['installment_number']})"
+            "description": f"Loan EMI Payment to {loan['lender']} (Inst #{target_sched['installment_number']})"
         }).execute()
 
         self.db.table("transactions").insert({
@@ -133,7 +133,7 @@ class LoanService:
             "intent": "loan_payment",
             "category": "Loans",
             "subcategory": "EMI Payment",
-            "description": f"EMI Payment - {loan['lender_name']}",
+            "description": f"EMI Payment - {loan['lender']}",
             "date": datetime.now(TZ_IST).isoformat(),
             "source_account": default_acc['account_name'],
             "soft_deleted": False
@@ -146,8 +146,8 @@ class LoanService:
             "status", "PENDING").execute()
         if not remaining_check.count or remaining_check.count == 0:
             self.db.table("loans").update({"is_active": False}).eq("loan_id", loan_id).execute()
-            loan_status_msg = f"\n🎉 Congratulations! Loan from **{loan['lender_name']}** is now fully paid off and closed!"
+            loan_status_msg = f"\n🎉 Congratulations! Loan from **{loan['lender']}** is now fully paid off and closed!"
         else:
             loan_status_msg = ""
 
-        return f"✅ *EMI Payment Successful*\nPaid ₹{amt_to_pay:,.2f} to *{loan['lender_name']}* (Installment #{target_sched['installment_number']}).\nNew Balance in {default_acc['account_name']}: ₹{new_balance:,.2f}{loan_status_msg}"
+        return f"✅ *EMI Payment Successful*\nPaid ₹{amt_to_pay:,.2f} to *{loan['lender']}* (Installment #{target_sched['installment_number']}).\nNew Balance in {default_acc['account_name']}: ₹{new_balance:,.2f}{loan_status_msg}"

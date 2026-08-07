@@ -23,18 +23,17 @@ class LoanHandler:
 
             progress = (completed_emi / total_emi * 100) if total_emi > 0 else 0
 
-            # Industry Standard Color Coded Health Bars
             if progress < 50:
-                bar_color = "🟩"  # Healthy (0 - 49%)
+                bar_color = "🟩"
             elif progress < 85:
-                bar_color = "🟨"  # Middle Stage (50 - 84%)
+                bar_color = "🟨"
             else:
-                bar_color = "🟥"  # Near Completion (85 - 100%)
+                bar_color = "🟥"
 
             filled_blocks = int(progress / 10)
             progress_bar = f"{bar_color} {'█' * filled_blocks}{'░' * (10 - filled_blocks)}"
 
-            msg.append(f"🏦 *{loan['lender_name']}*")
+            msg.append(f"🏦 *{loan['lender']}*")
             msg.append(f"{progress_bar} *{int(progress)}% Paid* ({completed_emi}/{total_emi} EMIs)")
             msg.append(f"💰 Principal: ₹{float(loan['principal_amount']):,.2f} | Rate: {loan['annual_interest_rate']}%")
 
