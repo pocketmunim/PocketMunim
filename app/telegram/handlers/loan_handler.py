@@ -53,7 +53,6 @@ class LoanHandler:
 
             pending_tenure_months = len(pending_emis)
 
-            # Check if current month EMI is paid
             current_month_paid = False
             for sched in schedules:
                 if sched['due_date'].startswith(curr_year_month) and sched['status'] == 'PAID':
@@ -72,7 +71,6 @@ class LoanHandler:
                 next_emi = pending_emis[0]
                 msg.append(f"📅 **Next Due**: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
 
-            # Omit Pay EMI button if current month EMI is already paid
             keyboard = None
             if pending_emis and not current_month_paid:
                 keyboard = {
@@ -100,12 +98,26 @@ class LoanHandler:
                     msg, success = await loan_service.create_loan(parsed)
                     response_messages.append(msg)
                 elif parsed.action == "PAY_EMI":
-                    msg, success = await loan_service.process_emi_payment(
+                    msg, res_status = await loan_service.process_emi_payment(
                         lender_name=parsed.lender_name,
                         payment_amount=parsed.payment_amount,
                         target_period=parsed.target_period
                     )
-                    response_messages.append(msg)
+
+                    # Handle confirmation state triggered via text command
+                    if isinstance(res_status, dict) and res_status.get("status") == "NEXT_EMI_CONFIRM":
+                        next_sched_id = res_status["next_schedule_id"]
+                        loan_id = res_status["loan_id"]
+                        keyboard = {
+                            "inline_keyboard": [
+                                [{"text": "✅ Yes, Pay Next Month's EMI",
+                                  "callback_data": f"paynext_{loan_id}_{next_sched_id}"}],
+                                [{"text": "❌ Cancel", "callback_data": "cancelpay"}]
+                            ]
+                        }
+                        await send_telegram_reply(chat_id, msg, reply_markup=keyboard)
+                    else:
+                        response_messages.append(msg)
 
             if response_messages:
                 await send_telegram_reply(chat_id, "\n\n".join(response_messages))
