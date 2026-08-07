@@ -20,241 +20,81 @@ class LoanService:
 
     async def create_loan(self, loan_data) -> tuple[str, bool]:
         if not loan_data.principal or not loan_data.lender_name:
-            item_desc = loan_data.lender_name or "Unknown Loan"
-            return f"⚠️ *Skipped Loan Creation*: Could not determine principal or lender for '{item_desc}'. Please provide complete details.", False
+            return f"⚠️ *Skipped Loan Creation*: Could not determine details.", False
 
         principal = Decimal(str(loan_data.principal))
         rate = Decimal(str(loan_data.annual_interest_rate or 0.0))
-        tenure_years = loan_data.tenure_years or 1
-        tenure_months = tenure_years * 12
+        tenure_months = (loan_data.tenure_years or 1) * 12
+        emi = loan_data.emi_amount or self.calculate_emi(principal, rate, tenure_months)
 
-        existing_loan = self.db.table("loans").select("*").eq("user_id", self.user_id).ilike("lender",
-                                                                                             loan_data.lender_name.strip()).eq(
-            "principal_amount", float(principal)).eq("is_active", True).execute()
-        if existing_loan.data:
-            return f"⚠️ *Duplicate Loan Detected*\nAn active loan from *{loan_data.lender_name.title()}* with principal ₹{float(principal):,.2f} already exists.", False
+        # Duplicate Check
+        exist = self.db.table("loans").select("*").eq("user_id", self.user_id).ilike("lender",
+                                                                                     loan_data.lender_name.strip()).execute()
+        if exist.data:
+            return f"⚠️ *Duplicate Loan*: Loan from *{loan_data.lender_name}* already exists.", False
 
-        emi = loan_data.emi_amount
-        if not emi or emi <= 0:
-            emi = self.calculate_emi(principal, rate, tenure_months)
-
-        disbursement_str = loan_data.disbursement_date or datetime.now(TZ_IST).date().isoformat()
-
-        loan_payload = {
-            "user_id": self.user_id,
-            "lender": loan_data.lender_name.title(),
-            "principal_amount": float(principal),
-            "annual_interest_rate": float(rate),
-            "tenure_months": tenure_months,
-            "start_date": str(disbursement_str),
-            "is_active": True
-        }
-        res = self.db.table("loans").insert(loan_payload).execute()
-        if not res.data:
-            return f"⚠️ *Failed* to save loan for {loan_data.lender_name}.", False
+        # Register Loan
+        res = self.db.table("loans").insert({
+            "user_id": self.user_id, "lender": loan_data.lender_name.title(),
+            "principal_amount": float(principal), "annual_interest_rate": float(rate),
+            "tenure_months": tenure_months, "start_date": str(datetime.now(TZ_IST).date()), "is_active": True
+        }).execute()
 
         loan_id = res.data[0]['loan_id']
-
-        start_date_str = loan_data.first_emi_date or disbursement_str
-        start_date = datetime.strptime(str(start_date_str), "%Y-%m-%d").date()
-        balance = principal
-        monthly_rate = rate / Decimal('12') / Decimal('100')
-
+        # Create Schedules
         schedules = []
-        curr_date = start_date
+        curr_date = datetime.now(TZ_IST).date()
         for i in range(1, tenure_months + 1):
-            interest = (balance * monthly_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            principal_comp = (emi - interest).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            if principal_comp > balance:
-                principal_comp = balance
-                emi = principal_comp + interest
-            balance -= principal_comp
-
             schedules.append({
-                "loan_id": loan_id,
-                "installment_number": i,
-                "due_date": curr_date.isoformat(),
-                "emi_amount": float(emi),
-                "principal_component": float(principal_comp),
-                "interest_component": float(interest),
-                "remaining_balance": float(max(balance, Decimal('0'))),
-                "status": "PENDING"
+                "loan_id": loan_id, "installment_number": i, "due_date": curr_date.isoformat(),
+                "emi_amount": float(emi), "status": "PENDING"
             })
             curr_date += relativedelta(months=1)
-
         self.db.table("emi_schedules").insert(schedules).execute()
 
-        acc_res = self.db.table("accounts").select("*").eq("user_id", self.user_id).eq("is_default", True).execute()
-        default_acc_name = "Account"
-        if acc_res.data:
-            default_acc = acc_res.data[0]
-            default_acc_name = default_acc['account_name']
-            current_balance = Decimal(str(default_acc['balance']))
-            new_balance = current_balance + principal
-
-            self.db.table("accounts").update({"balance": float(new_balance)}).eq("id", default_acc['id']).execute()
-
-            self.db.table("account_logs").insert({
-                "account_id": default_acc['id'],
-                "user_id": self.user_id,
-                "log_type": "CREDIT",
-                "amount": float(principal),
-                "balance_after": float(new_balance),
-                "description": f"Loan Disbursement - {loan_data.lender_name.title()}"
-            }).execute()
-
+        # Credit Account
+        acc = self.db.table("accounts").select("*").eq("user_id", self.user_id).eq("is_default", True).execute()
+        if acc.data:
+            new_bal = Decimal(str(acc.data[0]['balance'])) + principal
+            self.db.table("accounts").update({"balance": float(new_bal)}).eq("id", acc.data[0]['id']).execute()
             self.db.table("transactions").insert({
-                "user_id": self.user_id,
-                "amount": float(principal),
-                "txn_type": "borrow",
-                "intent": "borrow",
-                "category": "Loans",
-                "subcategory": "Loan Disbursement",
-                "description": f"Loan from {loan_data.lender_name.title()}",
-                "date": datetime.now(TZ_IST).isoformat(),
-                "destination_account": default_acc_name,
-                "soft_deleted": False
+                "user_id": self.user_id, "amount": float(principal), "txn_type": "borrow",
+                "description": f"Loan Disbursement - {loan_data.lender_name}", "date": datetime.now(TZ_IST).isoformat()
             }).execute()
 
-        success_msg = (
-            f"✅ *Loan Registered Successfully*\n"
-            f"Lender: *{loan_data.lender_name.title()}*\n"
-            f"Principal: ₹{float(principal):,.2f} (Credited to {default_acc_name})\n"
-            f"Calculated EMI: ₹{float(emi):,.2f}\n"
-            f"Tenure: {tenure_years} Years ({tenure_months} months)"
-        )
-        return success_msg, True
+        return f"✅ *Loan Registered*: {loan_data.lender_name.title()} (+₹{float(principal):,.2f})", True
 
-    async def process_emi_payment(self, lender_name: str, payment_amount: Decimal = None, target_period: str = None) -> \
-    tuple[str, bool]:
-        if not lender_name or lender_name.lower() in ["friend", "unknown", "someone"]:
-            return f"⚠️ *Skipped EMI Payment*: Lender name is missing or ambiguous ('{lender_name}').", False
+    async def process_emi_payment_by_id(self, loan_id: str, force_schedule_id: str = None) -> tuple[str, any]:
+        loan = self.db.table("loans").select("*").eq("loan_id", loan_id).execute().data[0]
+        scheds = self.db.table("emi_schedules").select("*").eq("loan_id", loan_id).order(
+            "installment_number").execute().data
 
-        loans_res = self.db.table("loans").select("*").eq("user_id", self.user_id).ilike("lender",
-                                                                                         f"%{lender_name.strip()}%").eq(
-            "is_active", True).execute()
-        matching_loans = loans_res.data or []
-
-        if not matching_loans:
-            return f"❌ *Lender Not Found*: '{lender_name.title()}' has no active loans.", False
-
-        if len(matching_loans) > 1:
-            return f"⚠️ *Multiple Loans Found for {lender_name.title()}*. Please use the `/getloans` dashboard buttons.", False
-
-        loan = matching_loans[0]
-        return await self.process_emi_payment_by_id(loan['loan_id'], payment_amount, target_period)
-
-    async def process_emi_payment_by_id(self, loan_id: str, payment_amount: Decimal = None, target_period: str = None,
-                                        force_schedule_id: str = None) -> tuple[str, any]:
-        loan_res = self.db.table("loans").select("*").eq("loan_id", loan_id).eq("is_active", True).execute()
-        if not loan_res.data:
-            return "❌ *Loan Not Found*: This loan account is invalid or already closed.", False
-
-        loan = loan_res.data[0]
-
-        sched_res = self.db.table("emi_schedules").select("*").eq("loan_id", loan_id).order(
-            "installment_number").execute()
-        all_schedules = sched_res.data or []
-        pending_schedules = [s for s in all_schedules if s['status'] == 'PENDING']
-
-        current_dt = datetime.now(TZ_IST)
-        curr_year_month = current_dt.strftime("%Y-%m")
-
-        target_sched = None
+        target = None
         if force_schedule_id:
-            for sched in all_schedules:
-                if sched['schedule_id'] == force_schedule_id:
-                    target_sched = sched
-                    break
+            target = next((s for s in scheds if s['schedule_id'] == force_schedule_id), None)
         else:
-            if target_period and "last month" in target_period.lower():
-                last_month_dt = current_dt - relativedelta(months=1)
-                for sched in all_schedules:
-                    due_dt = datetime.strptime(sched['due_date'], "%Y-%m-%d")
-                    if due_dt.year == last_month_dt.year and due_dt.month == last_month_dt.month:
-                        target_sched = sched
-                        break
-            else:
-                for sched in all_schedules:
-                    if sched['due_date'].startswith(curr_year_month):
-                        target_sched = sched
-                        break
-                if not target_sched and pending_schedules:
-                    target_sched = pending_schedules[0]
+            target = next((s for s in scheds if s['status'] == 'PENDING'), None)
 
-        if not target_sched and pending_schedules:
-            target_sched = pending_schedules[0]
+        if not target:
+            return f"ℹ️ All EMIs paid for *{loan['lender']}*.", False
 
-        if not target_sched:
-            return f"ℹ️ No valid EMI schedule found to pay for {loan['lender']}.", False
+        if target['status'] == 'PAID' and not force_schedule_id:
+            next_sched = next((s for s in scheds if s['status'] == 'PENDING'), None)
+            if next_sched:
+                return (
+                    f"⚠️ *EMI Already Paid*\nEMI for {target['due_date']} is paid. Pay next (#{next_sched['installment_number']})?",
+                    {"status": "NEXT_EMI_CONFIRM", "next_schedule_id": next_sched['schedule_id'], "loan_id": loan_id})
+            return "ℹ️ No pending EMIs.", False
 
-        if target_sched['status'] == 'PAID' and not force_schedule_id:
-            if not pending_schedules:
-                return f"ℹ️ All EMIs for *{loan['lender']}* are already fully paid!", False
+        # Pay Logic
+        amt = Decimal(str(target['emi_amount']))
+        acc = self.db.table("accounts").select("*").eq("user_id", self.user_id).eq("is_default", True).execute().data[0]
 
-            next_sched = pending_schedules[0]
-            return (
-                f"⚠️ *Current EMI Already Paid*\n"
-                f"The EMI for *{target_sched['due_date']}* (Installment #{target_sched['installment_number']}) "
-                f"for *{loan['lender']}* is already marked as *PAID*.\n\n"
-                f"Would you like to pay the next pending EMI instead?\n"
-                f"📌 *Installment #{next_sched['installment_number']}*\n"
-                f"📅 Due Date: {next_sched['due_date']}\n"
-                f"💰 Amount: ₹{float(next_sched['emi_amount']):,.2f}",
-                {"status": "NEXT_EMI_CONFIRM", "next_schedule_id": next_sched['schedule_id'], "loan_id": loan_id}
-            )
+        self.db.table("accounts").update({"balance": float(Decimal(str(acc['balance'])) - amt)}).eq("id",
+                                                                                                    acc['id']).execute()
+        self.db.table("transactions").insert({"user_id": self.user_id, "amount": float(amt), "txn_type": "loan_payment",
+                                              "description": f"EMI to {loan['lender']}",
+                                              "date": datetime.now(TZ_IST).isoformat()}).execute()
+        self.db.table("emi_schedules").update({"status": "PAID"}).eq("schedule_id", target['schedule_id']).execute()
 
-        amt_to_pay = payment_amount if (payment_amount and payment_amount > 0) else Decimal(
-            str(target_sched['emi_amount']))
-
-        acc_res = self.db.table("accounts").select("*").eq("user_id", self.user_id).eq("is_default", True).execute()
-        if not acc_res.data:
-            return "⚠️ *Transaction Failed*: No default bank account found for payment deduction.", False
-
-        default_acc = acc_res.data[0]
-        current_balance = Decimal(str(default_acc['balance']))
-
-        if current_balance < amt_to_pay:
-            return f"🚫 *Transaction Failed*\nInsufficient balance in *{default_acc['account_name']}* to complete payment of ₹{amt_to_pay:,.2f}.", False
-
-        new_balance = current_balance - amt_to_pay
-
-        self.db.table("accounts").update({"balance": float(new_balance)}).eq("id", default_acc['id']).execute()
-
-        self.db.table("account_logs").insert({
-            "account_id": default_acc['id'],
-            "user_id": self.user_id,
-            "log_type": "DEBIT",
-            "amount": float(amt_to_pay),
-            "balance_after": float(new_balance),
-            "description": f"Loan EMI Payment to {loan['lender']} (Installment #{target_sched['installment_number']})"
-        }).execute()
-
-        self.db.table("transactions").insert({
-            "user_id": self.user_id,
-            "amount": float(amt_to_pay),
-            "txn_type": "loan_payment",
-            "intent": "loan_payment",
-            "category": "Loans",
-            "subcategory": "EMI Payment",
-            "description": f"EMI Payment - {loan['lender']}",
-            "date": datetime.now(TZ_IST).isoformat(),
-            "source_account": default_acc['account_name'],
-            "soft_deleted": False
-        }).execute()
-
-        self.db.table("emi_schedules").update({"status": "PAID"}).eq("schedule_id",
-                                                                     target_sched['schedule_id']).execute()
-
-        remaining_check = self.db.table("emi_schedules").select("schedule_id", count="exact").eq("loan_id", loan_id).eq(
-            "status", "PENDING").execute()
-
-        success_header = "✅ *EMI Payment Successful*"
-        payment_line = f"Paid ₹{amt_to_pay:,.2f} to *{loan['lender']}* (Installment #{target_sched['installment_number']})."
-        balance_line = f"New Balance in {default_acc['account_name']}: ₹{new_balance:,.2f}"
-
-        if not remaining_check.count or remaining_check.count == 0:
-            self.db.table("loans").update({"is_active": False}).eq("loan_id", loan_id).execute()
-            return f"{success_header}\n{payment_line}\n{balance_line}\n🎉 *Congratulations!* Loan from *{loan['lender']}* is now fully paid off and closed!", True
-
-        return f"{success_header}\n{payment_line}\n{balance_line}", True
+        return f"✅ *Payment Successful*: ₹{float(amt):,.2f} to *{loan['lender']}*", True
