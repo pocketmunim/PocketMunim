@@ -41,8 +41,6 @@ class BulkTransactionService:
             if intent == "expense" and amount > Decimal('0.00') and not getattr(tx, 'needs_clarification', False):
                 tx_future = getattr(tx, 'future', None)
                 if not (tx_future and getattr(tx_future, 'is_future', False)):
-
-                    # SAFE FETCH: Fallback to tx.item if raw_description is missing
                     raw_desc = getattr(tx, 'raw_description', None) or getattr(tx, 'item', "Item")
                     raw_desc = str(raw_desc).title()
 
@@ -108,7 +106,9 @@ class BulkTransactionService:
                     category = "Income" if intent == "income" else "Transfer"
                 if not subcategory:
                     subcategory = "General"
-                norm_item = None
+
+                # FIX: Populate normalized_item for clean ledger analytics without auto-learning it
+                norm_item = subcategory if subcategory != "General" else category
 
             source_acc = default_account['account_name'] if intent in ["expense", "transfer_other",
                                                                        "transfer_own"] else None

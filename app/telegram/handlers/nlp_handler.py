@@ -145,7 +145,6 @@ class NLPHandler:
                             default_acc['id'], result["unique"], total_deduction, total_addition
                         )
                     except Exception as e:
-                        # ROBUST ERROR PARSING: Captures dict string and uppercase variations
                         error_msg = str(e).lower()
                         if "insufficient" in error_msg or "p0001" in error_msg:
                             await send_telegram_reply(chat_id,
@@ -316,9 +315,11 @@ class NLPHandler:
                             category = "Income" if intent == "income" else "Transfer"
                         if not subcategory:
                             subcategory = "General"
-                        norm_item = None
 
-                        # SAVE RAW & NORMALIZED ENTITY TO LEDGER
+                        # FIX: Populate normalized_item for clean ledger analytics without auto-learning it
+                        norm_item = subcategory if subcategory != "General" else category
+
+                    # SAVE RAW & NORMALIZED ENTITY TO LEDGER
                     db_payloads = [
                         {"user_id": user_id, "amount": float(amount), "txn_type": intent, "description": description,
                          "normalized_item": norm_item,
