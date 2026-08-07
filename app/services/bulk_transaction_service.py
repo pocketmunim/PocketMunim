@@ -2,7 +2,6 @@ from decimal import Decimal
 from datetime import datetime
 from app.utils.constants import TZ_IST
 
-
 class BulkTransactionService:
     def __init__(self, db_client, user_id: str, cache_manager, category_pull_service):
         self.db = db_client
@@ -17,6 +16,7 @@ class BulkTransactionService:
         pending_duplicates = []
         breakdown = []
         ignored = []
+
         totals = {
             "expenses": Decimal('0.00'),
             "income": Decimal('0.00'),
@@ -35,40 +35,38 @@ class BulkTransactionService:
             if amount <= Decimal('0.00'):
                 ignored.append(f"  {description} (Zero or missing amount)")
                 continue
+
             if tx.future and tx.future.is_future:
                 ignored.append(f"  {description} (Future item skipped)")
                 continue
+
             if not tx.intent or tx.needs_clarification:
                 ignored.append(f"  {description} (Needs Clarification)")
                 continue
 
             intent = tx.intent.lower()
 
-            # 🚀 CATEGORY RESOLUTION PRIORITY
-            # 1. Trust the AI's direct extraction first
             category = tx.category
             subcategory = tx.subcategory
 
-            # 2. If AI missed it, check user cache
             if not category or not subcategory:
                 cached = self.cache_manager.search_item(description)
                 if cached and cached.get("category"):
                     category = category or cached["category"]
                     subcategory = subcategory or cached.get("subcategory")
 
-            # 3. Clean fallback if completely missing
             if not category:
                 category = "Groceries"
             if not subcategory:
                 subcategory = "General Purchases"
 
-            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other",
-                                                                       "transfer_own"] else None
+            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own"] else None
             dest_acc = default_account['account_name'] if intent in ["income", "transfer_own"] else None
 
+            # CAST AMOUNT TO STRING TO PRESERVE EXACT PRECISION OVER NETWORK
             payload = {
                 "user_id": self.user_id,
-                "amount": float(amount),
+                "amount": str(amount),
                 "txn_type": intent,
                 "description": description,
                 "intent": intent,
@@ -81,17 +79,17 @@ class BulkTransactionService:
             }
 
             is_salary_or_income = intent == "income" or (category and category.lower() == "income")
-            is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(float(amount),
-                                                                                               description, intent)
+            is_duplicate = False if is_salary_or_income else self.dao.check_transaction_exists(str(amount), description, intent)
 
             if is_duplicate:
                 pending_duplicates.append({
-                    "payload": payload, "selected": False, "desc": description, "amount": float(amount),
+                    "payload": payload, "selected": False, "desc": description, "amount": str(amount),
                     "txn_type": intent
                 })
             else:
                 unique_payloads.append(payload)
                 cat_disp = f"{category} -> {subcategory}" if subcategory else category
+
                 if intent in ["expense", "transfer_other"]:
                     totals["expenses"] += amount
                     counts["expenses"] += 1
@@ -101,7 +99,8 @@ class BulkTransactionService:
                 elif intent == "transfer_own":
                     totals["transfers"] += amount
                     counts["transfers"] += 1
-                breakdown.append(f"  {description}: ₹{float(amount):,.2f} ({cat_disp})")
+
+                breakdown.append(f"  {description}:  {float(amount):,.2f} ({cat_disp})")
 
         return {
             "unique": unique_payloads,
