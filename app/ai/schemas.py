@@ -37,6 +37,10 @@ class LoanSchema(BaseModel):
     emi: Optional[Decimal] = None
 
 
+class LoanRepaymentSchema(BaseModel):
+    direction: Optional[str] = None
+
+
 class SplitSchema(BaseModel):
     enabled: Optional[bool] = False
     participants: Optional[int] = None
@@ -100,6 +104,7 @@ class TransactionItem(BaseModel):
     date: Optional[DateSchema] = None
     recurrence: Optional[RecurrenceSchema] = None
     loan: Optional[LoanSchema] = None
+    loan_repayment: Optional[LoanRepaymentSchema] = None
     split: Optional[SplitSchema] = None
     investment: Optional[InvestmentSchema] = None
     tax: Optional[TaxSchema] = None

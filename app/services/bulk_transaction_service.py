@@ -5,12 +5,11 @@ from app.utils.constants import TZ_IST
 
 
 def _safely_serialize_complex(val):
-    """Safely converts Pydantic objects to dicts, handling Decimals cleanly for Supabase."""
     if not val:
         return None
-    if hasattr(val, 'model_dump_json'):  # Pydantic V2
+    if hasattr(val, 'model_dump_json'):
         return json.loads(val.model_dump_json(exclude_none=True))
-    elif hasattr(val, 'json'):  # Pydantic V1
+    elif hasattr(val, 'json'):
         return json.loads(val.json(exclude_none=True))
     return None
 
@@ -42,9 +41,7 @@ class BulkTransactionService:
             "transfers": 0
         }
 
-        # =========================================================
         # PHASE 1: PRE-FLIGHT AUTO-LEARNING
-        # =========================================================
         unknown_item_names = set()
         for tx in transactions_list:
             amount = getattr(tx, 'amount', None) or Decimal('0.00')
@@ -70,9 +67,7 @@ class BulkTransactionService:
             except Exception as e:
                 print(f"Auto-learning pre-flight failed: {e}")
 
-        # =========================================================
         # PHASE 2: NORMAL TRANSACTION PROCESSING
-        # =========================================================
         for tx in transactions_list:
             raw_desc = getattr(tx, 'raw_description', None) or getattr(tx, 'item', "Item")
             description = str(raw_desc).title()
@@ -120,14 +115,25 @@ class BulkTransactionService:
                     subcategory = "General"
                 norm_item = subcategory if subcategory != "General" else category
 
-            source_acc = default_account['account_name'] if intent in ["expense", "transfer_other", "transfer_own",
-                                                                       "loan_payment", "lend"] else None
-            dest_acc = default_account['account_name'] if intent in ["income", "transfer_own", "borrow"] else None
+            # SMART DEBIT/CREDIT ROUTING INCLUDING LOAN REPAYMENT DIRECTION
+            is_debit = intent in ["expense", "transfer_other", "transfer_own", "loan_payment", "lend"]
+            is_credit = intent in ["income", "transfer_own", "borrow"]
+
+            if intent == "loan_repayment":
+                loan_rep = getattr(tx, 'loan_repayment', None)
+                direction = getattr(loan_rep, 'direction', None) if loan_rep else None
+                if direction == "paid":
+                    is_debit = True
+                else:
+                    is_credit = True
+
+            source_acc = default_account['account_name'] if is_debit else None
+            dest_acc = default_account['account_name'] if is_credit else None
 
             # EXTRACT RICH METADATA
             extended_data = {}
-            for complex_key in ['loan', 'split', 'investment', 'tax', 'subscription', 'future', 'edit_target',
-                                'transaction_target', 'recurrence']:
+            for complex_key in ['loan', 'loan_repayment', 'split', 'investment', 'tax', 'subscription', 'future',
+                                'edit_target', 'transaction_target', 'recurrence']:
                 val = getattr(tx, complex_key, None)
                 serialized = _safely_serialize_complex(val)
                 if serialized:
@@ -148,7 +154,6 @@ class BulkTransactionService:
                 "source_account": source_acc,
                 "destination_account": dest_acc,
                 "soft_deleted": False,
-                # NEW RICH ANALYTICS COLUMNS
                 "currency": getattr(tx, 'currency', 'INR') or 'INR',
                 "quantity": str(quantity_val) if quantity_val is not None else None,
                 "unit": getattr(tx, 'unit', None),
@@ -170,12 +175,14 @@ class BulkTransactionService:
             else:
                 unique_payloads.append(payload)
                 cat_disp = f"{category} -> {subcategory}" if subcategory else category
-                if intent in ["expense", "transfer_other", "loan_payment", "lend"]:
+
+                if is_debit and not is_credit:
                     totals["expenses"] += amount
-                elif intent in ["income", "borrow"]:
+                elif is_credit and not is_debit:
                     totals["income"] += amount
-                elif intent == "transfer_own":
-                    totals["transfers"] += amount
+                elif is_debit and is_credit:
+                    totals["transfers"] += amount  # Transfer Own
+
                 breakdown.append(f"  {description}:  {float(amount):,.2f} ({cat_disp})")
 
         if new_taxonomy_items:
