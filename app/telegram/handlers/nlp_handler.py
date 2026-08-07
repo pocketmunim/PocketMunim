@@ -284,7 +284,6 @@ def _add_months(date_obj: datetime, months_to_add: int) -> datetime:
         try:
             return date_obj.replace(year=y, month=m, day=d)
         except ValueError:
-            # E.g., Feb 29th goes to Feb 28th if not a leap year
             d -= 1
 
 
@@ -298,7 +297,6 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
     curr_iter = start_dt
     freq = frequency.lower() if frequency else ""
 
-    # SAFETY GUARDRAIL: Max 500 iterations to prevent infinite loops / db explosion
     max_iterations = 500
 
     while curr_iter <= current_dt and len(dates) < max_iterations:
@@ -319,7 +317,6 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
         elif freq in ['yearly', 'annually']:
             curr_iter = _add_months(curr_iter, 12)
         else:
-            # Fallback for unrecognizable frequencies
             break
 
     return dates
@@ -365,7 +362,7 @@ class NLPHandler:
                         db_client=supabase_admin,
                         is_json=True
                     ),
-                    timeout=60
+                    timeout=60.0  # UPDATED TO 60 SECONDS
                 )
             except asyncio.TimeoutError:
                 await send_telegram_reply(chat_id,
