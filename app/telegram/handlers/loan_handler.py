@@ -14,7 +14,6 @@ class LoanHandler:
             await send_telegram_reply(chat_id, "ℹ️ You have no active loans.")
             return
 
-        msg = ["🏦 **Active Loans Dashboard**\n"]
         for loan in loans:
             schedules = sorted(loan.get('emi_schedules', []), key=lambda x: x['installment_number'])
             pending_emis = [e for e in schedules if e['status'] == 'PENDING']
@@ -33,17 +32,38 @@ class LoanHandler:
             filled_blocks = int(progress / 10)
             progress_bar = f"{bar_color} {'█' * filled_blocks}{'░' * (10 - filled_blocks)}"
 
-            msg.append(f"🏦 **{loan['lender']}**")
-            msg.append(f"{progress_bar} **{int(progress)}% Paid** ({completed_emi}/{total_emi} EMIs)")
-            msg.append(
-                f"💰 Principal: ₹{float(loan['principal_amount']):,.2f} | Rate: {float(loan['annual_interest_rate'])}%")
+            # Calculate remaining principal from last paid or initial principal
+            paid_emis = [e for e in schedules if e['status'] == 'PAID']
+            if paid_emis:
+                last_paid = max(paid_emis, key=lambda x: x['installment_number'])
+                remaining_principal = float(last_paid['remaining_balance'])
+            else:
+                remaining_principal = float(loan['principal_amount'])
+
+            pending_tenure_months = len(pending_emis)
+
+            msg = [
+                f"🏦 **{loan['lender']}**",
+                f"{progress_bar} **{int(progress)}% Paid** ({completed_emi}/{total_emi} EMIs)",
+                f"⏳ **Remaining Tenure:** {pending_tenure_months} Months",
+                f"📉 **Remaining Principal:** ₹{remaining_principal:,.2f}",
+                f"💰 Original: ₹{float(loan['principal_amount']):,.2f} | Rate: {float(loan['annual_interest_rate'])}%"
+            ]
 
             if pending_emis:
                 next_emi = pending_emis[0]
                 msg.append(f"📅 **Next Due**: {next_emi['due_date']} — ₹{float(next_emi['emi_amount']):,.2f}")
-            msg.append("────────────────────────")
 
-        await send_telegram_reply(chat_id, "\n".join(msg))
+            # Interactive Pay EMI button linked directly to this loan ID
+            keyboard = {
+                "inline_keyboard": [
+                    [{
+                         "text": f"💳 Pay EMI (₹{float(pending_emis[0]['emi_amount']):,.2f})" if pending_emis else "💳 Pay EMI",
+                         "callback_data": f"payemi_{loan['loan_id']}"}]
+                ]
+            } if pending_emis else None
+
+            await send_telegram_reply(chat_id, "\n".join(msg), reply_markup=keyboard)
 
     @staticmethod
     async def handle_loan_text(supabase_admin, chat_id, user_id, text):
