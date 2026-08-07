@@ -275,7 +275,6 @@ END OF POCKETMUNIM NLP ENGINE CONSTITUTION"""
 
 
 def _add_months(date_obj: datetime, months_to_add: int) -> datetime:
-    """Safely adds months to a datetime object, handling leap years and end-of-month rollover."""
     m = date_obj.month - 1 + months_to_add
     y = date_obj.year + m // 12
     m = m % 12 + 1
@@ -296,12 +295,10 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
     dates = []
     curr_iter = start_dt
     freq = frequency.lower() if frequency else ""
-
     max_iterations = 500
 
     while curr_iter <= current_dt and len(dates) < max_iterations:
         dates.append(curr_iter)
-
         if freq == 'daily':
             curr_iter += timedelta(days=1)
         elif freq == 'weekly':
@@ -318,7 +315,6 @@ def generate_recurrence_dates(start_date_str: str, frequency: str, current_dt: d
             curr_iter = _add_months(curr_iter, 12)
         else:
             break
-
     return dates
 
 
@@ -354,40 +350,69 @@ class NLPHandler:
                 f"{current_dt.strftime('%Y-%m-%d')} ({current_dt.strftime('%A')})"
             )
 
-            try:
-                raw_response_text, finish_reason = await asyncio.wait_for(
-                    execute_resilient_ai(
-                        system_prompt=dynamic_system_prompt,
-                        user_prompt=text,
-                        db_client=supabase_admin,
-                        is_json=True
-                    ),
-                    timeout=60.0  # UPDATED TO 60 SECONDS
-                )
-            except asyncio.TimeoutError:
-                await send_telegram_reply(chat_id,
-                                          "⚠️ *Timeout*\nYour request took too long to process. Please try breaking it into smaller chunks.")
-                return
+            # =========================================================
+            # MAP-REDUCE: MASSIVE LIST CHUNKING ENGINE (Chunk Size: 20)
+            # =========================================================
+            # Split text into non-empty lines
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            CHUNK_SIZE = 20
 
-            try:
-                raw_json = json.loads(raw_response_text)
-                validated_data = AITransactionExtraction(**raw_json)
-                transactions_list = validated_data.transactions or []
-                metadata = validated_data.metadata
-            except Exception as e:
-                await send_telegram_reply(chat_id, f"⚠️ *AI Parsing Error*\n`{str(e)}`")
-                return
+            if len(lines) > CHUNK_SIZE:
+                chunks = ["\n".join(lines[i:i + CHUNK_SIZE]) for i in range(0, len(lines), CHUNK_SIZE)]
+            else:
+                chunks = [text]
 
-            acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
-            user_accounts = acc_res.data or []
+            transactions_list = []
+            metadata = None
+            hit_length_limit = False
+            failed_chunks = 0
 
-            if not user_accounts and transactions_list:
-                await send_telegram_reply(chat_id,
-                                          "⚠️ *No Bank Accounts Configured*\nUse `/addaccount [BankName] [Balance]` to start.")
-                return
+            # Concurrency limit to prevent Groq Rate Limits
+            semaphore = asyncio.Semaphore(5)
 
+            async def fetch_chunk(chunk_str):
+                async with semaphore:
+                    try:
+                        raw_response_text, finish_reason = await asyncio.wait_for(
+                            execute_resilient_ai(
+                                system_prompt=dynamic_system_prompt,
+                                user_prompt=chunk_str,
+                                db_client=supabase_admin,
+                                is_json=True
+                            ),
+                            timeout=45.0  # Generous per-chunk timeout buffer
+                        )
+                        raw_json = json.loads(raw_response_text)
+                        return AITransactionExtraction(**raw_json), finish_reason
+                    except Exception as e:
+                        return e
+
+            # Fire all chunks in parallel
+            tasks = [fetch_chunk(chunk) for chunk in chunks]
+            results = await asyncio.gather(*tasks)
+
+            # Merge results
+            for res in results:
+                if isinstance(res, Exception):
+                    failed_chunks += 1
+                    print(f"Chunk failure: {res}")
+                    continue
+
+                validated_data, finish_reason = res
+                if finish_reason == "length":
+                    hit_length_limit = True
+
+                if validated_data.transactions:
+                    transactions_list.extend(validated_data.transactions)
+                if validated_data.metadata and not metadata:
+                    metadata = validated_data.metadata
+
+            # Post-Merge Validation
             if not transactions_list:
-                if metadata and getattr(metadata, 'operation_type', '') in ['delete', 'edit', 'reverse']:
+                if failed_chunks > 0:
+                    await send_telegram_reply(chat_id,
+                                              "⚠️ *Processing Failed*\nThe AI timed out or failed to parse your list. Please try sending fewer items.")
+                elif metadata and getattr(metadata, 'operation_type', '') in ['delete', 'edit', 'reverse']:
                     await send_telegram_reply(chat_id,
                                               "ℹ️ *Modification Request*\nTransaction editing and deletion via chat is currently under development.")
                 else:
@@ -400,9 +425,17 @@ class NLPHandler:
                                           "ℹ️ *Modification Request*\nTransaction editing and deletion via chat is currently under development.")
                 return
 
+            acc_res = supabase_admin.table('accounts').select('*').eq('user_id', user_id).execute()
+            user_accounts = acc_res.data or []
+
+            if not user_accounts:
+                await send_telegram_reply(chat_id,
+                                          "⚠️ *No Bank Accounts Configured*\nUse `/addaccount [BankName] [Balance]` to start.")
+                return
+
             cache_manager = CategoryCacheManager(supabase, user_id)
 
-            # ================= BULK TRANSACTION =================
+            # ================= BULK TRANSACTION PIPELINE =================
             if len(transactions_list) > 1:
                 default_acc = AccountHandler.get_account_from_list(user_accounts)
                 bulk_service = BulkTransactionService(supabase_admin, user_id, cache_manager, category_pull_service)
@@ -446,8 +479,10 @@ class NLPHandler:
                         f"📝 *Receipt Breakdown:*\n{bd_text}"
                     )
 
-                    if finish_reason == "length":
-                        receipt += "\n\n⚠️ *WARNING: LIMIT EXCEEDED*\nYour list was extremely long. The AI hit its maximum output limit."
+                    if hit_length_limit:
+                        receipt += "\n\n⚠️ *WARNING: CHUNK TRUNCATION*\nA segment of your list was too long and hit the token limit."
+                    if failed_chunks > 0:
+                        receipt += f"\n\n⚠️ *WARNING: TIMEOUTS*\n{failed_chunks} block(s) of your list failed to process due to AI rate limits."
                     if result.get("ignored"):
                         receipt += f"\n\nℹ️ *Unprocessed Items:*\n" + "\n".join(result["ignored"])
 
@@ -462,9 +497,9 @@ class NLPHandler:
                                               reply_markup=keyboard)
                 return
 
-            # ================= SINGLE TRANSACTION =================
+            # ================= SINGLE TRANSACTION PIPELINE =================
             response_sections, committed_items = [], []
-            if finish_reason == "length":
+            if hit_length_limit:
                 response_sections.append(
                     "⚠️ *WARNING: The AI hit its maximum capacity and may not have processed your entire message.*")
 
@@ -517,7 +552,6 @@ class NLPHandler:
 
                     intent = getattr(tx, 'intent', "").lower()
 
-                    # SMART DEBIT/CREDIT ROUTING INCLUDING LOAN REPAYMENT DIRECTION
                     is_debit = intent in ["expense", "transfer_other", "transfer_own", "loan_payment", "lend"]
                     is_credit = intent in ["income", "transfer_own", "borrow"]
 
@@ -601,7 +635,6 @@ class NLPHandler:
                             subcategory = "General"
                         norm_item = subcategory if subcategory != "General" else category
 
-                    # EXTRACT RICH METADATA
                     extended_data = {}
                     for complex_key in ['loan', 'loan_repayment', 'split', 'investment', 'tax', 'subscription',
                                         'future', 'edit_target', 'transaction_target', 'recurrence']:
@@ -612,7 +645,6 @@ class NLPHandler:
 
                     quantity_val = getattr(tx, 'quantity', None)
 
-                    # SAVE RAW & NORMALIZED ENTITY TO LEDGER
                     db_payloads = [
                         {
                             "user_id": user_id,
@@ -642,7 +674,6 @@ class NLPHandler:
                         elif len(db_payloads) > 1:
                             supabase.table("transactions").insert(db_payloads).execute()
 
-                        # If recurring, modify the response message to show total impact!
                         if is_recurring_past:
                             committed_items.append(
                                 f"✅ *Recurring Saved*\n  {description}: {float(amount):,.2f} x {len(tx_dates)} = *{float(tot_amt):,.2f}*\n  ({category} -> {subcategory})")
