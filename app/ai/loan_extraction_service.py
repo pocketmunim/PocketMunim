@@ -10,8 +10,11 @@ class LoanExtractionService:
 
     async def parse_loan_text(self, text: str) -> List[LoanNLPData]:
         system_prompt = """You are the PocketMunim Loan NLP Engine.
-        The user may provide one or multiple loan creation or EMI payment instructions in the text.
-        Analyze the text and extract all individual actions into an array.
+        Analyze the user text and extract all loan creations and EMI payments into an array.
+
+        VALIDATION GUIDELINES:
+        - For loan creations, extract explicit lender names (e.g., "HDFC", "SBI", "ICICI", "Bajaj Finserv", "Sushma"). If the lender is generic or missing (e.g., "friend", "car loan" without a bank), set `lender_name` to null.
+        - For EMI payments, extract the specific lender name. If the counterparty is generic (e.g., "friend"), set `lender_name` to null so it can be flagged and eliminated with a warning.
 
         Return ONLY valid JSON matching this schema:
         {
@@ -26,11 +29,11 @@ class LoanExtractionService:
               "first_emi_date": "YYYY-MM-DD or null",
               "emi_amount": number or null,
               "payment_amount": number or null,
-              "target_period": "string or null (e.g. last month, current month)"
+              "target_period": "string or null"
             }
           ]
         }
-        Current date is 2026. Resolve relative dates accurately. If dates are missing, leave them null.
+        Current date is 2026. Resolve relative dates accurately.
         """
         raw_json, _ = await execute_resilient_ai(
             system_prompt=system_prompt,
@@ -40,7 +43,6 @@ class LoanExtractionService:
         )
         data = json.loads(raw_json)
 
-        # Robust handling for list vs dict response formats
         if isinstance(data, list):
             return [LoanNLPData(**item) for item in data]
         elif isinstance(data, dict) and "actions" in data:
