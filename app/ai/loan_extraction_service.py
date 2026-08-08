@@ -12,6 +12,11 @@ class LoanExtractionService:
         system_prompt = """You are the PocketMunim Loan NLP Engine.
         Analyze the user text and extract all loan creations and EMI payments into an array.
 
+        CRITICAL NUMBER PARSING RULES (INDIAN SYSTEM):
+        - "l", "L", "lakh", "lakhs" MUST be multiplied by 100,000 (e.g., "5l" = 500000, "1.5L" = 150000).
+        - "k", "K" MUST be multiplied by 1,000 (e.g., "50k" = 50000).
+        - "cr", "crore" MUST be multiplied by 10,000,000.
+
         VALIDATION GUIDELINES:
         - For loan creations, extract explicit lender names (e.g., "HDFC", "SBI", "ICICI", "Bajaj Finserv", "Sushma"). If the lender is generic or missing (e.g., "friend", "car loan" without a bank), set `lender_name` to null.
         - For EMI payments, extract the specific lender name. If the counterparty is generic (e.g., "friend"), set `lender_name` to null so it can be flagged and eliminated with a warning.
