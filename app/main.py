@@ -98,6 +98,8 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await UserHandler.register(supabase_admin, chat_id, user_id, text, user_exists)
     elif text.startswith("/setsalary"):
         await SalaryHandler.set_salary(supabase_admin, chat_id, user_id, text)
+    elif text.startswith("/settle"):
+        await SalaryHandler.settle_salary(supabase_admin, chat_id, user_id, text)
     elif deduct_all_match := re.match(deduct_all_regex, text, re.IGNORECASE):
         await SalaryHandler.deduct_all(supabase_admin, chat_id, user_id, deduct_all_match)
     elif text.startswith("/report"):
@@ -115,7 +117,6 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
     elif is_loan_intent:
         leftover_text = await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
         if leftover_text and leftover_text.strip():
-            # Pass the leftovers directly to standard NLP safely
             await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, leftover_text,
                                           category_pull_service)
 
