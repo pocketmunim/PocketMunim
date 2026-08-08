@@ -1,5 +1,6 @@
 import os
 import re
+import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from app.telegram.handlers.report_handler import ReportHandler
 from app.telegram.handlers.callback_handler import CallbackHandler
 from app.telegram.handlers.nlp_handler import NLPHandler
 from app.telegram.handlers.loan_handler import LoanHandler
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -38,6 +40,34 @@ app = FastAPI(lifespan=lifespan)
 @app.head("/")
 def health_check():
     return {"status": "PocketMunim Enterprise API is live (Vercel-Safe Synchronous Mode)", "status_code": 200}
+
+
+@app.get("/setup-menu")
+async def setup_telegram_menu():
+    """
+    Hit this endpoint once (e.g., https://your-vercel-app.vercel.app/setup-menu)
+    to permanently register the bot commands in the Telegram UI Menu.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN is missing"}
+
+    url = f"https://api.telegram.org/bot{token}/setMyCommands"
+
+    # These match the exact commands you have defined in execute_telegram_command
+    commands = [
+        {"command": "getloans", "description": "🏦 View active loans & pay EMIs"},
+        {"command": "report", "description": "📊 View financial dashboard"},
+        {"command": "monthly", "description": "📅 Get monthly summary"},
+        {"command": "showaccount", "description": "💳 Show all bank accounts"},
+        {"command": "addaccount", "description": "➕ Add a new bank account"},
+        {"command": "setsalary", "description": "💸 Set monthly salary"},
+        {"command": "start", "description": "🚀 Restart the bot"}
+    ]
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json={"commands": commands})
+        return response.json()
 
 
 @app.get("/report/view/{token}", response_class=HTMLResponse)
@@ -71,12 +101,16 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await AccountHandler.set_default(supabase_admin, chat_id, user_id, text)
     elif text.startswith("/showaccount"):
         await AccountHandler.show_accounts(supabase_admin, chat_id, user_id)
-        # Inside execute_telegram_command()
     elif text.startswith("/getloans"):
         await LoanHandler.get_loans(supabase_admin, chat_id, user_id, text)
     elif any(kw in text.lower() for kw in ["taken", "borrowed", "emi", "lender", "gave me", "loan"]) or (
-                    "@" in text and ("%" in text )):        # Intercept loan statements or EMI payments safely
-        await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
+            "@" in text and ("%" in text )):
+        # 1. Process all loans and capture any mixed standard transactions
+        leftover_text = await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
+        # 2. If the user included non-loan items (groceries, bills), pass them to standard NLP
+        if leftover_text and leftover_text.strip():
+            from app.telegram.handlers.nlp_handler import NLPHandler
+            await NLPHandler.handle_text_message(supabase_admin, chat_id, user_id, leftover_text)
     elif text.startswith("/start"):
         await send_telegram_reply(chat_id,
                                   "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
