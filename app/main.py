@@ -109,8 +109,7 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         leftover_text = await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
         # 2. If the user included non-loan items (groceries, bills), pass them to standard NLP
         if leftover_text and leftover_text.strip():
-            from app.telegram.handlers.nlp_handler import NLPHandler
-            await NLPHandler.handle_text_message(supabase_admin, chat_id, user_id, leftover_text)
+            await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, leftover_text, category_pull_service)
     elif text.startswith("/start"):
         await send_telegram_reply(chat_id,
                                   "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
