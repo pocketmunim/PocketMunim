@@ -99,7 +99,7 @@ class SalaryHandler:
             supabase_admin.table('account_logs').insert({
                 "account_id": default_acc['id'],
                 "user_id": user_id,
-                "log_type": "debit",
+                "log_type": "DEBIT",
                 "amount": float(amount),
                 "balance_after": float(new_balance),
                 "description": desc,
