@@ -53,6 +53,7 @@ class CallbackHandler:
                     message_id,
                     reply_markup=CallbackHandler.generate_duplicate_keyboard(batch_id, items)
                 )
+
         elif data.startswith("bconf_"):
             batch_id = data.split("_")[1]
             batch = batch_dao.get_batch(batch_id)
@@ -86,10 +87,12 @@ class CallbackHandler:
                 batch_dao.delete_batch(batch_id)
             else:
                 await edit_telegram_message(chat_id, message_id, text="⚠️ Batch session expired or already processed.")
+
         elif data.startswith("bcanc_"):
             batch_id = data.split("_")[1]
             batch_dao.delete_batch(batch_id)
             await edit_telegram_message(chat_id, message_id, text="ℹ️ All duplicate transactions discarded.")
+
         elif data.startswith("payemi_"):
             loan_id = data.split("_")[1]
             from app.services.loan_service import LoanService
@@ -109,6 +112,7 @@ class CallbackHandler:
             else:
                 await edit_telegram_message(chat_id, message_id, text=result_msg)
             return {"ok": True}
+
         elif data.startswith("paynext_"):
             parts = data.split("_")
             loan_id, next_sched_id = parts[1], parts[2]
@@ -117,8 +121,40 @@ class CallbackHandler:
             result_msg, success = await service.process_emi_payment_by_id(loan_id, force_schedule_id=next_sched_id)
             await edit_telegram_message(chat_id, message_id, text=result_msg)
             return {"ok": True}
+
         elif data == "cancelpay":
             await edit_telegram_message(chat_id, message_id, text="ℹ️ EMI payment cancelled.")
             return {"ok": True}
+
+        # ==========================================
+        # --- PREMIUM WELCOME MENU CALLBACKS ---
+        # ==========================================
+        elif data == "menu_report":
+            from app.telegram.handlers.report_handler import ReportHandler
+            base_url = "https://pocket-munim.vercel.app"
+            await ReportHandler.generate_report_link(base_url, chat_id, user_id, supabase_admin)
+
+        elif data == "menu_loans":
+            from app.telegram.handlers.loan_handler import LoanHandler
+            await LoanHandler.get_loans(supabase_admin, chat_id, user_id, "")
+
+        elif data == "menu_accounts":
+            from app.telegram.handlers.account_handler import AccountHandler
+            await AccountHandler.show_accounts(supabase_admin, chat_id, user_id)
+
+        elif data == "menu_monthly":
+            from app.telegram.handlers.report_handler import ReportHandler
+            await ReportHandler.monthly_summary(supabase_admin, chat_id, user_id, "")
+
+        elif data == "menu_help":
+            help_msg = (
+                "🏢 *Ishita Financial Intelligence - Quick Guide*\n\n"
+                "• *Bulk Entry:* Send items together like _\"salt 30, sugar 50\"_ to save time.\n"
+                "• *Loans:* Use words like _\"loan\"_, _\"EMI\"_, or _\"%\"_ so I know it's a credit line.\n"
+                "• *Bank Accounts:* Set a default account using `/setdefault [AccountName]`.\n"
+                "• *Corrections:* Made a mistake? The web dashboard lets you delete or edit records easily!\n\n"
+                "💬 _Just type your first expense to begin tracking with PocketMunim!_"
+            )
+            await edit_telegram_message(chat_id, message_id, text=help_msg)
 
         return {"ok": True}

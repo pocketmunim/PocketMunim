@@ -54,7 +54,6 @@ async def setup_telegram_menu():
 
     url = f"https://api.telegram.org/bot{token}/setMyCommands"
 
-    # These match the exact commands you have defined in execute_telegram_command
     commands = [
         {"command": "getloans", "description": "🏦 View active loans & pay EMIs"},
         {"command": "report", "description": "📊 View financial dashboard"},
@@ -85,6 +84,14 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         return
 
     deduct_all_regex = r"^deduct\s+all\s+(?:amount\s+of\s+|for\s+)?([a-zA-Z]+)$"
+    text_lower = text.lower()
+
+    # Precise Loan Detection Rules
+    is_loan_intent = (
+            any(kw in text_lower for kw in ["loan", " emi", "emi ", "borrowed", "lender"]) or
+            ("taken" in text_lower and "from" in text_lower) or
+            ("%" in text_lower and any(kw in text_lower for kw in ["year", "yr", "month", "p.a"]))
+    )
 
     # ================= COMMAND ROUTING =================
     if text.startswith("/register"):
@@ -103,16 +110,45 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
         await AccountHandler.show_accounts(supabase_admin, chat_id, user_id)
     elif text.startswith("/getloans"):
         await LoanHandler.get_loans(supabase_admin, chat_id, user_id, text)
-    elif any(kw in text.lower() for kw in ["taken", "borrowed", "emi", "lender", "gave me", "loan"]) or (
-            "@" in text and ("%" in text )):
-        # 1. Process all loans and capture any mixed standard transactions
+
+    # --- HYBRID LOAN & GROCERY INTERCEPTION ---
+    elif is_loan_intent:
         leftover_text = await LoanHandler.handle_loan_text(supabase_admin, chat_id, user_id, text)
-        # 2. If the user included non-loan items (groceries, bills), pass them to standard NLP
         if leftover_text and leftover_text.strip():
-            await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, leftover_text, category_pull_service)
+            # Pass the leftovers directly to standard NLP safely
+            await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, leftover_text,
+                                          category_pull_service)
+
     elif text.startswith("/start"):
-        await send_telegram_reply(chat_id,
-                                  "Welcome to PocketMunim.\n\nYour automated financial intelligence system is active.")
+        # Premium Branded Corporate UI/UX Formatting
+        welcome_msg = (
+            "✨ *Welcome to PocketMunim!* ✨\n"
+            "_An Initiative by Ishita Financial Intelligence (I) Pvt. Ltd._ 🏢\n\n"
+            "Your premium AI-powered wealth and expense manager is online. Forget rigid formats and complex accounting—just text me exactly how you speak! I'll automate your ledgers, track your loans, and build your reports instantly.\n\n"
+            "💡 *Try it out! Just type:*\n"
+            "🟢 *Earned:* _\"Got my 50k salary today\"_\n"
+            "🔴 *Spent:* _\"Paid 450 for Zomato & 2k for electricity\"_\n"
+            "🏦 *Loans:* _\"HDFC loan 5L at 9.5% for 3 years\"_\n"
+            "🛒 *Bulk:* _\"Milk 60, Bread 40, Eggs 50\"_\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 *Access your financial universe below:*"
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "📊 PocketMunim Dashboard", "callback_data": "menu_report"}],
+                [
+                    {"text": "🏦 Active Loans", "callback_data": "menu_loans"},
+                    {"text": "💳 My Accounts", "callback_data": "menu_accounts"}
+                ],
+                [
+                    {"text": "📅 Monthly Report", "callback_data": "menu_monthly"},
+                    {"text": "❓ How it works", "callback_data": "menu_help"}
+                ]
+            ]
+        }
+        await send_telegram_reply(chat_id, welcome_msg, reply_markup=keyboard)
+
     elif text.startswith("/categorypull"):
         await NLPHandler.pull_categories(supabase_admin, chat_id, user_id, text, category_pull_service)
     elif text.startswith("/history"):
@@ -120,6 +156,7 @@ async def execute_telegram_command(chat_id: int, text: str, user_id: str, reques
     elif text.startswith("/monthly"):
         await ReportHandler.monthly_summary(supabase_admin, chat_id, user_id, text)
     else:
+        # Standard Transactions
         await NLPHandler.process_text(supabase_admin, supabase, chat_id, user_id, text, category_pull_service)
 
 
