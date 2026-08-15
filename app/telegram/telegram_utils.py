@@ -1,10 +1,78 @@
-"""
-Telegram Utility Module: PocketMunim Enterprise
-Handles premium UI/UX formatting for Telegram responses.
-"""
+import json
+import httpx
+import os
+import logging
 import re
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# ORIGINAL CORE API FUNCTIONS (RESTORED)
+# ==========================================
+
+async def send_telegram_reply(chat_id: int, text: str, reply_markup: dict = None):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token or not chat_id:
+        return None
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "MarkdownV2"} # Upgraded to MarkdownV2 for premium UI
+
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload)
+        if response.status_code != 200:
+            logger.error(f"Telegram API Error ({response.status_code}): {response.text}")
+            return None
+
+        data = response.json()
+        return data.get("result", {}).get("message_id")
+
+
+async def edit_telegram_message(chat_id: int, message_id: int, text: str = None, reply_markup: dict = None):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+
+    if text:
+        url += "editMessageText"
+        payload["text"] = text
+        payload["parse_mode"] = "MarkdownV2"
+    else:
+        url += "editMessageReplyMarkup"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload)
+        if response.status_code != 200:
+            logger.error(f"Telegram API Edit Error ({response.status_code}): {response.text}")
+            return False
+        return True
+
+
+async def delete_telegram_message(chat_id: int, message_id: int):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/deleteMessage"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload)
+        return response.status_code == 200
+
+# ==========================================
+# NEW PREMIUM FORMATTING FUNCTIONS (ADDED)
+# ==========================================
 
 def escape_markdown_v2(text: str) -> str:
     """
@@ -12,7 +80,7 @@ def escape_markdown_v2(text: str) -> str:
     Ensures no unescaped characters crash the delivery.
     """
     escape_chars = r"_*[]()~`>#+-=|{}.!"
-    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", text)
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", str(text))
 
 
 def format_transaction_receipt(amount: float, category: str, date: str, note: Optional[str] = None) -> str:
