@@ -2,12 +2,10 @@
 High-Speed Command Router: PocketMunim Enterprise
 Decouples transport layer from business logic for sub-second routing.
 """
-from app.dependencies import get_async_db, get_ai_provider, get_notification_gateway
-from app.telegram.telegram_utils import format_transaction_receipt
 import logging
+from app.telegram.telegram_utils import format_transaction_receipt
 
 logger = logging.getLogger("PocketMunim.Router")
-
 
 class CommandRouter:
     def __init__(self, db, ai, notifier, cache):
@@ -38,7 +36,8 @@ class CommandRouter:
 
         except Exception as e:
             logger.error(f"Routing Error: {str(e)}")
-            await self.notifier.send_message(chat_id, "⚠️ System error processing request.")
+            # FIXED: Uses standard .send_message() interface
+            await self.notifier.send_message(str(chat_id), "⚠️ System error processing request.")
             raise e
 
     async def _route_command(self, text: str, chat_id: int):
@@ -46,9 +45,9 @@ class CommandRouter:
         command = text.split()[0].lower()
         if command == "/dashboard":
             # Delegate to specialized handler
-            await self.notifier.send_message(chat_id, "📊 Generating your secure link...")
+            await self.notifier.send_message(str(chat_id), "📊 Generating your secure link...")
         else:
-            await self.notifier.send_message(chat_id, "ℹ️ Command recognized but not implemented in fast-router yet.")
+            await self.notifier.send_message(str(chat_id), "ℹ️ Command recognized but not implemented in fast-router yet.")
 
     async def _route_nlp(self, text: str, chat_id: int):
         """Routes natural language to Groq AI for extraction."""
@@ -62,6 +61,8 @@ class CommandRouter:
         receipt = format_transaction_receipt(
             amount=extraction.amount,
             category=extraction.category,
-            date="Today"
+            date="Today" # Future capability: sync with user's timezone via business calendar
         )
-        await self.notifier.send_markdown_message(chat_id, receipt)
+
+        # FIXED: Enforcing strict NotificationGateway interface compliance
+        await self.notifier.send_message(str(chat_id), receipt)
