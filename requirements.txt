@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+supabase
+groq
+google-generativeai
+python-dateutil
+pandas
+qstash
+httpx
+pytest
+pytest-asyncio
+jinja2
