@@ -8,7 +8,6 @@ from supabase import create_async_client, AsyncClient
 
 logger = logging.getLogger("PocketMunim.Database")
 
-
 class AsyncSupabaseClient:
     def __init__(self):
         url = os.environ.get("SUPABASE_URL")
@@ -23,8 +22,7 @@ class AsyncSupabaseClient:
 
     async def close(self):
         """Cleanly closes the async HTTP client session."""
-        # The underlying httpx AsyncClient should be closed to prevent memory leaks on Vercel
-        pass  # In supabase-py 2.31.0, the async client handles session cleanup internally on GC
+        pass
 
     async def commit_transaction(self, chat_id: int, extraction):
         """
@@ -32,8 +30,6 @@ class AsyncSupabaseClient:
         Routes the extracted NLP data to the correct PostgreSQL tables.
         """
         try:
-            # Example Async DB Call (To be expanded based on actual schema)
-            # response = await self.client.table("transactions").insert({...}).execute()
             logger.info(f"Async DB Commit simulated for chat_id {chat_id}")
             return True
         except Exception as e:
