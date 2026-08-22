@@ -50,7 +50,7 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
 
         m_other_income = sum(
             float(t['amount']) for t in m_txs
-            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
+            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] in ['CREDITED', 'COMPLETED', 'SETTLED']
         )
         total_month_income = actual + m_other_income
         m_debit = sum(float(t['amount']) for t in m_txs if t['type'] in ['DEBIT', 'EXPENSE'])
@@ -165,14 +165,13 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     _, last_day_of_month = calendar.monthrange(yr, m)
     end_d = f"{yr:04d}-{m:02d}-{last_day_of_month:02d}"
 
-    # Fetch month transactions to calculate net margin
     tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
         'transaction_date', end_d).execute()
     txs = tx_res.data or []
 
     m_other_income = sum(
         float(t['amount']) for t in txs
-        if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
+        if t['type'] in ['INCOME', 'CREDIT'] and t['status'] in ['CREDITED', 'COMPLETED', 'SETTLED']
     )
     total_inflow = salary_amount + m_other_income
     total_debits = sum(float(t['amount']) for t in txs if t['type'] in ['DEBIT', 'EXPENSE'])
@@ -183,7 +182,6 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             detail=f"Settlement Blocked: Total debits (₹{total_debits:,.2f}) exceed total incoming funds (₹{total_inflow:,.2f})."
         )
 
-    # Net settlement amount to deduct/debit
     settlement_debit_amount = total_inflow - total_debits
     target_acc = str(payload.target_account_id) if payload.target_account_id else sal.get('account_id')
 
@@ -195,7 +193,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             new_bal = curr_bal - settlement_debit_amount
             db.table('accounts').update({"balance": new_bal}).eq('account_id', target_acc).execute()
 
-        # 2. Make DEBIT entry in transactions table (Type strictly = DEBIT)
+        # 2. Make DEBIT entry in transactions table with status = 'SETTLED'
         db.table('transactions').insert({
             "user_id": uid,
             "account_id": target_acc,
@@ -204,7 +202,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             "category": "Salary Settlement",
             "amount": settlement_debit_amount,
             "transaction_date": str(date.today()),
-            "status": "CREDITED",
+            "status": "SETTLED",
             "description": f"Bulk Month Settlement Sweep - {calendar.month_name[m]} {yr}"
         }).execute()
 
