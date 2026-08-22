@@ -2,12 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas.account import (
     CreateAccountRequest,
     SetDefaultAccountRequest,
+    TransferFundsRequest,
     AccountListResponse,
     AccountItem
 )
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
 from supabase import Client
+from datetime import date
 
 router = APIRouter(prefix="/api/v1/accounts", tags=["Liquidity Vaults & Accounts"])
 
@@ -36,16 +38,13 @@ async def list_user_accounts(user_id: str, db: Client = Depends(get_db)):
 async def create_account(payload: CreateAccountRequest, db: Client = Depends(get_db)):
     uid = str(payload.user_id)
 
-    # If this is marked default, unset existing default accounts for this user
     if payload.is_default:
         db.table('accounts').update({"is_default": False}).eq('user_id', uid).execute()
     else:
-        # If user has no existing accounts, force this first one to be default
         existing = db.table('accounts').select('account_id').eq('user_id', uid).eq('is_active', True).execute()
         if not existing.data:
             payload.is_default = True
 
-    # 1. Insert new account
     acc_res = db.table('accounts').insert({
         "user_id": uid,
         "account_name": payload.account_name,
@@ -60,7 +59,6 @@ async def create_account(payload: CreateAccountRequest, db: Client = Depends(get
     new_acc = acc_res.data[0]
     new_acc_id = new_acc['account_id']
 
-    # 2. Add audit log
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": new_acc_id,
@@ -84,21 +82,15 @@ async def set_default_account(payload: SetDefaultAccountRequest, db: Client = De
     uid = str(payload.user_id)
     target_aid = str(payload.account_id)
 
-    # 1. Verify account belongs to user
     verify_acc = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).execute()
     if not verify_acc.data:
         raise HTTPException(status_code=404, detail="Account not found.")
 
-    # 2. Reset all user accounts to is_default = False
     db.table('accounts').update({"is_default": False}).eq('user_id', uid).execute()
-
-    # 3. Set the target account as default
     db.table('accounts').update({"is_default": True}).eq('account_id', target_aid).execute()
 
-    # 4. Point upcoming scheduled salaries to this new default account
     db.table('salaries').update({"account_id": target_aid}).eq('user_id', uid).eq('status', 'SCHEDULED').execute()
 
-    # 5. Audit log
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": target_aid,
@@ -110,4 +102,103 @@ async def set_default_account(payload: SetDefaultAccountRequest, db: Client = De
     return {
         "status": "SUCCESS",
         "message": f"'{verify_acc.data[0]['account_name']}' is now set as the primary default account."
+    }
+
+
+@router.post(
+    "/transfer",
+    dependencies=[Depends(verify_zero_trust_signature)]
+)
+async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get_db)):
+    uid = str(payload.user_id)
+    src_id = str(payload.source_account_id)
+    dest_id = str(payload.destination_account_id)
+    transfer_amount = float(payload.amount)
+
+    # 1. Validation Checks
+    if src_id == dest_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Source and destination accounts must be distinct vaults."
+        )
+
+    # Fetch Source Account
+    src_res = db.table('accounts').select('*').eq('account_id', src_id).eq('user_id', uid).eq('is_active',
+                                                                                              True).execute()
+    if not src_res.data:
+        raise HTTPException(status_code=404, detail="Source vault not found or inactive.")
+    src_acc = src_res.data[0]
+    src_bal = float(src_acc['balance'])
+
+    # Fetch Destination Account
+    dest_res = db.table('accounts').select('*').eq('account_id', dest_id).eq('user_id', uid).eq('is_active',
+                                                                                                True).execute()
+    if not dest_res.data:
+        raise HTTPException(status_code=404, detail="Destination vault not found or inactive.")
+    dest_acc = dest_res.data[0]
+    dest_bal = float(dest_acc['balance'])
+
+    # 2. Solvency / Liquidity Invariant Check
+    if src_bal < transfer_amount:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient funds in {src_acc['account_name']}. Available: ₹{src_bal:,.2f}, Requested: ₹{transfer_amount:,.2f}."
+        )
+
+    # 3. Double-Entry Balance Execution
+    new_src_bal = src_bal - transfer_amount
+    new_dest_bal = dest_bal + transfer_amount
+
+    db.table('accounts').update({"balance": new_src_bal}).eq('account_id', src_id).execute()
+    db.table('accounts').update({"balance": new_dest_bal}).eq('account_id', dest_id).execute()
+
+    today_str = str(date.today())
+
+    # 4. Paired Transaction Ledger Entries
+    # Source Outflow Entry
+    db.table('transactions').insert({
+        "user_id": uid,
+        "account_id": src_id,
+        "type": "DEBIT",
+        "category": "Vault Transfer",
+        "amount": transfer_amount,
+        "transaction_date": today_str,
+        "status": "DEBITED",
+        "description": f"Transfer Out to {dest_acc['account_name']}"
+    }).execute()
+
+    # Destination Inflow Entry
+    db.table('transactions').insert({
+        "user_id": uid,
+        "account_id": dest_id,
+        "type": "CREDIT",
+        "category": "Vault Transfer",
+        "amount": transfer_amount,
+        "transaction_date": today_str,
+        "status": "CREDITED",
+        "description": f"Transfer In from {src_acc['account_name']}"
+    }).execute()
+
+    # 5. Dual Audit Logs
+    db.table('account_logs').insert({
+        "user_id": uid,
+        "account_id": src_id,
+        "event_type": "VAULT_TRANSFER_OUT",
+        "amount": -transfer_amount,
+        "description": f"Transferred ₹{transfer_amount:,.2f} to {dest_acc['account_name']}."
+    }).execute()
+
+    db.table('account_logs').insert({
+        "user_id": uid,
+        "account_id": dest_id,
+        "event_type": "VAULT_TRANSFER_IN",
+        "amount": transfer_amount,
+        "description": f"Received ₹{transfer_amount:,.2f} from {src_acc['account_name']}."
+    }).execute()
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Successfully transferred ₹{transfer_amount:,.2f} from {src_acc['account_name']} to {dest_acc['account_name']}.",
+        "source_balance": new_src_bal,
+        "destination_balance": new_dest_bal
     }

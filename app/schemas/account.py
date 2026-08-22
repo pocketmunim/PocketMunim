@@ -18,6 +18,12 @@ class SetDefaultAccountRequest(BaseModel):
     user_id: UUID
     account_id: UUID
 
+class TransferFundsRequest(BaseModel):
+    user_id: UUID
+    source_account_id: UUID
+    destination_account_id: UUID
+    amount: float = Field(..., gt=0.0, description="Transfer amount must be strictly greater than zero")
+
 class AccountItem(BaseModel):
     account_id: UUID
     user_id: UUID
