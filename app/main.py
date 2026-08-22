@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth
+from app.routers import auth, salary, cron
 
 app = FastAPI(
     title="PocketMunim Core Engine",
@@ -17,11 +17,9 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(salary.router)
+app.include_router(cron.router)
 
 @app.get("/")
 def health():
-    return {
-        "status": "ONLINE",
-        "system": "Ishita Financial Intelligence System",
-        "protocol": "IFIS-ZERO-TRUST-V2"
-    }
+    return {"status": "ONLINE", "protocol": "IFIS-ZERO-TRUST-V2"}

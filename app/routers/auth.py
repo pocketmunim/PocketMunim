@@ -3,6 +3,7 @@ from app.schemas.auth import RegisterRequest, RegisterResponse
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
 from supabase import Client
+from app.services.salary_service import SalaryService
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Identity & Provisioning"])
 
@@ -46,6 +47,15 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "balance": payload.current_balance,
             "is_active": True
         }).execute()
+
+        SalaryService.seed_annual_salaries(
+            db=db,
+            user_id=uid_str,
+            account_id=account_id,
+            salary_amount=float(payload.salary),
+            salary_date=int(payload.salary_date),
+            year=date.today().year
+        )
 
         return RegisterResponse(
             status="PROVISIONED",
