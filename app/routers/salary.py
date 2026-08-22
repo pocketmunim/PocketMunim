@@ -85,7 +85,7 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
     old_actual = float(sal['actual_amount'])
     old_status = sal['status']
 
-    # Auto-shift the override date if it hits a weekend or bank holiday
+    # Auto-shift override date if it falls on weekend or bank holiday
     effective_override_date = await HolidayService.get_effective_payout_date(payload.new_payout_date)
 
     db.table('salaries').update({
@@ -94,6 +94,7 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
         "is_custom_override": True
     }).eq('salary_id', sal['salary_id']).execute()
 
+    # If salary was ALREADY paid/settled, adjust balance and update the existing transaction
     if old_status in ['PAID', 'SETTLED'] and sal.get('account_id'):
         diff = payload.new_amount - old_actual
         if diff != 0:
@@ -107,13 +108,14 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
                     "account_id": sal['account_id'],
                     "event_type": "SALARY_OVERRIDE_ADJUSTMENT",
                     "amount": diff,
-                    "description": f"Differential adjustment for {calendar.month_name[payload.month]} {payload.year} salary (Effective Date: {effective_override_date})."
+                    "description": f"Differential adjustment for {calendar.month_name[payload.month]} {payload.year} salary."
                 }).execute()
 
-    db.table('transactions').update({
-        "amount": payload.new_amount,
-        "transaction_date": str(effective_override_date)
-    }).eq('salary_id', sal['salary_id']).execute()
+        # Update the already-existing transaction
+        db.table('transactions').update({
+            "amount": payload.new_amount,
+            "transaction_date": str(effective_override_date)
+        }).eq('salary_id', sal['salary_id']).execute()
 
     return {
         "status": "SUCCESS",
@@ -155,22 +157,33 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     target_acc = str(payload.target_account_id) if payload.target_account_id else sal.get('account_id')
     amount_to_credit = float(sal['actual_amount'])
 
+    # 1. Credit account balance
     acc_res = db.table('accounts').select('balance').eq('account_id', target_acc).execute()
     if acc_res.data:
         curr_bal = float(acc_res.data[0]['balance'])
         db.table('accounts').update({"balance": curr_bal + amount_to_credit}).eq('account_id', target_acc).execute()
 
+    # 2. Update salary status to SETTLED
     db.table('salaries').update({
         "status": "SETTLED",
         "paid_at": "now()",
         "account_id": target_acc
     }).eq('salary_id', sid).execute()
 
-    db.table('transactions').update({
+    # 3. Create the transaction record on settlement
+    db.table('transactions').insert({
+        "user_id": uid,
+        "account_id": target_acc,
+        "salary_id": sid,
+        "type": "SALARY",
+        "category": "Salary",
+        "amount": amount_to_credit,
+        "transaction_date": str(date.today()),
         "status": "CREDITED",
-        "account_id": target_acc
-    }).eq('salary_id', sid).execute()
+        "description": f"Manual Past Salary Settlement - {calendar.month_name[m]} {yr}"
+    }).execute()
 
+    # 4. Insert audit log
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": target_acc,

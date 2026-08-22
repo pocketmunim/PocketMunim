@@ -15,9 +15,9 @@ class SalaryService:
             year: int = None
     ) -> float:
         """
-        Seeds 12 months of salaries and transactions.
-        Credits all past/today salaries to the bank account and logs each in account_logs.
-        Returns the total accumulated past salary credited.
+        Seeds 12 months of salaries for the specified year.
+        ONLY creates transactions and account_logs for salaries paid till date.
+        Future months remain purely in the salaries table until the cron job triggers.
         """
         if not year:
             year = date.today().year
@@ -35,7 +35,6 @@ class SalaryService:
 
             is_past = effective_payout_dt <= today
             sal_status = "PAID" if is_past else "SCHEDULED"
-            tx_status = "CREDITED" if is_past else "SCHEDULED"
             paid_timestamp = f"{effective_payout_dt}T00:00:00Z" if is_past else None
 
             # 1. Upsert salary month row
@@ -52,10 +51,11 @@ class SalaryService:
                 "is_custom_override": False
             }, on_conflict="user_id,year,month").execute()
 
-            if sal_res.data:
+            if sal_res.data and is_past:
                 sal_id = sal_res.data[0]['salary_id']
+                total_past_salaries_credited += salary_amount
 
-                # 2. Insert corresponding transaction
+                # 2. Insert transaction ONLY for paid/past months
                 db.table('transactions').insert({
                     "user_id": user_id,
                     "account_id": account_id,
@@ -64,20 +64,18 @@ class SalaryService:
                     "category": "Salary",
                     "amount": salary_amount,
                     "transaction_date": str(effective_payout_dt),
-                    "status": tx_status,
+                    "status": "CREDITED",
                     "description": f"Salary Credit - {calendar.month_name[m]} {year}"
                 }).execute()
 
-                # 3. If past, record account log entry and tally total
-                if is_past:
-                    total_past_salaries_credited += salary_amount
-                    db.table('account_logs').insert({
-                        "user_id": user_id,
-                        "account_id": account_id,
-                        "event_type": "SALARY_HISTORICAL_CREDIT",
-                        "amount": salary_amount,
-                        "description": f"Historical salary credit for {calendar.month_name[m]} {year} (Paid on {effective_payout_dt})."
-                    }).execute()
+                # 3. Log account credit event
+                db.table('account_logs').insert({
+                    "user_id": user_id,
+                    "account_id": account_id,
+                    "event_type": "SALARY_HISTORICAL_CREDIT",
+                    "amount": salary_amount,
+                    "description": f"Historical salary credit for {calendar.month_name[m]} {year} (Paid on {effective_payout_dt})."
+                }).execute()
 
         # Update account balance to include all disbursed past salaries
         if total_past_salaries_credited > 0:
