@@ -29,7 +29,6 @@ class SettlePastEMIsRequest(BaseModel):
 )
 async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
     uid = str(user_id)
-    # Fetch only active loans where pending principal > 0 and status is ACTIVE
     loans_res = db.table('loans') \
         .select('*') \
         .eq('user_id', uid) \
@@ -57,7 +56,6 @@ async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
         else:
             total_receivables += p_amt
 
-        # Check for pending past EMIs strictly before or on today
         past_sched = db.table('loan_repayments') \
             .select('repayment_id, emi_amount') \
             .eq('loan_id', lid) \
@@ -69,7 +67,6 @@ async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
         pending_past_emis_count = len(past_sched.data or [])
         pending_past_emis_total = sum(float(x['emi_amount']) for x in (past_sched.data or []))
 
-        # Check if current month installment is paid
         start_of_month = f"{today.year:04d}-{today.month:02d}-01"
         end_of_month = (date(today.year, today.month, 1) + relativedelta(months=1, days=-1))
 
@@ -128,6 +125,7 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
     sanitized_name = payload.loan_name.strip()
     principal = round(float(payload.original_principal), 2)
 
+    # 1. Deduplication Guard
     existing = db.table('loans').select('loan_id').eq('user_id', uid).ilike('loan_name', sanitized_name).execute()
     if existing.data:
         raise HTTPException(
@@ -135,6 +133,7 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
             detail=f"A loan titled '{sanitized_name}' already exists. Please use a unique title."
         )
 
+    # 2. Resolve Vault Account for Disbursement
     if payload.account_id:
         acc_res = db.table('accounts').select('*').eq('account_id', str(payload.account_id)).eq('user_id', uid).eq(
             'is_active', True).execute()
@@ -152,6 +151,14 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
     acc_name = acc['account_name']
     curr_balance = float(acc['balance'])
 
+    # 3. Solvency Guard for LENT loans (Money given out must not exceed bank balance)
+    if payload.loan_type.value == "LENT" and curr_balance < principal:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient balance in {acc_name} to lend ₹{principal:,.2f}. Available balance: ₹{curr_balance:,.2f}."
+        )
+
+    # 4. Calculate EMI & Amortization Plan
     monthly_emi = LoanService.calculate_reducing_emi(
         principal,
         payload.annual_interest_rate,
@@ -169,6 +176,7 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
     total_repayment = sum(item['emi_amount'] for item in schedule)
     total_interest = round(total_repayment - principal, 2)
 
+    # 5. Insert Master Loan Contract
     loan_insert = db.table('loans').insert({
         "user_id": uid,
         "account_id": aid,
@@ -202,6 +210,7 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
 
     db.table('loan_repayments').insert(schedule).execute()
 
+    # 6. Apply Disbursement Flow
     tx_type = "CREDIT" if payload.loan_type.value == "BORROWED" else "DEBIT"
     status_label = "CREDITED" if tx_type == "CREDIT" else "DEBITED"
     new_bal = round(curr_balance + principal if tx_type == "CREDIT" else curr_balance - principal, 2)
@@ -217,7 +226,7 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
         "amount": principal,
         "transaction_date": str(payload.disbursement_date),
         "status": status_label,
-        "description": f"Loan Disbursement: {sanitized_name} ({payload.counterparty})"
+        "description": f"Loan Disbursement ({payload.loan_type.value}): {sanitized_name} - {payload.counterparty}"
     }).execute()
 
     db.table('account_logs').insert({
@@ -230,7 +239,7 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
 
     return {
         "status": "SUCCESS",
-        "message": f"Loan '{sanitized_name}' registered. Disbursed ₹{principal:,.2f} recorded in {acc_name}.",
+        "message": f"Loan '{sanitized_name}' registered. {'Credited' if tx_type == 'CREDIT' else 'Debited'} ₹{principal:,.2f} on {acc_name}.",
         "loan_id": new_loan_id,
         "monthly_emi": monthly_emi
     }
