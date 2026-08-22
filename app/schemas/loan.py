@@ -17,11 +17,12 @@ class RegisterLoanRequest(BaseModel):
     loan_type: LoanTypeEnum = LoanTypeEnum.BORROWED
     counterparty: str = Field(..., min_length=2, max_length=150)
     disbursement_date: date
-    first_emi_date: date
+    first_emi_date: Optional[date] = None
     original_principal: float = Field(..., gt=0.0)
     annual_interest_rate: float = Field(default=0.0, ge=0.0, le=100.0)
-    original_tenure_months: int = Field(..., gt=0, le=480)
+    original_tenure_months: int = Field(default=0, ge=0, le=480)
     account_id: Optional[str] = None
+    is_flexible: bool = False  # True for irregular P2P ad-hoc repayment contracts
 
     @field_validator('loan_name', 'counterparty')
     @classmethod
@@ -34,13 +35,29 @@ class PayEMIRequest(BaseModel):
     account_id: Optional[str] = None
     is_advance_confirmed: bool = False
 
+class FlexibleRepaymentRequest(BaseModel):
+    user_id: str
+    loan_id: str
+    amount: float = Field(..., gt=0.0)
+    account_id: Optional[str] = None
+    payment_date: Optional[date] = None
+    note: Optional[str] = "Ad-hoc repayment"
+
+class PartialRepaymentLogItem(BaseModel):
+    partial_repayment_id: str
+    amount: float
+    payment_date: date
+    note: Optional[str]
+    remaining_balance_after: float
+    created_at: str
+
 class LoanSummaryItem(BaseModel):
     loan_id: str
     loan_name: str
     loan_type: str
     counterparty: str
     disbursement_date: date
-    first_emi_date: date
+    first_emi_date: Optional[date] = None
     original_principal: float
     pending_principal: float
     annual_interest_rate: float
@@ -50,14 +67,16 @@ class LoanSummaryItem(BaseModel):
     total_interest_payable: float
     principal_paid: float
     interest_paid: float
-    next_emi_date: date
+    next_emi_date: Optional[date] = None
     status: str
+    is_flexible: bool = False
     account_id: Optional[str] = None
     account_name: Optional[str] = "Default Vault"
     is_current_month_paid: bool = False
     has_pending_past_emis: bool = False
     pending_past_emis_count: int = 0
     pending_past_emis_total: float = 0.0
+    partial_repayments: List[PartialRepaymentLogItem] = []
 
 class LoanListResponse(BaseModel):
     status: str
