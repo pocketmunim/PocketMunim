@@ -85,11 +85,12 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
         }
         db.table('users').insert(user_insert).execute()
 
-        # 2. Insert primary bank account
+        # 2. Insert primary bank account with is_default = True
         acc_insert = {
             "user_id": uid_str,
             "account_name": payload.bank_name.upper(),
             "balance": float(payload.current_balance),
+            "is_default": True,
             "is_active": True
         }
         acc_res = db.table('accounts').insert(acc_insert).execute()
@@ -101,7 +102,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "account_id": account_id,
             "event_type": "GENESIS_INITIALIZATION",
             "amount": float(payload.current_balance),
-            "description": f"Initial liquidity provisioned for {payload.bank_name.upper()}."
+            "description": f"Initial default liquidity vault provisioned for {payload.bank_name.upper()}."
         }).execute()
 
         # 4. Dynamically seed 12 months with holiday & weekend shifting
@@ -119,7 +120,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             status="PROVISIONED",
             code=201,
             user_id=payload.user_id,
-            message="Node successfully provisioned. Historical salaries and ledger accounts initialized."
+            message="Node successfully provisioned. Default vault initialized."
         )
 
     except HTTPException:

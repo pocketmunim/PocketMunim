@@ -1,11 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import auth, salary, cron
+from app.routers import auth, salary, account, cron
 
 app = FastAPI(
     title="PocketMunim Core Engine",
     description="Ishita Financial Intelligence System - Zero-Trust Backend",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -18,6 +18,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(salary.router)
+app.include_router(account.router)
 app.include_router(cron.router)
 
 @app.get("/")
