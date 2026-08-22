@@ -16,16 +16,13 @@ router = APIRouter(prefix="/api/v1/salary", tags=["Salary & Dispersal Engine"])
     dependencies=[Depends(verify_zero_trust_signature)]
 )
 async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db)):
-    # 1. Fetch salaries for specified year
     sal_res = db.table('salaries').select('*').eq('user_id', user_id).eq('year', year).order('month').execute()
     salaries = sal_res.data or []
 
-    # Dynamic annual boundary lookup
     start_dt = f"{year:04d}-01-01"
     _, last_day_of_dec = calendar.monthrange(year, 12)
     end_dt = f"{year:04d}-12-{last_day_of_dec:02d}"
 
-    # 2. Fetch all transactions within the dynamic calendar year
     tx_res = db.table('transactions').select('*').eq('user_id', user_id).gte('transaction_date', start_dt).lte(
         'transaction_date', end_dt).execute()
     txs = tx_res.data or []
@@ -49,10 +46,8 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
         else:
             scheduled_total += actual
 
-        # Filter transactions for this dynamic month
         m_txs = [t for t in txs if int(t['transaction_date'].split('-')[1]) == m]
 
-        # Other income excludes core salary to prevent double tally
         m_other_income = sum(
             float(t['amount']) for t in m_txs
             if t['type'] in ['INCOME'] and t['status'] == 'CREDITED'
@@ -63,10 +58,7 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
 
         payout_d = date.fromisoformat(s['payout_date'])
 
-        # ELIGIBILITY RULE:
-        # 1. Must be ALREADY PAID (status == 'PAID')
-        # 2. Payout date is in the past
-        # 3. Logged expenses do not exceed total incoming funds (Salary + Other Income)
+        # Settle Eligibility: Must be PAID in a past month, and expenses <= total income
         can_settle = (current_status == 'PAID') and (payout_d < today) and (m_expense <= total_month_income)
 
         month_items.append(SalaryMonthItem(
@@ -109,7 +101,6 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
     old_actual = float(sal['actual_amount'])
     old_status = sal['status']
 
-    # Auto-shift override date if it falls on a weekend or bank holiday
     effective_override_date = await HolidayService.get_effective_payout_date(payload.new_payout_date)
 
     db.table('salaries').update({
@@ -118,7 +109,6 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
         "is_custom_override": True
     }).eq('salary_id', sal['salary_id']).execute()
 
-    # Differential adjustment for already paid/settled months
     if old_status in ['PAID', 'SETTLED'] and sal.get('account_id'):
         diff = payload.new_amount - old_actual
         if diff != 0:
@@ -161,7 +151,6 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
 
     sal = sal_res.data[0]
 
-    # 1. Verification: Must be in 'PAID' state to settle
     if sal['status'] != 'PAID':
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -172,12 +161,11 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     m = sal['month']
     salary_amount = float(sal['actual_amount'])
 
-    # Dynamic month start and end dates
     start_d = f"{yr:04d}-{m:02d}-01"
     _, last_day_of_month = calendar.monthrange(yr, m)
     end_d = f"{yr:04d}-{m:02d}-{last_day_of_month:02d}"
 
-    # 2. Fetch logged transactions for the month
+    # Fetch month transactions to calculate net margin
     tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
         'transaction_date', end_d).execute()
     txs = tx_res.data or []
@@ -189,31 +177,54 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     total_inflow = salary_amount + m_other_income
     total_expense = sum(float(t['amount']) for t in txs if t['type'] == 'EXPENSE')
 
-    # 3. Verification: Expense <= Total Inflow
     if total_expense > total_inflow:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Settlement Blocked: Total expenses (₹{total_expense:,.2f}) exceed total incoming funds (₹{total_inflow:,.2f})."
         )
 
+    # Net settlement amount to deduct/debit
+    settlement_debit_amount = total_inflow - total_expense
     target_acc = str(payload.target_account_id) if payload.target_account_id else sal.get('account_id')
 
-    # 4. Mark Salary status as SETTLED
+    # 1. Deduct amount from accounts balance
+    if settlement_debit_amount > 0 and target_acc:
+        acc_res = db.table('accounts').select('balance').eq('account_id', target_acc).execute()
+        if acc_res.data:
+            curr_bal = float(acc_res.data[0]['balance'])
+            new_bal = curr_bal - settlement_debit_amount
+            db.table('accounts').update({"balance": new_bal}).eq('account_id', target_acc).execute()
+
+        # 2. Make DEBIT/EXPENSE entry in transactions table
+        db.table('transactions').insert({
+            "user_id": uid,
+            "account_id": target_acc,
+            "salary_id": sid,
+            "type": "EXPENSE",
+            "category": "Salary Settlement",
+            "amount": settlement_debit_amount,
+            "transaction_date": str(date.today()),
+            "status": "CREDITED",
+            "description": f"Bulk Month Settlement Sweep - {calendar.month_name[m]} {yr}"
+        }).execute()
+
+        # 3. Make audit entry in account_logs
+        db.table('account_logs').insert({
+            "user_id": uid,
+            "account_id": target_acc,
+            "event_type": "SALARY_MONTH_SETTLED_DEBIT",
+            "amount": -settlement_debit_amount,
+            "description": f"Month closed and balance swept for {calendar.month_name[m]} {yr} (Deducted: ₹{settlement_debit_amount:,.2f})."
+        }).execute()
+
+    # 4. Update salary status to SETTLED
     db.table('salaries').update({
         "status": "SETTLED",
         "account_id": target_acc
     }).eq('salary_id', sid).execute()
 
-    # 5. Record Month Closing Audit Log
-    db.table('account_logs').insert({
-        "user_id": uid,
-        "account_id": target_acc,
-        "event_type": "MONTH_SETTLEMENT_CLOSED",
-        "amount": salary_amount,
-        "description": f"Month closed and settled for {calendar.month_name[m]} {yr} (Total Inflow: ₹{total_inflow:,.2f}, Logged Outflow: ₹{total_expense:,.2f})."
-    }).execute()
-
     return {
         "status": "SETTLED",
-        "message": f"Month {calendar.month_name[m]} {yr} successfully settled and balanced."
+        "settled_amount_debited": settlement_debit_amount,
+        "message": f"Month {calendar.month_name[m]} {yr} settled. ₹{settlement_debit_amount:,.2f} debited from vault."
     }
