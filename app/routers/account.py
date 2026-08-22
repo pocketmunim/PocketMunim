@@ -37,6 +37,16 @@ async def list_user_accounts(user_id: str, db: Client = Depends(get_db)):
 )
 async def create_account(payload: CreateAccountRequest, db: Client = Depends(get_db)):
     uid = str(payload.user_id)
+    sanitized_name = payload.account_name.strip().upper()
+
+    # Deduplication Guard: Check if account name already exists for this user
+    existing_acc = db.table('accounts').select('account_id').eq('user_id', uid).ilike('account_name',
+                                                                                      sanitized_name).execute()
+    if existing_acc.data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"An account vault named '{sanitized_name}' already exists. Please use a unique name."
+        )
 
     if payload.is_default:
         db.table('accounts').update({"is_default": False}).eq('user_id', uid).execute()
@@ -47,7 +57,7 @@ async def create_account(payload: CreateAccountRequest, db: Client = Depends(get
 
     acc_res = db.table('accounts').insert({
         "user_id": uid,
-        "account_name": payload.account_name,
+        "account_name": sanitized_name,
         "balance": payload.balance,
         "is_default": payload.is_default,
         "is_active": True
@@ -64,12 +74,12 @@ async def create_account(payload: CreateAccountRequest, db: Client = Depends(get
         "account_id": new_acc_id,
         "event_type": "ACCOUNT_PROVISIONED",
         "amount": payload.balance,
-        "description": f"New liquidity vault provisioned: {payload.account_name} with opening balance ₹{payload.balance:,.2f}."
+        "description": f"New liquidity vault provisioned: {sanitized_name} with opening balance ₹{payload.balance:,.2f}."
     }).execute()
 
     return {
         "status": "SUCCESS",
-        "message": f"Account '{payload.account_name}' created successfully.",
+        "message": f"Account '{sanitized_name}' created successfully.",
         "account": new_acc
     }
 
@@ -115,7 +125,6 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
     dest_id = str(payload.destination_account_id)
     transfer_amount = round(float(payload.amount), 2)
 
-    # 1. Invariant Validation
     if src_id == dest_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -128,7 +137,6 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
             detail="Transfer amount must be strictly greater than ₹0.00."
         )
 
-    # 2. Vault Verification
     src_res = db.table('accounts').select('*').eq('account_id', src_id).eq('user_id', uid).eq('is_active',
                                                                                               True).execute()
     if not src_res.data:
@@ -145,14 +153,12 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
     dest_name = dest_acc['account_name']
     dest_bal = float(dest_acc['balance'])
 
-    # 3. Solvency Check
     if src_bal < transfer_amount:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Insufficient funds in {src_name}. Available: ₹{src_bal:,.2f}, Requested: ₹{transfer_amount:,.2f}."
         )
 
-    # 4. Atomic Balance Execution
     new_src_bal = round(src_bal - transfer_amount, 2)
     new_dest_bal = round(dest_bal + transfer_amount, 2)
     today_str = str(date.today())
@@ -160,8 +166,6 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
     db.table('accounts').update({"balance": new_src_bal}).eq('account_id', src_id).execute()
     db.table('accounts').update({"balance": new_dest_bal}).eq('account_id', dest_id).execute()
 
-    # 5. Descriptive Double-Entry Transactions
-    # Leg A: Source Account Outflow (DEBIT)
     db.table('transactions').insert({
         "user_id": uid,
         "account_id": src_id,
@@ -176,7 +180,6 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
         "description": f"Self Transfer: Debited from {src_name} → Transferred to {dest_name}"
     }).execute()
 
-    # Leg B: Destination Account Inflow (CREDIT)
     db.table('transactions').insert({
         "user_id": uid,
         "account_id": dest_id,
@@ -191,7 +194,6 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
         "description": f"Self Transfer: Credited to {dest_name} ← Received from {src_name}"
     }).execute()
 
-    # 6. Immutable Audit Logs
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": src_id,
