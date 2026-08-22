@@ -60,9 +60,9 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "description": f"Initial liquidity provisioned for {payload.bank_name.upper()}."
         }).execute()
 
-        # 4. Dynamically seed all 12 calendar months for the current runtime year
+        # 4. Dynamically seed 12 months with bank holiday & weekend preceding shifts
         current_year = date.today().year
-        SalaryService.seed_annual_salaries(
+        await SalaryService.seed_annual_salaries(
             db=db,
             user_id=uid_str,
             account_id=account_id,

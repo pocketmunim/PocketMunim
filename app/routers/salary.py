@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas.salary import SalaryMatrixResponse, SalaryOverrideRequest, SettleSalaryRequest, SalaryMonthItem
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
+from app.services.holiday_service import HolidayService
 from supabase import Client
 from datetime import date
 import calendar
@@ -14,11 +15,9 @@ router = APIRouter(prefix="/api/v1/salary", tags=["Salary & Dispersal Engine"])
     dependencies=[Depends(verify_zero_trust_signature)]
 )
 async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db)):
-    # 1. Fetch salaries for specified year
     sal_res = db.table('salaries').select('*').eq('user_id', user_id).eq('year', year).order('month').execute()
     salaries = sal_res.data or []
 
-    # 2. Fetch all transactions for telemetry calculations
     start_dt = f"{year}-01-01"
     end_dt = f"{year}-12-31"
     tx_res = db.table('transactions').select('*').eq('user_id', user_id).gte('transaction_date', start_dt).lte('transaction_date', end_dt).execute()
@@ -40,7 +39,6 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
         else:
             scheduled_total += actual
 
-        # Compute Month Incomes and Expenses
         m_txs = [t for t in txs if int(t['transaction_date'].split('-')[1]) == m]
         m_income = sum(float(t['amount']) for t in m_txs if t['type'] in ['INCOME', 'SALARY'] and t['status'] == 'CREDITED')
         m_expense = sum(float(t['amount']) for t in m_txs if t['type'] == 'EXPENSE')
@@ -87,14 +85,15 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
     old_actual = float(sal['actual_amount'])
     old_status = sal['status']
 
-    # Update salary entry
+    # Auto-shift the override date if it hits a weekend or bank holiday
+    effective_override_date = await HolidayService.get_effective_payout_date(payload.new_payout_date)
+
     db.table('salaries').update({
         "actual_amount": payload.new_amount,
-        "payout_date": str(payload.new_payout_date),
+        "payout_date": str(effective_override_date),
         "is_custom_override": True
     }).eq('salary_id', sal['salary_id']).execute()
 
-    # Differential balance adjustment for settled/paid months
     if old_status in ['PAID', 'SETTLED'] and sal.get('account_id'):
         diff = payload.new_amount - old_actual
         if diff != 0:
@@ -108,16 +107,19 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
                     "account_id": sal['account_id'],
                     "event_type": "SALARY_OVERRIDE_ADJUSTMENT",
                     "amount": diff,
-                    "description": f"Differential adjustment for {calendar.month_name[payload.month]} {payload.year} salary."
+                    "description": f"Differential adjustment for {calendar.month_name[payload.month]} {payload.year} salary (Effective Date: {effective_override_date})."
                 }).execute()
 
-    # Sync transaction record
     db.table('transactions').update({
         "amount": payload.new_amount,
-        "transaction_date": str(payload.new_payout_date)
+        "transaction_date": str(effective_override_date)
     }).eq('salary_id', sal['salary_id']).execute()
 
-    return {"status": "SUCCESS", "message": f"Salary for {calendar.month_name[payload.month]} updated."}
+    return {
+        "status": "SUCCESS",
+        "message": f"Salary for {calendar.month_name[payload.month]} updated.",
+        "effective_payout_date": str(effective_override_date)
+    }
 
 @router.post(
     "/settle",

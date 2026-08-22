@@ -1,6 +1,7 @@
--- Run this in Supabase SQL Editor
+-- Enable UUID Generator Extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- 1. Users Table
 CREATE TABLE IF NOT EXISTS users (
     user_id UUID PRIMARY KEY,
     telegram_id VARCHAR(255) UNIQUE NOT NULL,
@@ -14,6 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 2. Bank Accounts Table
 CREATE TABLE IF NOT EXISTS accounts (
     account_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
@@ -23,15 +25,67 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 3. Account Logs / Audit Ledger Table
+CREATE TABLE IF NOT EXISTS account_logs (
+    log_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id UUID REFERENCES accounts(account_id) ON DELETE CASCADE,
+    event_type VARCHAR(50) NOT NULL,
+    amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. Annual Salaries Table
+CREATE TABLE IF NOT EXISTS salaries (
+    salary_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id UUID REFERENCES accounts(account_id) ON DELETE SET NULL,
+    year INTEGER NOT NULL,
+    month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
+    base_amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+    actual_amount NUMERIC(14, 2) NOT NULL DEFAULT 0.00,
+    payout_date DATE NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'SCHEDULED', -- 'SCHEDULED', 'PAID', 'SETTLED', 'DEFICIT_BLOCKED'
+    paid_at TIMESTAMPTZ NULL,
+    is_custom_override BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_user_salary_month UNIQUE(user_id, year, month)
+);
+
+-- 5. Transactions Table
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(user_id) ON DELETE CASCADE,
+    account_id UUID REFERENCES accounts(account_id) ON DELETE CASCADE,
+    salary_id UUID REFERENCES salaries(salary_id) ON DELETE SET NULL,
+    type VARCHAR(20) NOT NULL, -- 'INCOME', 'EXPENSE', 'TRANSFER', 'SALARY'
+    category VARCHAR(50) DEFAULT 'Salary',
+    amount NUMERIC(14, 2) NOT NULL,
+    transaction_date DATE NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'SCHEDULED', -- 'SCHEDULED', 'CREDITED', 'FAILED'
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. Zero-Trust Security Nonces Table (Anti-Replay)
 CREATE TABLE IF NOT EXISTS security_nonces (
     nonce VARCHAR(64) PRIMARY KEY,
     device_uuid VARCHAR(255) NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Performance Indexes
+CREATE INDEX IF NOT EXISTS idx_account_logs_user ON account_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_account_logs_account ON account_logs(account_id);
+CREATE INDEX IF NOT EXISTS idx_account_logs_created ON account_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_salaries_user_yr ON salaries(user_id, year);
+CREATE INDEX IF NOT EXISTS idx_salaries_cron_payout ON salaries(status, payout_date);
+CREATE INDEX IF NOT EXISTS idx_tx_user_date ON transactions(user_id, transaction_date);
 CREATE INDEX IF NOT EXISTS idx_nonce_lookup ON security_nonces(nonce);
 
-CREATE OR REPLACE FUNCTION clean_expired_nonces() 
+-- Automated Nonce Pruning Function
+CREATE OR REPLACE FUNCTION clean_expired_nonces()
 RETURNS trigger AS $$
 BEGIN
   DELETE FROM security_nonces WHERE created_at < NOW() - INTERVAL '5 minutes';
