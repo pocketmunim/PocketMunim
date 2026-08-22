@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers import auth, salary, account, cron
+from app.routers import auth, salary, account, cron, dashboard
 
 app = FastAPI(
     title="PocketMunim Core Engine",
@@ -20,7 +21,7 @@ app.include_router(auth.router)
 app.include_router(salary.router)
 app.include_router(account.router)
 app.include_router(cron.router)
-
+app.include_router(dashboard.router)
 @app.get("/")
 def health():
     return {
