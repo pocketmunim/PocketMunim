@@ -1,5 +1,5 @@
 import math
-from datetime import date
+from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 from typing import List, Dict, Any, Tuple
 
@@ -18,11 +18,26 @@ class LoanService:
     @staticmethod
     def calculate_default_first_emi_date(disbursement_date: date) -> date:
         """
-        Defaults to the 5th of the following month after disbursement.
-        Example: 23 Jan 2026 -> 05 Feb 2026
+        Disbursement Date + 30 Days -> Nearest 5th of that cycle
         """
-        next_month = disbursement_date + relativedelta(months=1)
-        return date(next_month.year, next_month.month, 5)
+        target_date = disbursement_date + timedelta(days=30)
+
+        # 5th of target month
+        candidate_same_month = date(target_date.year, target_date.month, 5)
+
+        # 5th of next month
+        next_m = target_date + relativedelta(months=1)
+        candidate_next_month = date(next_m.year, next_m.month, 5)
+
+        # If target date has already passed the 5th of same month, evaluate nearest
+        diff_same = abs((candidate_same_month - target_date).days)
+        diff_next = abs((candidate_next_month - target_date).days)
+
+        # If candidate same month is before disbursement date, fallback to next month
+        if candidate_same_month <= disbursement_date:
+            return candidate_next_month
+
+        return candidate_same_month if diff_same <= diff_next else candidate_next_month
 
     @staticmethod
     def generate_amortization_schedule(
@@ -75,9 +90,6 @@ class LoanService:
             original_principal: float,
             total_tenure: int
     ) -> Tuple[List[Dict[str, Any]], float, float, float, int, date, str]:
-        """
-        Recalculates amortization ledger when past EMIs are settled at registration.
-        """
         today = date.today()
         pending_principal = original_principal
         principal_paid = 0.0
