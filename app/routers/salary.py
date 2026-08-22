@@ -16,11 +16,16 @@ router = APIRouter(prefix="/api/v1/salary", tags=["Salary & Dispersal Engine"])
     dependencies=[Depends(verify_zero_trust_signature)]
 )
 async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db)):
+    # 1. Fetch salaries for specified year
     sal_res = db.table('salaries').select('*').eq('user_id', user_id).eq('year', year).order('month').execute()
     salaries = sal_res.data or []
 
-    start_dt = f"{year}-01-01"
-    end_dt = f"{year}-12-31"
+    # Dynamic annual boundary lookup
+    start_dt = f"{year:04d}-01-01"
+    _, last_day_of_dec = calendar.monthrange(year, 12)
+    end_dt = f"{year:04d}-12-{last_day_of_dec:02d}"
+
+    # 2. Fetch all transactions within the dynamic calendar year
     tx_res = db.table('transactions').select('*').eq('user_id', user_id).gte('transaction_date', start_dt).lte(
         'transaction_date', end_dt).execute()
     txs = tx_res.data or []
@@ -44,10 +49,10 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
         else:
             scheduled_total += actual
 
-        # Filter transactions for this specific month
+        # Filter transactions for this dynamic month
         m_txs = [t for t in txs if int(t['transaction_date'].split('-')[1]) == m]
 
-        # Other income excludes the core automated salary line
+        # Other income excludes core salary to prevent double tally
         m_other_income = sum(
             float(t['amount']) for t in m_txs
             if t['type'] in ['INCOME'] and t['status'] == 'CREDITED'
@@ -104,6 +109,7 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
     old_actual = float(sal['actual_amount'])
     old_status = sal['status']
 
+    # Auto-shift override date if it falls on a weekend or bank holiday
     effective_override_date = await HolidayService.get_effective_payout_date(payload.new_payout_date)
 
     db.table('salaries').update({
@@ -112,6 +118,7 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
         "is_custom_override": True
     }).eq('salary_id', sal['salary_id']).execute()
 
+    # Differential adjustment for already paid/settled months
     if old_status in ['PAID', 'SETTLED'] and sal.get('account_id'):
         diff = payload.new_amount - old_actual
         if diff != 0:
@@ -154,7 +161,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
 
     sal = sal_res.data[0]
 
-    # 1. Verification: Must be currently in 'PAID' state to settle
+    # 1. Verification: Must be in 'PAID' state to settle
     if sal['status'] != 'PAID':
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -165,10 +172,12 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     m = sal['month']
     salary_amount = float(sal['actual_amount'])
 
-    start_d = f"{yr}-{m:02d}-01"
-    end_d = f"{yr}-{m:02d}-{calendar.monthrange(yr, m)[1]:02d}"
+    # Dynamic month start and end dates
+    start_d = f"{yr:04d}-{m:02d}-01"
+    _, last_day_of_month = calendar.monthrange(yr, m)
+    end_d = f"{yr:04d}-{m:02d}-{last_day_of_month:02d}"
 
-    # 2. Fetch transactions for the month
+    # 2. Fetch logged transactions for the month
     tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
         'transaction_date', end_d).execute()
     txs = tx_res.data or []
@@ -180,7 +189,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     total_inflow = salary_amount + m_other_income
     total_expense = sum(float(t['amount']) for t in txs if t['type'] == 'EXPENSE')
 
-    # 3. Verification: Expense <= Overall Inflow (Salary + Other Income)
+    # 3. Verification: Expense <= Total Inflow
     if total_expense > total_inflow:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
