@@ -50,7 +50,7 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
 
         m_other_income = sum(
             float(t['amount']) for t in m_txs
-            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] in ['CREDITED', 'COMPLETED', 'SETTLED']
+            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
         )
         total_month_income = actual + m_other_income
         m_debit = sum(float(t['amount']) for t in m_txs if t['type'] in ['DEBIT', 'EXPENSE'])
@@ -171,7 +171,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
 
     m_other_income = sum(
         float(t['amount']) for t in txs
-        if t['type'] in ['INCOME', 'CREDIT'] and t['status'] in ['CREDITED', 'COMPLETED', 'SETTLED']
+        if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
     )
     total_inflow = salary_amount + m_other_income
     total_debits = sum(float(t['amount']) for t in txs if t['type'] in ['DEBIT', 'EXPENSE'])
@@ -193,7 +193,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             new_bal = curr_bal - settlement_debit_amount
             db.table('accounts').update({"balance": new_bal}).eq('account_id', target_acc).execute()
 
-        # 2. Make DEBIT entry in transactions table with status = 'SETTLED'
+        # 2. Make DEBIT entry in transactions table with status = 'DEBITED'
         db.table('transactions').insert({
             "user_id": uid,
             "account_id": target_acc,
@@ -202,7 +202,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             "category": "Salary Settlement",
             "amount": settlement_debit_amount,
             "transaction_date": str(date.today()),
-            "status": "SETTLED",
+            "status": "DEBITED",
             "description": f"Bulk Month Settlement Sweep - {calendar.month_name[m]} {yr}"
         }).execute()
 
@@ -215,7 +215,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             "description": f"Month closed and balance swept for {calendar.month_name[m]} {yr} (Deducted: ₹{settlement_debit_amount:,.2f})."
         }).execute()
 
-    # 4. Update salary status to SETTLED
+    # 4. Update salary contract status to SETTLED
     db.table('salaries').update({
         "status": "SETTLED",
         "account_id": target_acc
