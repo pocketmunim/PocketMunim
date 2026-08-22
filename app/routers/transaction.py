@@ -14,39 +14,45 @@ router = APIRouter(prefix="/api/v1/transactions", tags=["Daily Ledger Engine"])
 async def create_transaction(payload: CreateTransactionRequest, db: Client = Depends(get_db)):
     uid = str(payload.user_id)
     tx_amount = round(float(payload.amount), 2)
-    tx_date = str(payload.transaction_date or date.today())
     tx_type = payload.type.value
+    today = date.today()
+    tx_date = payload.transaction_date or today
 
-    # 1. Resolve Account (Specific Account or fallback to Default Account)
+    # 1. Reject Future Transactions
+    if tx_date > today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Future transactions cannot be logged directly. Selected date ({tx_date}) is in the future."
+        )
+
+    # 2. Resolve Target Account Vault
     if payload.account_id:
         acc_res = db.table('accounts').select('*').eq('account_id', str(payload.account_id)).eq('user_id', uid).eq('is_active', True).execute()
     else:
         acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_default', True).eq('is_active', True).execute()
         if not acc_res.data:
-            # Fallback to any active account if default is somehow missing
             acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).limit(1).execute()
 
     if not acc_res.data:
-        raise HTTPException(status_code=404, detail="No active liquidity vault available for this transaction.")
+        raise HTTPException(status_code=404, detail="No active account vault found. Please create an account first.")
 
     acc = acc_res.data[0]
     aid = acc['account_id']
     acc_name = acc['account_name']
     current_balance = float(acc['balance'])
 
-    # 2. Solvency Invariant Check on DEBIT
+    # 3. Solvency Invariant Guard
     if tx_type == "DEBIT" and current_balance < tx_amount:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient funds in {acc_name}. Available: ₹{current_balance:,.2f}, Required: ₹{tx_amount:,.2f}."
+            detail=f"Insufficient balance in {acc_name}. Available: ₹{current_balance:,.2f}, Required: ₹{tx_amount:,.2f}."
         )
 
-    # 3. Calculate New Balance
+    # 4. Atomic Execution Block
     new_balance = round(current_balance - tx_amount if tx_type == "DEBIT" else current_balance + tx_amount, 2)
     status_label = "DEBITED" if tx_type == "DEBIT" else "CREDITED"
 
-    # 4. Atomic Execution Block
-    # Update Account Balance
+    # Update Vault Balance
     db.table('accounts').update({"balance": new_balance}).eq('account_id', aid).execute()
 
     # Insert Transaction Entry
@@ -55,25 +61,25 @@ async def create_transaction(payload: CreateTransactionRequest, db: Client = Dep
         "account_id": aid,
         "account_name": acc_name,
         "type": tx_type,
-        "category": payload.category or "Miscellaneous",
+        "category": payload.category or ("Miscellaneous" if tx_type == "DEBIT" else "Other Income"),
         "amount": tx_amount,
-        "transaction_date": tx_date,
+        "transaction_date": str(tx_date),
         "status": status_label,
         "description": payload.item_name
     }).execute()
 
-    # Insert Audit Log
+    # Insert Immutable Audit Log
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": aid,
         "event_type": f"MANUAL_{tx_type}",
         "amount": -tx_amount if tx_type == "DEBIT" else tx_amount,
-        "description": f"Manual {tx_type.lower()} entry: {payload.item_name} via {acc_name}."
+        "description": f"Logged {tx_type.lower()}: '{payload.item_name}' on {acc_name} (New Balance: ₹{new_balance:,.2f})."
     }).execute()
 
     return {
         "status": "SUCCESS",
-        "message": f"Recorded ₹{tx_amount:,.2f} {tx_type.lower()} under {acc_name}.",
+        "message": f"Successfully logged ₹{tx_amount:,.2f} on {acc_name}.",
         "transaction": tx_insert.data[0] if tx_insert.data else None,
         "updated_account": {
             "account_id": aid,
