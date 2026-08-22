@@ -15,9 +15,8 @@ class SalaryService:
             year: int = None
     ) -> float:
         """
-        Seeds 12 months of salaries for the specified year.
-        ONLY creates transactions and account_logs for salaries paid till date.
-        Future months remain purely in the salaries table until the cron job triggers.
+        Seeds 12 months of salaries for the specified calendar year.
+        Uses calendar.monthrange to calculate exact month days dynamically.
         """
         if not year:
             year = date.today().year
@@ -26,11 +25,12 @@ class SalaryService:
         total_past_salaries_credited = 0.0
 
         for m in range(1, 13):
-            max_days = calendar.monthrange(year, m)[1]
-            day = min(salary_date, max_days)
+            # Dynamically compute exact days in this specific month/year (handles leap years 28/29, 30, 31)
+            _, days_in_month = calendar.monthrange(year, m)
+            day = min(salary_date, days_in_month)
             raw_payout_dt = date(year, m, day)
 
-            # Auto-shift if payout falls on Weekend or Bank Holiday
+            # Auto-shift if payout falls on Weekend or Gazetted Bank Holiday
             effective_payout_dt = await HolidayService.get_effective_payout_date(raw_payout_dt)
 
             is_past = effective_payout_dt <= today
@@ -55,7 +55,7 @@ class SalaryService:
                 sal_id = sal_res.data[0]['salary_id']
                 total_past_salaries_credited += salary_amount
 
-                # 2. Insert transaction ONLY for paid/past months
+                # 2. Insert transaction ONLY for realized/paid months
                 db.table('transactions').insert({
                     "user_id": user_id,
                     "account_id": account_id,
