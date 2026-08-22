@@ -22,7 +22,6 @@ class RegisterLoanRequest(BaseModel):
     annual_interest_rate: float = Field(default=0.0, ge=0.0, le=100.0)
     original_tenure_months: int = Field(..., gt=0, le=480)
     account_id: Optional[str] = None
-    settle_past_emis: bool = True  # Automatically catch-up historical EMIs up to today
 
     @field_validator('loan_name', 'counterparty')
     @classmethod
@@ -33,18 +32,7 @@ class PayEMIRequest(BaseModel):
     user_id: str
     loan_id: str
     account_id: Optional[str] = None
-    is_advance_confirmed: bool = False  # Set to true if paying extra/next month installment
-
-class LoanRepaymentItem(BaseModel):
-    repayment_id: str
-    installment_number: int
-    due_date: date
-    emi_amount: float
-    principal_component: float
-    interest_component: float
-    remaining_principal_after: float
-    status: str
-    paid_at: Optional[str] = None
+    is_advance_confirmed: bool = False
 
 class LoanSummaryItem(BaseModel):
     loan_id: str
@@ -67,6 +55,9 @@ class LoanSummaryItem(BaseModel):
     account_id: Optional[str] = None
     account_name: Optional[str] = "Default Vault"
     is_current_month_paid: bool = False
+    has_pending_past_emis: bool = False
+    pending_past_emis_count: int = 0
+    pending_past_emis_total: float = 0.0
 
 class LoanListResponse(BaseModel):
     status: str

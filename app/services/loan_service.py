@@ -7,10 +7,6 @@ from typing import List, Dict, Any, Tuple
 class LoanService:
     @staticmethod
     def calculate_reducing_emi(principal: float, annual_rate: float, tenure_months: int) -> float:
-        """
-        Calculates reducing-balance EMI.
-        Formula: EMI = P * r * (1+r)^n / ((1+r)^n - 1)
-        """
         if annual_rate <= 0:
             return round(principal / max(1, tenure_months), 2)
 
@@ -20,6 +16,15 @@ class LoanService:
         return round(emi, 2)
 
     @staticmethod
+    def calculate_default_first_emi_date(disbursement_date: date) -> date:
+        """
+        Defaults to the 5th of the following month after disbursement.
+        Example: 23 Jan 2026 -> 05 Feb 2026
+        """
+        next_month = disbursement_date + relativedelta(months=1)
+        return date(next_month.year, next_month.month, 5)
+
+    @staticmethod
     def generate_amortization_schedule(
             principal: float,
             annual_rate: float,
@@ -27,9 +32,6 @@ class LoanService:
             first_emi_date: date,
             monthly_emi: float
     ) -> List[Dict[str, Any]]:
-        """
-        Generates month-by-month amortization schedule with principal/interest breakdown.
-        """
         monthly_rate = (annual_rate / 100.0) / 12.0 if annual_rate > 0 else 0.0
         remaining = principal
         schedule = []
@@ -44,7 +46,6 @@ class LoanService:
                 interest_comp = 0.0
                 principal_comp = round(monthly_emi, 2)
 
-            # Cap last installment rounding delta
             if i == tenure_months or principal_comp > remaining:
                 principal_comp = round(remaining, 2)
                 remaining_after = 0.0
@@ -75,7 +76,7 @@ class LoanService:
             total_tenure: int
     ) -> Tuple[List[Dict[str, Any]], float, float, float, int, date, str]:
         """
-        Settles historical EMIs up to the current date and returns recalculated loan metrics.
+        Recalculates amortization ledger when past EMIs are settled at registration.
         """
         today = date.today()
         pending_principal = original_principal
@@ -97,7 +98,7 @@ class LoanService:
                 next_emi_date = due_d
 
         pending_tenure = max(0, total_tenure - settled_count)
-        loan_status = "CLOSED" if pending_principal <= 0 else "ACTIVE"
+        loan_status = "CLOSED" if pending_principal <= 0 or pending_tenure == 0 else "ACTIVE"
 
         return (
             schedule,

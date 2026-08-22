@@ -11,8 +11,15 @@ from app.services.loan_service import LoanService
 from supabase import Client
 from datetime import date
 from dateutil.relativedelta import relativedelta
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/v1/loans", tags=["Loan & Amortization Engine"])
+
+
+class SettlePastEMIsRequest(BaseModel):
+    user_id: str
+    loan_id: str
+    account_id: str = None
 
 
 @router.post(
@@ -45,7 +52,19 @@ async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
             else:
                 total_receivables += p_amt
 
-        # Check if current month's installment is already settled
+        # Check for pending past EMIs strictly before or on today
+        past_sched = db.table('loan_repayments') \
+            .select('repayment_id, emi_amount') \
+            .eq('loan_id', lid) \
+            .lte('due_date', str(today)) \
+            .eq('status', 'SCHEDULED') \
+            .execute()
+
+        has_pending_past_emis = len(past_sched.data or []) > 0
+        pending_past_emis_count = len(past_sched.data or [])
+        pending_past_emis_total = sum(float(x['emi_amount']) for x in (past_sched.data or []))
+
+        # Check if current month installment is paid
         start_of_month = f"{today.year:04d}-{today.month:02d}-01"
         end_of_month = (date(today.year, today.month, 1) + relativedelta(months=1, days=-1))
 
@@ -79,7 +98,10 @@ async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
             status=l['status'],
             account_id=l.get('account_id'),
             account_name=acc_map.get(l.get('account_id'), "Default Vault"),
-            is_current_month_paid=is_cur_paid
+            is_current_month_paid=is_cur_paid,
+            has_pending_past_emis=has_pending_past_emis,
+            pending_past_emis_count=pending_past_emis_count,
+            pending_past_emis_total=round(pending_past_emis_total, 2)
         ))
 
     return LoanListResponse(
@@ -99,8 +121,9 @@ async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
 async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_db)):
     uid = str(payload.user_id)
     sanitized_name = payload.loan_name.strip()
+    principal = round(float(payload.original_principal), 2)
 
-    # Deduplication Guard
+    # 1. Deduplication Guard
     existing = db.table('loans').select('loan_id').eq('user_id', uid).ilike('loan_name', sanitized_name).execute()
     if existing.data:
         raise HTTPException(
@@ -108,71 +131,62 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
             detail=f"A loan titled '{sanitized_name}' already exists. Please use a unique title."
         )
 
-    # Date Validation
-    if payload.first_emi_date < payload.disbursement_date:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="First EMI date cannot precede the disbursement date."
-        )
+    # 2. Resolve Vault Account for Disbursement
+    if payload.account_id:
+        acc_res = db.table('accounts').select('*').eq('account_id', str(payload.account_id)).eq('user_id', uid).eq(
+            'is_active', True).execute()
+    else:
+        acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_default', True).eq('is_active',
+                                                                                                True).execute()
+        if not acc_res.data:
+            acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).limit(1).execute()
 
-    # 1. Compute EMI
+    if not acc_res.data:
+        raise HTTPException(status_code=404, detail="No active account vault found for loan disbursement.")
+
+    acc = acc_res.data[0]
+    aid = acc['account_id']
+    acc_name = acc['account_name']
+    curr_balance = float(acc['balance'])
+
+    # 3. Calculate EMI & Amortization Plan
     monthly_emi = LoanService.calculate_reducing_emi(
-        payload.original_principal,
+        principal,
         payload.annual_interest_rate,
         payload.original_tenure_months
     )
 
-    # 2. Generate Base Amortization Schedule
-    raw_schedule = LoanService.generate_amortization_schedule(
-        payload.original_principal,
+    schedule = LoanService.generate_amortization_schedule(
+        principal,
         payload.annual_interest_rate,
         payload.original_tenure_months,
         payload.first_emi_date,
         monthly_emi
     )
 
-    total_repayment = sum(item['emi_amount'] for item in raw_schedule)
-    total_interest = round(total_repayment - payload.original_principal, 2)
+    total_repayment = sum(item['emi_amount'] for item in schedule)
+    total_interest = round(total_repayment - principal, 2)
 
-    # 3. Process Inception Catch-Up via LoanService
-    (
-        schedule,
-        pending_principal,
-        principal_paid,
-        interest_paid,
-        pending_tenure,
-        next_emi_date,
-        loan_status
-    ) = LoanService.process_inception_settlement(
-        raw_schedule,
-        payload.settle_past_emis,
-        payload.first_emi_date,
-        payload.original_principal,
-        payload.original_tenure_months
-    )
-
-    settled_count = payload.original_tenure_months - pending_tenure
-
-    # 4. Save Master Loan Contract
+    # 4. Insert Master Loan Contract
     loan_insert = db.table('loans').insert({
         "user_id": uid,
-        "account_id": payload.account_id,
+        "account_id": aid,
         "loan_name": sanitized_name,
         "loan_type": payload.loan_type.value,
         "counterparty": payload.counterparty.strip(),
         "disbursement_date": str(payload.disbursement_date),
         "first_emi_date": str(payload.first_emi_date),
-        "original_principal": payload.original_principal,
-        "pending_principal": pending_principal,
+        "original_principal": principal,
+        "pending_principal": principal,
         "annual_interest_rate": payload.annual_interest_rate,
         "original_tenure_months": payload.original_tenure_months,
-        "pending_tenure_months": pending_tenure,
+        "pending_tenure_months": payload.original_tenure_months,
         "monthly_emi": monthly_emi,
         "total_interest_payable": total_interest,
-        "principal_paid": principal_paid,
-        "interest_paid": interest_paid,
-        "next_emi_date": str(next_emi_date),
-        "status": loan_status
+        "principal_paid": 0.0,
+        "interest_paid": 0.0,
+        "next_emi_date": str(payload.first_emi_date),
+        "status": "ACTIVE"
     }).execute()
 
     if not loan_insert.data:
@@ -180,21 +194,166 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
 
     new_loan_id = loan_insert.data[0]['loan_id']
 
-    # 5. Save Amortization Installments
+    # 5. Insert Full Amortization Schedule
     for inst in schedule:
         inst['loan_id'] = new_loan_id
         inst['user_id'] = uid
-        inst['account_id'] = payload.account_id
+        inst['account_id'] = aid
 
     db.table('loan_repayments').insert(schedule).execute()
 
+    # 6. Apply Disbursement Inflow to Account & Ledger
+    # If BORROWED, money flows into account (CREDIT)
+    # If LENT, money flows out of account (DEBIT)
+    tx_type = "CREDIT" if payload.loan_type.value == "BORROWED" else "DEBIT"
+    status_label = "CREDITED" if tx_type == "CREDIT" else "DEBITED"
+    new_bal = round(curr_balance + principal if tx_type == "CREDIT" else curr_balance - principal, 2)
+
+    db.table('accounts').update({"balance": new_bal}).eq('account_id', aid).execute()
+
+    db.table('transactions').insert({
+        "user_id": uid,
+        "account_id": aid,
+        "account_name": acc_name,
+        "type": tx_type,
+        "category": "Debt & EMI",
+        "amount": principal,
+        "transaction_date": str(payload.disbursement_date),
+        "status": status_label,
+        "description": f"Loan Disbursement: {sanitized_name} ({payload.counterparty})"
+    }).execute()
+
+    db.table('account_logs').insert({
+        "user_id": uid,
+        "account_id": aid,
+        "event_type": f"LOAN_DISBURSEMENT_{tx_type}",
+        "amount": principal if tx_type == "CREDIT" else -principal,
+        "description": f"Loan disbursement processed for '{sanitized_name}' via {acc_name}."
+    }).execute()
+
     return {
         "status": "SUCCESS",
-        "message": f"Loan '{sanitized_name}' registered. {settled_count} past installments settled.",
+        "message": f"Loan '{sanitized_name}' registered. Disbursed ₹{principal:,.2f} recorded in {acc_name}.",
         "loan_id": new_loan_id,
-        "monthly_emi": monthly_emi,
-        "pending_principal": pending_principal,
-        "next_emi_date": str(next_emi_date)
+        "monthly_emi": monthly_emi
+    }
+
+
+@router.post(
+    "/settle-past-emis",
+    dependencies=[Depends(verify_zero_trust_signature)]
+)
+async def settle_past_emis(payload: SettlePastEMIsRequest, db: Client = Depends(get_db)):
+    uid = str(payload.user_id)
+    lid = str(payload.loan_id)
+    today = date.today()
+
+    loan_res = db.table('loans').select('*').eq('loan_id', lid).eq('user_id', uid).execute()
+    if not loan_res.data:
+        raise HTTPException(status_code=404, detail="Loan not found.")
+    loan = loan_res.data[0]
+
+    # Fetch all past scheduled EMIs <= today
+    past_emis_res = db.table('loan_repayments') \
+        .select('*') \
+        .eq('loan_id', lid) \
+        .lte('due_date', str(today)) \
+        .eq('status', 'SCHEDULED') \
+        .order('installment_number') \
+        .execute()
+
+    past_emis = past_emis_res.data or []
+    if not past_emis:
+        return {"status": "SUCCESS", "message": "No pending past EMIs found for this loan."}
+
+    total_settle_amount = sum(float(x['emi_amount']) for x in past_emis)
+    total_principal_component = sum(float(x['principal_component']) for x in past_emis)
+    total_interest_component = sum(float(x['interest_component']) for x in past_emis)
+    last_past_emi = past_emis[-1]
+
+    # Resolve account for batch debit
+    target_aid = payload.account_id or loan.get('account_id')
+    acc_res = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).execute()
+    if not acc_res.data:
+        raise HTTPException(status_code=404, detail="Disbursement account not found.")
+    acc = acc_res.data[0]
+    aid = acc['account_id']
+    acc_name = acc['account_name']
+    curr_bal = float(acc['balance'])
+    loan_type = loan['loan_type']
+
+    if loan_type == 'BORROWED' and curr_bal < total_settle_amount:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient balance in {acc_name} to settle {len(past_emis)} past EMIs. Required: ₹{total_settle_amount:,.2f}, Available: ₹{curr_bal:,.2f}."
+        )
+
+    # 1. Update account balance
+    new_bal = round(curr_bal - total_settle_amount if loan_type == 'BORROWED' else curr_bal + total_settle_amount, 2)
+    tx_type = "DEBIT" if loan_type == 'BORROWED' else "CREDIT"
+    db.table('accounts').update({"balance": new_bal}).eq('account_id', aid).execute()
+
+    # 2. Mark past repayment rows as PAID
+    for item in past_emis:
+        db.table('loan_repayments').update({
+            "status": "PAID",
+            "paid_at": str(today),
+            "account_id": aid
+        }).eq('repayment_id', item['repayment_id']).execute()
+
+    # 3. Insert transaction log
+    db.table('transactions').insert({
+        "user_id": uid,
+        "account_id": aid,
+        "account_name": acc_name,
+        "type": tx_type,
+        "category": "Debt & EMI",
+        "amount": round(total_settle_amount, 2),
+        "transaction_date": str(today),
+        "status": "DEBITED" if tx_type == "DEBIT" else "CREDITED",
+        "description": f"Batch Settlement ({len(past_emis)} Past EMIs) - {loan['loan_name']}"
+    }).execute()
+
+    # 4. Insert account log
+    db.table('account_logs').insert({
+        "user_id": uid,
+        "account_id": aid,
+        "event_type": "PAST_EMIS_BATCH_SETTLEMENT",
+        "amount": -total_settle_amount if tx_type == "DEBIT" else total_settle_amount,
+        "description": f"Settled {len(past_emis)} historical EMIs for '{loan['loan_name']}'."
+    }).execute()
+
+    # 5. Update loan aggregates
+    new_pending_p = round(float(last_past_emi['remaining_principal_after']), 2)
+    new_pending_t = max(0, int(loan['pending_tenure_months']) - len(past_emis))
+    new_p_paid = round(float(loan['principal_paid']) + total_principal_component, 2)
+    new_i_paid = round(float(loan['interest_paid']) + total_interest_component, 2)
+    new_status = "CLOSED" if new_pending_p <= 0 or new_pending_t == 0 else "ACTIVE"
+
+    next_sched = db.table('loan_repayments') \
+        .select('due_date') \
+        .eq('loan_id', lid) \
+        .eq('status', 'SCHEDULED') \
+        .order('installment_number') \
+        .limit(1) \
+        .execute()
+    next_date = next_sched.data[0]['due_date'] if next_sched.data else str(today)
+
+    db.table('loans').update({
+        "pending_principal": new_pending_p,
+        "pending_tenure_months": new_pending_t,
+        "principal_paid": new_p_paid,
+        "interest_paid": new_i_paid,
+        "next_emi_date": next_date,
+        "status": new_status
+    }).eq('loan_id', lid).execute()
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Successfully settled {len(past_emis)} past EMIs (₹{total_settle_amount:,.2f}) for {loan['loan_name']}.",
+        "settled_count": len(past_emis),
+        "total_amount_debited": total_settle_amount,
+        "new_pending_principal": new_pending_p
     }
 
 
@@ -206,16 +365,14 @@ async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
     uid = str(payload.user_id)
     lid = str(payload.loan_id)
 
-    # 1. Fetch Loan Details
     loan_res = db.table('loans').select('*').eq('loan_id', lid).eq('user_id', uid).execute()
     if not loan_res.data:
         raise HTTPException(status_code=404, detail="Loan contract not found.")
     loan = loan_res.data[0]
 
     if loan['status'] != 'ACTIVE':
-        raise HTTPException(status_code=400, detail="This loan is already fully settled and CLOSED.")
+        raise HTTPException(status_code=400, detail="This loan is already CLOSED.")
 
-    # 2. Find earliest SCHEDULED installment
     sched_res = db.table('loan_repayments') \
         .select('*') \
         .eq('loan_id', lid) \
@@ -234,7 +391,6 @@ async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
     due_date = date.fromisoformat(next_installment['due_date'])
     today = date.today()
 
-    # 3. Duplicate Month / Advance Confirmation Guard
     start_of_month = f"{today.year:04d}-{today.month:02d}-01"
     end_of_month = (date(today.year, today.month, 1) + relativedelta(months=1, days=-1))
 
@@ -252,17 +408,8 @@ async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
             detail=f"DUPLICATE_CURRENT_MONTH: Installment for {today.strftime('%B %Y')} has ALREADY been paid. Are you sure you want to pay in advance for Installment #{inst_num} (Due: {due_date})?"
         )
 
-    # 4. Resolve Target Vault Account
     target_aid = payload.account_id or loan.get('account_id')
-    if target_aid:
-        acc_res = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).eq('is_active',
-                                                                                                      True).execute()
-    else:
-        acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_default', True).eq('is_active',
-                                                                                                True).execute()
-        if not acc_res.data:
-            acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).limit(1).execute()
-
+    acc_res = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).execute()
     if not acc_res.data:
         raise HTTPException(status_code=404, detail="No active liquidity vault available for EMI deduction.")
 
@@ -272,14 +419,12 @@ async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
     curr_balance = float(acc['balance'])
     loan_type = loan['loan_type']
 
-    # 5. Solvency Guard
     if loan_type == 'BORROWED' and curr_balance < emi_amount:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Insufficient balance in {acc_name}. Available: ₹{curr_balance:,.2f}, Required EMI: ₹{emi_amount:,.2f}."
         )
 
-    # 6. Execute Mutations
     new_balance = round(curr_balance - emi_amount if loan_type == 'BORROWED' else curr_balance + emi_amount, 2)
     tx_type = "DEBIT" if loan_type == 'BORROWED' else "CREDIT"
     status_label = "DEBITED" if loan_type == 'BORROWED' else "CREDITED"
@@ -338,7 +483,7 @@ async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
 
     return {
         "status": "SUCCESS",
-        "message": f"Installment #{inst_num} of ₹{emi_amount:,.2f} successfully settled from {acc_name}.",
+        "message": f"Installment #{inst_num} of ₹{emi_amount:,.2f} settled from {acc_name}.",
         "new_pending_principal": new_pending_principal,
         "new_pending_tenure": new_pending_tenure,
         "loan_status": loan_status,
