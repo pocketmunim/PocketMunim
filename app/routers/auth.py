@@ -27,21 +27,19 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
                 detail="Security Clearance: Node identity already provisioned in vault."
             )
 
-        # 1. Insert user
+        # 1. Insert user (NO salary columns)
         user_insert = {
             "user_id": uid_str,
             "telegram_id": uid_str,
             "full_name": payload.full_name,
             "currency": payload.currency or "INR",
-            "salary_amount": float(payload.salary),
-            "salary_date": int(payload.salary_date),
             "security_strikes": 0,
             "role": "user",
             "is_active": True
         }
         db.table('users').insert(user_insert).execute()
 
-        # 2. Insert primary bank account
+        # 2. Insert primary bank account with initial opening balance
         acc_insert = {
             "user_id": uid_str,
             "account_name": payload.bank_name.upper(),
@@ -60,7 +58,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "description": f"Initial liquidity provisioned for {payload.bank_name.upper()}."
         }).execute()
 
-        # 4. Dynamically seed 12 months with bank holiday & weekend preceding shifts
+        # 4. Seed annual salaries, record past transactions, credit balance, and write account_logs
         current_year = date.today().year
         await SalaryService.seed_annual_salaries(
             db=db,
@@ -75,7 +73,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             status="PROVISIONED",
             code=201,
             user_id=payload.user_id,
-            message="Node successfully linked to Ishita Financial Intelligence System."
+            message="Node successfully provisioned. Historical salaries and ledger accounts initialized."
         )
 
     except HTTPException:
