@@ -5,8 +5,14 @@ import calendar
 
 class SalaryService:
     @staticmethod
-    def seed_annual_salaries(db: Client, user_id: str, account_id: str, salary_amount: float, salary_date: int,
-                             year: int = None):
+    def seed_annual_salaries(
+            db: Client,
+            user_id: str,
+            account_id: str,
+            salary_amount: float,
+            salary_date: int,
+            year: int = None
+    ):
         if not year:
             year = date.today().year
 
@@ -22,7 +28,7 @@ class SalaryService:
             tx_status = "CREDITED" if is_past else "SCHEDULED"
             paid_timestamp = f"{payout_dt}T00:00:00Z" if is_past else None
 
-            # 1. Upsert salary row
+            # 1. Upsert salary month row
             sal_res = db.table('salaries').upsert({
                 "user_id": user_id,
                 "account_id": account_id,
@@ -38,7 +44,7 @@ class SalaryService:
 
             if sal_res.data:
                 sal_id = sal_res.data[0]['salary_id']
-                # 2. Upsert corresponding transaction
+                # 2. Insert corresponding transaction
                 db.table('transactions').insert({
                     "user_id": user_id,
                     "account_id": account_id,
@@ -48,5 +54,5 @@ class SalaryService:
                     "amount": salary_amount,
                     "transaction_date": str(payout_dt),
                     "status": tx_status,
-                    "description": f"Automated Salary Credit - {calendar.month_name[m]} {year}"
+                    "description": f"Automated Salary Allocation - {calendar.month_name[m]} {year}"
                 }).execute()

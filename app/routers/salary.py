@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Header
+from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas.salary import SalaryMatrixResponse, SalaryOverrideRequest, SettleSalaryRequest, SalaryMonthItem
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
@@ -8,17 +8,17 @@ import calendar
 
 router = APIRouter(prefix="/api/v1/salary", tags=["Salary & Dispersal Engine"])
 
-@router.get(
+@router.post(
     "/matrix/{user_id}/{year}",
     response_model=SalaryMatrixResponse,
     dependencies=[Depends(verify_zero_trust_signature)]
 )
 async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db)):
-    # 1. Fetch salaries for the year
+    # 1. Fetch salaries for specified year
     sal_res = db.table('salaries').select('*').eq('user_id', user_id).eq('year', year).order('month').execute()
     salaries = sal_res.data or []
 
-    # 2. Fetch all transactions for this user & year for financial telemetry
+    # 2. Fetch all transactions for telemetry calculations
     start_dt = f"{year}-01-01"
     end_dt = f"{year}-12-31"
     tx_res = db.table('transactions').select('*').eq('user_id', user_id).gte('transaction_date', start_dt).lte('transaction_date', end_dt).execute()
@@ -40,14 +40,12 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
         else:
             scheduled_total += actual
 
-        # Compute Month's Incomes & Expenses
+        # Compute Month Incomes and Expenses
         m_txs = [t for t in txs if int(t['transaction_date'].split('-')[1]) == m]
         m_income = sum(float(t['amount']) for t in m_txs if t['type'] in ['INCOME', 'SALARY'] and t['status'] == 'CREDITED')
         m_expense = sum(float(t['amount']) for t in m_txs if t['type'] == 'EXPENSE')
         net_margin = m_income - m_expense
 
-        # Past Unsettled Settlement Logic:
-        # If past month, salary was uncredited or scheduled, but Net Margin >= 0
         payout_d = date.fromisoformat(s['payout_date'])
         can_settle = (s['status'] == 'SCHEDULED') and (payout_d < date.today()) and (net_margin >= 0)
 
@@ -81,10 +79,9 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
 )
 async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(get_db)):
     uid = str(payload.user_id)
-    # Check if record exists
     sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', payload.year).eq('month', payload.month).execute()
     if not sal_res.data:
-        raise HTTPException(status_code=404, detail="Salary entry not found for this cycle.")
+        raise HTTPException(status_code=404, detail="Salary entry not found for specified cycle.")
 
     sal = sal_res.data[0]
     old_actual = float(sal['actual_amount'])
@@ -97,17 +94,15 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
         "is_custom_override": True
     }).eq('salary_id', sal['salary_id']).execute()
 
-    # If salary was already PAID/SETTLED, adjust account balance differential
+    # Differential balance adjustment for settled/paid months
     if old_status in ['PAID', 'SETTLED'] and sal.get('account_id'):
         diff = payload.new_amount - old_actual
         if diff != 0:
             acc_res = db.table('accounts').select('balance').eq('account_id', sal['account_id']).execute()
             if acc_res.data:
                 curr_bal = float(acc_res.data[0]['balance'])
-                new_bal = curr_bal + diff
-                db.table('accounts').update({"balance": new_bal}).eq('account_id', sal['account_id']).execute()
+                db.table('accounts').update({"balance": curr_bal + diff}).eq('account_id', sal['account_id']).execute()
 
-                # Audit Log
                 db.table('account_logs').insert({
                     "user_id": uid,
                     "account_id": sal['account_id'],
@@ -116,7 +111,7 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
                     "description": f"Differential adjustment for {calendar.month_name[payload.month]} {payload.year} salary."
                 }).execute()
 
-    # Update associated transaction record
+    # Sync transaction record
     db.table('transactions').update({
         "amount": payload.new_amount,
         "transaction_date": str(payload.new_payout_date)
@@ -134,13 +129,12 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
 
     sal_res = db.table('salaries').select('*').eq('salary_id', sid).eq('user_id', uid).execute()
     if not sal_res.data:
-        raise HTTPException(status_code=404, detail="Salary entry not found.")
+        raise HTTPException(status_code=404, detail="Salary record not found.")
 
     sal = sal_res.data[0]
     yr = sal['year']
     m = sal['month']
 
-    # Verify Expenses vs Incomes for that month
     start_d = f"{yr}-{m:02d}-01"
     end_d = f"{yr}-{m:02d}-{calendar.monthrange(yr, m)[1]:02d}"
 
@@ -156,30 +150,25 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             detail=f"Settlement Blocked: Total monthly expenses (₹{m_expense:,.2f}) exceeded earnings (₹{m_income:,.2f})."
         )
 
-    # Proceed with settlement
     target_acc = str(payload.target_account_id) if payload.target_account_id else sal.get('account_id')
     amount_to_credit = float(sal['actual_amount'])
 
-    # Credit vault
     acc_res = db.table('accounts').select('balance').eq('account_id', target_acc).execute()
     if acc_res.data:
         curr_bal = float(acc_res.data[0]['balance'])
         db.table('accounts').update({"balance": curr_bal + amount_to_credit}).eq('account_id', target_acc).execute()
 
-    # Update salary status
     db.table('salaries').update({
         "status": "SETTLED",
         "paid_at": "now()",
         "account_id": target_acc
     }).eq('salary_id', sid).execute()
 
-    # Update transaction status
     db.table('transactions').update({
         "status": "CREDITED",
         "account_id": target_acc
     }).eq('salary_id', sid).execute()
 
-    # Audit log
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": target_acc,

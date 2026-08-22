@@ -11,13 +11,12 @@ async def process_daily_salary_disbursals(
     x_qstash_token: str = Header(None),
     db: Client = Depends(get_db)
 ):
-    # Verify QStash token or master pepper
     if x_qstash_token != settings.QSTASH_TOKEN and x_qstash_token != settings.MASTER_PEPPER:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized Cron Source")
 
     today_str = str(date.today())
 
-    # 1. Fetch all salaries scheduled on or before today that are still 'SCHEDULED'
+    # Fetch scheduled disbursals due on or before today
     pending_res = db.table('salaries').select('*').eq('status', 'SCHEDULED').lte('payout_date', today_str).execute()
     pending = pending_res.data or []
 
@@ -31,17 +30,14 @@ async def process_daily_salary_disbursals(
         amt = float(s['actual_amount'])
 
         if acc_id:
-            # Credit account balance
             acc_res = db.table('accounts').select('balance').eq('account_id', acc_id).execute()
             if acc_res.data:
                 curr_bal = float(acc_res.data[0]['balance'])
                 db.table('accounts').update({"balance": curr_bal + amt}).eq('account_id', acc_id).execute()
 
-        # Update salary & transaction status
         db.table('salaries').update({"status": "PAID", "paid_at": "now()"}).eq('salary_id', sid).execute()
         db.table('transactions').update({"status": "CREDITED"}).eq('salary_id', sid).execute()
 
-        # Insert audit log
         if acc_id:
             db.table('account_logs').insert({
                 "user_id": uid,

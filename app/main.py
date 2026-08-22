@@ -22,4 +22,8 @@ app.include_router(cron.router)
 
 @app.get("/")
 def health():
-    return {"status": "ONLINE", "protocol": "IFIS-ZERO-TRUST-V2"}
+    return {
+        "status": "ONLINE",
+        "system": "Ishita Financial Intelligence System",
+        "protocol": "IFIS-ZERO-TRUST-V2"
+    }
