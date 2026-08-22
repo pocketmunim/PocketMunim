@@ -31,31 +31,40 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     total_liquidity = sum(float(a['balance']) for a in accounts)
     default_acc = next((a for a in accounts if a['is_default']), accounts[0] if accounts else None)
 
-    # 3. Current month salary status
+    # 3. Fetch current month salary status
     sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', current_year).eq('month',
                                                                                               current_month).execute()
     current_salary = sal_res.data[0] if sal_res.data else None
 
-    # 4. Fetch month transactions
+    # 4. Fetch transactions for month metrics & recent 5 ledger events
     start_d = f"{current_year:04d}-{current_month:02d}-01"
     _, last_day = calendar.monthrange(current_year, current_month)
     end_d = f"{current_year:04d}-{current_month:02d}-{last_day:02d}"
 
-    tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
-        'transaction_date', end_d).order('created_at', desc=True).limit(8).execute()
+    # Recent activity feed strictly capped at the last 5 transactions
+    tx_res = db.table('transactions') \
+        .select('*') \
+        .eq('user_id', uid) \
+        .order('created_at', desc=True) \
+        .limit(5) \
+        .execute()
     recent_txs = tx_res.data or []
 
-    all_tx_month = db.table('transactions').select('amount, type, status, category').eq('user_id', uid).gte(
-        'transaction_date', start_d).lte('transaction_date', end_d).execute().data or []
+    # Monthly calculation metrics for income & spend
+    all_tx_month = db.table('transactions') \
+                       .select('amount, type, status, category') \
+                       .eq('user_id', uid) \
+                       .gte('transaction_date', start_d) \
+                       .lte('transaction_date', end_d) \
+                       .execute().data or []
 
-    # Internal self transfers are excluded from monthly expense and income run-rates
     month_spent = sum(
         float(t['amount']) for t in all_tx_month
-        if t['type'] in ['DEBIT', 'EXPENSE'] and t['category'] != 'Self Transfer'
+        if t['type'] in ['DEBIT', 'EXPENSE'] and t['category'] != 'Vault Transfer'
     )
     month_income = sum(
         float(t['amount']) for t in all_tx_month
-        if t['type'] in ['CREDIT', 'SALARY', 'INCOME'] and t['category'] != 'Self Transfer'
+        if t['type'] in ['CREDIT', 'SALARY', 'INCOME'] and t['category'] != 'Vault Transfer'
     )
 
     return {
