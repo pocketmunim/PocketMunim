@@ -50,16 +50,16 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
 
         m_other_income = sum(
             float(t['amount']) for t in m_txs
-            if t['type'] in ['INCOME'] and t['status'] == 'CREDITED'
+            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
         )
         total_month_income = actual + m_other_income
-        m_expense = sum(float(t['amount']) for t in m_txs if t['type'] == 'EXPENSE')
-        net_margin = total_month_income - m_expense
+        m_debit = sum(float(t['amount']) for t in m_txs if t['type'] in ['DEBIT', 'EXPENSE'])
+        net_margin = total_month_income - m_debit
 
         payout_d = date.fromisoformat(s['payout_date'])
 
-        # Settle Eligibility: Must be PAID in a past month, and expenses <= total income
-        can_settle = (current_status == 'PAID') and (payout_d < today) and (m_expense <= total_month_income)
+        # Settle Eligibility: Must be PAID in a past month, and total debits <= total income
+        can_settle = (current_status == 'PAID') and (payout_d < today) and (m_debit <= total_month_income)
 
         month_items.append(SalaryMonthItem(
             salary_id=s['salary_id'],
@@ -71,7 +71,7 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
             status=current_status,
             is_custom_override=s.get('is_custom_override', False),
             total_income=total_month_income,
-            total_expense=m_expense,
+            total_expense=m_debit,
             net_margin=net_margin,
             can_settle=can_settle
         ))
@@ -172,19 +172,19 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
 
     m_other_income = sum(
         float(t['amount']) for t in txs
-        if t['type'] in ['INCOME'] and t['status'] == 'CREDITED'
+        if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
     )
     total_inflow = salary_amount + m_other_income
-    total_expense = sum(float(t['amount']) for t in txs if t['type'] == 'EXPENSE')
+    total_debits = sum(float(t['amount']) for t in txs if t['type'] in ['DEBIT', 'EXPENSE'])
 
-    if total_expense > total_inflow:
+    if total_debits > total_inflow:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Settlement Blocked: Total expenses (₹{total_expense:,.2f}) exceed total incoming funds (₹{total_inflow:,.2f})."
+            detail=f"Settlement Blocked: Total debits (₹{total_debits:,.2f}) exceed total incoming funds (₹{total_inflow:,.2f})."
         )
 
     # Net settlement amount to deduct/debit
-    settlement_debit_amount = total_inflow - total_expense
+    settlement_debit_amount = total_inflow - total_debits
     target_acc = str(payload.target_account_id) if payload.target_account_id else sal.get('account_id')
 
     # 1. Deduct amount from accounts balance
@@ -195,12 +195,12 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
             new_bal = curr_bal - settlement_debit_amount
             db.table('accounts').update({"balance": new_bal}).eq('account_id', target_acc).execute()
 
-        # 2. Make DEBIT/EXPENSE entry in transactions table
+        # 2. Make DEBIT entry in transactions table (Type strictly = DEBIT)
         db.table('transactions').insert({
             "user_id": uid,
             "account_id": target_acc,
             "salary_id": sid,
-            "type": "EXPENSE",
+            "type": "DEBIT",
             "category": "Salary Settlement",
             "amount": settlement_debit_amount,
             "transaction_date": str(date.today()),
