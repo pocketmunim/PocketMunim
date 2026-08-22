@@ -5,8 +5,54 @@ from app.core.security import verify_zero_trust_signature
 from app.services.salary_service import SalaryService
 from supabase import Client
 from datetime import date
+from pydantic import BaseModel
+from uuid import UUID
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Identity & Provisioning"])
+
+
+class NodeStatusRequest(BaseModel):
+    user_id: UUID
+
+
+class NodeStatusResponse(BaseModel):
+    status: str
+    is_registered: bool
+    full_name: str = ""
+    currency: str = "INR"
+
+
+@router.post(
+    "/status",
+    response_model=NodeStatusResponse,
+    dependencies=[Depends(verify_zero_trust_signature)]
+)
+async def check_node_clearance(payload: NodeStatusRequest, db: Client = Depends(get_db)):
+    uid_str = str(payload.user_id)
+    try:
+        user_res = db.table('users').select('user_id, full_name, currency, is_active').eq('user_id', uid_str).execute()
+
+        if user_res.data and len(user_res.data) > 0:
+            user = user_res.data[0]
+            return NodeStatusResponse(
+                status="PROVISIONED",
+                is_registered=True,
+                full_name=user.get("full_name", ""),
+                currency=user.get("currency", "INR")
+            )
+
+        return NodeStatusResponse(
+            status="UNREGISTERED",
+            is_registered=False,
+            full_name="",
+            currency="INR"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Vault Identity Verification Fault: {str(e)}"
+        )
+
 
 @router.post(
     "/register",
@@ -27,7 +73,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
                 detail="Security Clearance: Node identity already provisioned in vault."
             )
 
-        # 1. Insert user (NO salary columns)
+        # 1. Insert user
         user_insert = {
             "user_id": uid_str,
             "telegram_id": uid_str,
@@ -39,7 +85,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
         }
         db.table('users').insert(user_insert).execute()
 
-        # 2. Insert primary bank account with initial opening balance
+        # 2. Insert primary bank account
         acc_insert = {
             "user_id": uid_str,
             "account_name": payload.bank_name.upper(),
@@ -58,7 +104,7 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "description": f"Initial liquidity provisioned for {payload.bank_name.upper()}."
         }).execute()
 
-        # 4. Seed annual salaries, record past transactions, credit balance, and write account_logs
+        # 4. Dynamically seed 12 months with holiday & weekend shifting
         current_year = date.today().year
         await SalaryService.seed_annual_salaries(
             db=db,
