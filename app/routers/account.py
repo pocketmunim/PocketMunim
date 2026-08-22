@@ -113,79 +113,91 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
     uid = str(payload.user_id)
     src_id = str(payload.source_account_id)
     dest_id = str(payload.destination_account_id)
-    transfer_amount = float(payload.amount)
+    transfer_amount = round(float(payload.amount), 2)
 
-    # 1. Validation Checks
+    # 1. Invariant Validation
     if src_id == dest_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Source and destination accounts must be distinct vaults."
         )
 
-    # Fetch Source Account
+    if transfer_amount <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Transfer amount must be strictly greater than ₹0.00."
+        )
+
+    # 2. Vault Verification
     src_res = db.table('accounts').select('*').eq('account_id', src_id).eq('user_id', uid).eq('is_active',
                                                                                               True).execute()
     if not src_res.data:
         raise HTTPException(status_code=404, detail="Source vault not found or inactive.")
     src_acc = src_res.data[0]
+    src_name = src_acc['account_name']
     src_bal = float(src_acc['balance'])
 
-    # Fetch Destination Account
     dest_res = db.table('accounts').select('*').eq('account_id', dest_id).eq('user_id', uid).eq('is_active',
                                                                                                 True).execute()
     if not dest_res.data:
         raise HTTPException(status_code=404, detail="Destination vault not found or inactive.")
     dest_acc = dest_res.data[0]
+    dest_name = dest_acc['account_name']
     dest_bal = float(dest_acc['balance'])
 
-    # 2. Solvency / Liquidity Invariant Check
+    # 3. Solvency Check
     if src_bal < transfer_amount:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient funds in {src_acc['account_name']}. Available: ₹{src_bal:,.2f}, Requested: ₹{transfer_amount:,.2f}."
+            detail=f"Insufficient funds in {src_name}. Available: ₹{src_bal:,.2f}, Requested: ₹{transfer_amount:,.2f}."
         )
 
-    # 3. Double-Entry Balance Execution
-    new_src_bal = src_bal - transfer_amount
-    new_dest_bal = dest_bal + transfer_amount
+    # 4. Atomic Balance Execution
+    new_src_bal = round(src_bal - transfer_amount, 2)
+    new_dest_bal = round(dest_bal + transfer_amount, 2)
+    today_str = str(date.today())
 
     db.table('accounts').update({"balance": new_src_bal}).eq('account_id', src_id).execute()
     db.table('accounts').update({"balance": new_dest_bal}).eq('account_id', dest_id).execute()
 
-    today_str = str(date.today())
-
-    # 4. Paired Transaction Ledger Entries
-    # Source Outflow Entry
+    # 5. Descriptive Double-Entry Transactions
+    # Leg A: Source Account Outflow (DEBIT)
     db.table('transactions').insert({
         "user_id": uid,
         "account_id": src_id,
+        "account_name": src_name,
+        "related_account_id": dest_id,
+        "related_account_name": dest_name,
         "type": "DEBIT",
         "category": "Vault Transfer",
         "amount": transfer_amount,
         "transaction_date": today_str,
         "status": "DEBITED",
-        "description": f"Transfer Out to {dest_acc['account_name']}"
+        "description": f"Self Transfer: Debited from {src_name} → Transferred to {dest_name}"
     }).execute()
 
-    # Destination Inflow Entry
+    # Leg B: Destination Account Inflow (CREDIT)
     db.table('transactions').insert({
         "user_id": uid,
         "account_id": dest_id,
+        "account_name": dest_name,
+        "related_account_id": src_id,
+        "related_account_name": src_name,
         "type": "CREDIT",
         "category": "Vault Transfer",
         "amount": transfer_amount,
         "transaction_date": today_str,
         "status": "CREDITED",
-        "description": f"Transfer In from {src_acc['account_name']}"
+        "description": f"Self Transfer: Credited to {dest_name} ← Received from {src_name}"
     }).execute()
 
-    # 5. Dual Audit Logs
+    # 6. Immutable Audit Logs
     db.table('account_logs').insert({
         "user_id": uid,
         "account_id": src_id,
         "event_type": "VAULT_TRANSFER_OUT",
         "amount": -transfer_amount,
-        "description": f"Transferred ₹{transfer_amount:,.2f} to {dest_acc['account_name']}."
+        "description": f"Transferred ₹{transfer_amount:,.2f} out to {dest_name}."
     }).execute()
 
     db.table('account_logs').insert({
@@ -193,12 +205,20 @@ async def transfer_funds(payload: TransferFundsRequest, db: Client = Depends(get
         "account_id": dest_id,
         "event_type": "VAULT_TRANSFER_IN",
         "amount": transfer_amount,
-        "description": f"Received ₹{transfer_amount:,.2f} from {src_acc['account_name']}."
+        "description": f"Received ₹{transfer_amount:,.2f} in from {src_name}."
     }).execute()
 
     return {
         "status": "SUCCESS",
-        "message": f"Successfully transferred ₹{transfer_amount:,.2f} from {src_acc['account_name']} to {dest_acc['account_name']}.",
-        "source_balance": new_src_bal,
-        "destination_balance": new_dest_bal
+        "message": f"Transferred ₹{transfer_amount:,.2f} from {src_name} to {dest_name}.",
+        "source_vault": {
+            "account_id": src_id,
+            "account_name": src_name,
+            "balance": new_src_bal
+        },
+        "destination_vault": {
+            "account_id": dest_id,
+            "account_name": dest_name,
+            "balance": new_dest_bal
+        }
     }

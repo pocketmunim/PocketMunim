@@ -7,6 +7,7 @@ import calendar
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["Command Dashboard Engine"])
 
+
 @router.post(
     "/summary/{user_id}",
     dependencies=[Depends(verify_zero_trust_signature)]
@@ -17,33 +18,45 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     current_year = today.year
     current_month = today.month
 
-    # 1. Fetch user identity
+    # 1. Fetch user profile
     u_res = db.table('users').select('full_name, currency').eq('user_id', uid).execute()
     if not u_res.data:
         raise HTTPException(status_code=404, detail="User identity not provisioned in vault.")
     user = u_res.data[0]
 
-    # 2. Fetch all liquidity vaults / accounts
-    acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).order('is_default', desc=True).execute()
+    # 2. Fetch all registered liquidity accounts
+    acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).order('is_default',
+                                                                                              desc=True).execute()
     accounts = acc_res.data or []
     total_liquidity = sum(float(a['balance']) for a in accounts)
     default_acc = next((a for a in accounts if a['is_default']), accounts[0] if accounts else None)
 
-    # 3. Fetch current month salary status
-    sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', current_year).eq('month', current_month).execute()
+    # 3. Current month salary status
+    sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', current_year).eq('month',
+                                                                                              current_month).execute()
     current_salary = sal_res.data[0] if sal_res.data else None
 
-    # 4. Fetch current month outflow & inflow
+    # 4. Fetch month transactions
     start_d = f"{current_year:04d}-{current_month:02d}-01"
     _, last_day = calendar.monthrange(current_year, current_month)
     end_d = f"{current_year:04d}-{current_month:02d}-{last_day:02d}"
 
-    tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte('transaction_date', end_d).order('created_at', desc=True).limit(5).execute()
+    tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
+        'transaction_date', end_d).order('created_at', desc=True).limit(8).execute()
     recent_txs = tx_res.data or []
 
-    all_tx_month = db.table('transactions').select('amount, type').eq('user_id', uid).gte('transaction_date', start_d).lte('transaction_date', end_d).execute().data or []
-    month_spent = sum(float(t['amount']) for t in all_tx_month if t['type'] in ['DEBIT', 'EXPENSE'])
-    month_income = sum(float(t['amount']) for t in all_tx_month if t['type'] in ['CREDIT', 'SALARY', 'INCOME'])
+    all_tx_month = db.table('transactions').select('amount, type, status, category').eq('user_id', uid).gte(
+        'transaction_date', start_d).lte('transaction_date', end_d).execute().data or []
+
+    # Internal self transfers are excluded from monthly expense and income run-rates
+    month_spent = sum(
+        float(t['amount']) for t in all_tx_month
+        if t['type'] in ['DEBIT', 'EXPENSE'] and t['category'] != 'Self Transfer'
+    )
+    month_income = sum(
+        float(t['amount']) for t in all_tx_month
+        if t['type'] in ['CREDIT', 'SALARY', 'INCOME'] and t['category'] != 'Self Transfer'
+    )
 
     return {
         "status": "SUCCESS",
