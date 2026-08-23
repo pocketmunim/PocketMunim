@@ -1,12 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas.loan import (
-    RegisterLoanRequest,
-    PayEMIRequest,
-    SettlePastEMIsRequest,
-    FlexibleRepaymentRequest,
-    LoanListResponse,
-    LoanSummaryItem,
-    PartialRepaymentLogItem
+    RegisterLoanRequest, PayEMIRequest, SettlePastEMIsRequest,
+    FlexibleRepaymentRequest, LoanListResponse, LoanSummaryItem, PartialRepaymentLogItem
 )
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
@@ -18,198 +13,96 @@ from dateutil.relativedelta import relativedelta
 router = APIRouter(prefix="/api/v1/loans", tags=["Loan & Amortization Engine"])
 
 
-@router.post(
-    "/list/{user_id}",
-    response_model=LoanListResponse,
-    dependencies=[Depends(verify_zero_trust_signature)]
-)
+@router.post("/list/{user_id}", response_model=LoanListResponse, dependencies=[Depends(verify_zero_trust_signature)])
 async def get_user_loans(user_id: str, db: Client = Depends(get_db)):
     uid = str(user_id)
-
-    loans_res = db.table('loans') \
-        .select('*') \
-        .eq('user_id', uid) \
-        .eq('status', 'ACTIVE') \
-        .gt('pending_principal', 0) \
-        .order('created_at', desc=True) \
-        .execute()
+    loans_res = db.table('loans').select('*').eq('user_id', uid).eq('status', 'ACTIVE').gt('pending_principal',
+                                                                                           0).order('created_at',
+                                                                                                    desc=True).execute()
     loans_data = loans_res.data or []
 
     acc_res = db.table('accounts').select('account_id, account_name').eq('user_id', uid).execute()
     acc_map = {a['account_id']: a['account_name'] for a in (acc_res.data or [])}
 
+    loan_ids = [l['loan_id'] for l in loans_data]
+
+    # API-01 FIX: Batch query all partial repayments and schedules instead of N+1 loop
+    partial_map = {lid: [] for lid in loan_ids}
+    if loan_ids:
+        p_res = db.table('loan_partial_repayments').select('*').in_('loan_id', loan_ids).order('payment_date',
+                                                                                               desc=True).execute()
+        for p in (p_res.data or []):
+            partial_map[p['loan_id']].append(PartialRepaymentLogItem(**p))
+
+    sched_map = {lid: [] for lid in loan_ids}
+    if loan_ids:
+        s_res = db.table('loan_repayments').select('*').in_('loan_id', loan_ids).lte('due_date', str(date.today())).eq(
+            'status', 'SCHEDULED').execute()
+        for s in (s_res.data or []):
+            sched_map[s['loan_id']].append(s)
+
     today = date.today()
-    total_liabilities = 0.0
-    total_receivables = 0.0
+    start_of_month = f"{today.year:04d}-{today.month:02d}-01"
+    end_of_month = (date(today.year, today.month, 1) + relativedelta(months=1, days=-1))
+
+    cur_paid_set = set()
+    if loan_ids:
+        cur_res = db.table('loan_repayments').select('loan_id').in_('loan_id', loan_ids).gte('due_date',
+                                                                                             start_of_month).lte(
+            'due_date', str(end_of_month)).eq('status', 'PAID').execute()
+        cur_paid_set = {c['loan_id'] for c in (cur_res.data or [])}
+
+    total_liabilities, total_receivables = 0.0, 0.0
     loan_items = []
 
     for l in loans_data:
         lid = l['loan_id']
         p_amt = float(l.get('pending_principal') or 0.0)
         l_type = l.get('loan_type', 'BORROWED')
-        is_flex = bool(l.get('is_flexible', False))
 
         if l_type == 'BORROWED':
             total_liabilities += p_amt
         else:
             total_receivables += p_amt
 
-        # Graceful fetch of partial repayments (failsafe if table is not yet created)
-        partial_logs = []
-        try:
-            partial_res = db.table('loan_partial_repayments') \
-                .select('*') \
-                .eq('loan_id', lid) \
-                .order('payment_date', desc=True) \
-                .order('created_at', desc=True) \
-                .execute()
-            if partial_res.data:
-                for p in partial_res.data:
-                    partial_logs.append(PartialRepaymentLogItem(
-                        partial_repayment_id=str(p['partial_repayment_id']),
-                        amount=float(p.get('amount') or 0.0),
-                        payment_date=date.fromisoformat(str(p['payment_date'])),
-                        note=p.get('note') or "Ad-hoc repayment",
-                        remaining_balance_after=float(p.get('remaining_balance_after') or 0.0),
-                        created_at=str(p.get('created_at'))
-                    ))
-        except Exception:
-            partial_logs = []
-
-        has_pending_past_emis = False
-        pending_past_emis_count = 0
-        pending_past_emis_total = 0.0
-        is_cur_paid = False
-
-        if not is_flex:
-            try:
-                past_sched = db.table('loan_repayments') \
-                    .select('repayment_id, emi_amount') \
-                    .eq('loan_id', lid) \
-                    .lte('due_date', str(today)) \
-                    .eq('status', 'SCHEDULED') \
-                    .execute()
-
-                has_pending_past_emis = len(past_sched.data or []) > 0
-                pending_past_emis_count = len(past_sched.data or [])
-                pending_past_emis_total = sum(float(x['emi_amount']) for x in (past_sched.data or []))
-
-                start_of_month = f"{today.year:04d}-{today.month:02d}-01"
-                end_of_month = (date(today.year, today.month, 1) + relativedelta(months=1, days=-1))
-
-                repay_res = db.table('loan_repayments') \
-                    .select('repayment_id') \
-                    .eq('loan_id', lid) \
-                    .gte('due_date', start_of_month) \
-                    .lte('due_date', str(end_of_month)) \
-                    .eq('status', 'PAID') \
-                    .execute()
-
-                is_cur_paid = bool(repay_res.data)
-            except Exception:
-                pass
+        past_emis = sched_map.get(lid, [])
+        pending_past_total = sum(float(x['emi_amount']) for x in past_emis)
 
         loan_items.append(LoanSummaryItem(
-            loan_id=lid,
-            loan_name=l['loan_name'],
-            loan_type=l_type,
-            counterparty=l['counterparty'],
+            loan_id=lid, loan_name=l['loan_name'], loan_type=l_type, counterparty=l['counterparty'],
             disbursement_date=date.fromisoformat(str(l['disbursement_date'])),
             first_emi_date=date.fromisoformat(str(l['first_emi_date'])) if l.get('first_emi_date') else None,
-            original_principal=float(l.get('original_principal') or 0.0),
-            pending_principal=p_amt,
+            original_principal=float(l.get('original_principal') or 0.0), pending_principal=p_amt,
             annual_interest_rate=float(l.get('annual_interest_rate') or 0.0),
             original_tenure_months=int(l.get('original_tenure_months') or 0),
             pending_tenure_months=int(l.get('pending_tenure_months') or 0),
             monthly_emi=float(l.get('monthly_emi') or 0.0),
             total_interest_payable=float(l.get('total_interest_payable') or 0.0),
-            principal_paid=float(l.get('principal_paid') or 0.0),
-            interest_paid=float(l.get('interest_paid') or 0.0),
+            principal_paid=float(l.get('principal_paid') or 0.0), interest_paid=float(l.get('interest_paid') or 0.0),
             next_emi_date=date.fromisoformat(str(l['next_emi_date'])) if l.get('next_emi_date') else None,
-            status=l.get('status', 'ACTIVE'),
-            is_flexible=is_flex,
-            account_id=l.get('account_id'),
-            account_name=acc_map.get(l.get('account_id'), "Default Vault"),
-            is_current_month_paid=is_cur_paid,
-            has_pending_past_emis=has_pending_past_emis,
-            pending_past_emis_count=pending_past_emis_count,
-            pending_past_emis_total=round(pending_past_emis_total, 2),
-            partial_repayments=partial_logs
+            status=l.get('status', 'ACTIVE'), is_flexible=bool(l.get('is_flexible', False)),
+            account_id=l.get('account_id'), account_name=acc_map.get(l.get('account_id'), "Default Vault"),
+            is_current_month_paid=(lid in cur_paid_set), has_pending_past_emis=len(past_emis) > 0,
+            pending_past_emis_count=len(past_emis), pending_past_emis_total=round(pending_past_total, 2),
+            partial_repayments=partial_map.get(lid, [])
         ))
 
     return LoanListResponse(
-        status="SUCCESS",
-        total_liabilities=round(total_liabilities, 2),
-        total_receivables=round(total_receivables, 2),
-        net_debt_position=round(total_receivables - total_liabilities, 2),
-        active_loans_count=len(loan_items),
+        status="SUCCESS", total_liabilities=round(total_liabilities, 2), total_receivables=round(total_receivables, 2),
+        net_debt_position=round(total_receivables - total_liabilities, 2), active_loans_count=len(loan_items),
         loans=loan_items
     )
 
 
-@router.post(
-    "/register",
-    dependencies=[Depends(verify_zero_trust_signature)]
-)
+@router.post("/register", dependencies=[Depends(verify_zero_trust_signature)])
 async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_db)):
-    uid = str(payload.user_id)
-    sanitized_name = payload.loan_name.strip()
+    """Delegates complex multi-table loan generation to a Postgres RPC for ACID isolation."""
     principal = round(float(payload.original_principal), 2)
+    schedule = []
+    first_emi_d = payload.first_emi_date or payload.disbursement_date
+    monthly_emi, total_interest = 0.0, 0.0
 
-    existing = db.table('loans').select('loan_id').eq('user_id', uid).ilike('loan_name', sanitized_name).execute()
-    if existing.data:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"A loan titled '{sanitized_name}' already exists. Please use a unique title."
-        )
-
-    if payload.account_id:
-        acc_res = db.table('accounts').select('*').eq('account_id', str(payload.account_id)).eq('user_id', uid).eq(
-            'is_active', True).execute()
-    else:
-        acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_default', True).eq('is_active',
-                                                                                                True).execute()
-        if not acc_res.data:
-            acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).limit(1).execute()
-
-    if not acc_res.data:
-        raise HTTPException(status_code=404, detail="No active account vault found for loan disbursement.")
-
-    acc = acc_res.data[0]
-    aid = acc['account_id']
-    acc_name = acc['account_name']
-    curr_balance = float(acc['balance'])
-
-    if payload.loan_type.value == "LENT" and curr_balance < principal:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient balance in {acc_name} to lend ₹{principal:,.2f}. Available: ₹{curr_balance:,.2f}."
-        )
-
-    if payload.is_flexible:
-        loan_insert = db.table('loans').insert({
-            "user_id": uid,
-            "account_id": aid,
-            "loan_name": sanitized_name,
-            "loan_type": payload.loan_type.value,
-            "counterparty": payload.counterparty.strip(),
-            "disbursement_date": str(payload.disbursement_date),
-            "first_emi_date": str(payload.disbursement_date),
-            "original_principal": principal,
-            "pending_principal": principal,
-            "annual_interest_rate": 0.0,
-            "original_tenure_months": 0,
-            "pending_tenure_months": 0,
-            "monthly_emi": 0.0,
-            "total_interest_payable": 0.0,
-            "principal_paid": 0.0,
-            "interest_paid": 0.0,
-            "next_emi_date": str(payload.disbursement_date),
-            "status": "ACTIVE",
-            "is_flexible": True
-        }).execute()
-        monthly_emi = 0.0
-    else:
+    if not payload.is_flexible:
         first_emi_d = payload.first_emi_date or LoanService.calculate_default_first_emi_date(payload.disbursement_date)
         monthly_emi = LoanService.calculate_reducing_emi(principal, payload.annual_interest_rate,
                                                          payload.original_tenure_months)
@@ -217,412 +110,63 @@ async def register_loan(payload: RegisterLoanRequest, db: Client = Depends(get_d
                                                               payload.original_tenure_months, first_emi_d, monthly_emi)
         total_interest = round(sum(item['emi_amount'] for item in schedule) - principal, 2)
 
-        loan_insert = db.table('loans').insert({
-            "user_id": uid,
-            "account_id": aid,
-            "loan_name": sanitized_name,
-            "loan_type": payload.loan_type.value,
-            "counterparty": payload.counterparty.strip(),
-            "disbursement_date": str(payload.disbursement_date),
-            "first_emi_date": str(first_emi_d),
-            "original_principal": principal,
-            "pending_principal": principal,
-            "annual_interest_rate": payload.annual_interest_rate,
-            "original_tenure_months": payload.original_tenure_months,
-            "pending_tenure_months": payload.original_tenure_months,
-            "monthly_emi": monthly_emi,
-            "total_interest_payable": total_interest,
-            "principal_paid": 0.0,
-            "interest_paid": 0.0,
-            "next_emi_date": str(first_emi_d),
-            "status": "ACTIVE",
-            "is_flexible": False
-        }).execute()
-
-        new_loan_id = loan_insert.data[0]['loan_id']
-        for inst in schedule:
-            inst['loan_id'] = new_loan_id
-            inst['user_id'] = uid
-            inst['account_id'] = aid
-        db.table('loan_repayments').insert(schedule).execute()
-
-    new_loan_id = loan_insert.data[0]['loan_id']
-
-    tx_type = "CREDIT" if payload.loan_type.value == "BORROWED" else "DEBIT"
-    status_label = "CREDITED" if tx_type == "CREDIT" else "DEBITED"
-    new_bal = round(curr_balance + principal if tx_type == "CREDIT" else curr_balance - principal, 2)
-
-    db.table('accounts').update({"balance": new_bal}).eq('account_id', aid).execute()
-
-    db.table('transactions').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "account_name": acc_name,
-        "type": tx_type,
-        "category": "Debt & EMI",
-        "amount": principal,
-        "transaction_date": str(payload.disbursement_date),
-        "status": status_label,
-        "description": f"Loan Disbursement: {sanitized_name} ({payload.counterparty})"
-    }).execute()
-
-    db.table('account_logs').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "event_type": f"LOAN_DISBURSEMENT_{tx_type}",
-        "amount": principal if tx_type == "CREDIT" else -principal,
-        "description": f"Loan disbursement processed for '{sanitized_name}' via {acc_name}."
-    }).execute()
-
-    return {
-        "status": "SUCCESS",
-        "message": f"Loan '{sanitized_name}' registered. {'Credited' if tx_type == 'CREDIT' else 'Debited'} ₹{principal:,.2f} on {acc_name}.",
-        "loan_id": new_loan_id,
-        "monthly_emi": monthly_emi
+    rpc_payload = {
+        "user_id": str(payload.user_id),
+        "account_id": str(payload.account_id) if payload.account_id else None,
+        "loan_name": payload.loan_name.strip(),
+        "loan_type": payload.loan_type.value,
+        "counterparty": payload.counterparty.strip(),
+        "disbursement_date": str(payload.disbursement_date),
+        "first_emi_date": str(first_emi_d),
+        "original_principal": principal,
+        "annual_interest_rate": payload.annual_interest_rate,
+        "original_tenure_months": payload.original_tenure_months,
+        "monthly_emi": monthly_emi,
+        "total_interest_payable": total_interest,
+        "is_flexible": payload.is_flexible,
+        "schedule": schedule
     }
-
-
-@router.post(
-    "/pay-emi",
-    dependencies=[Depends(verify_zero_trust_signature)]
-)
-async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
-    uid = str(payload.user_id)
-    lid = str(payload.loan_id)
-
-    loan_res = db.table('loans').select('*').eq('loan_id', lid).eq('user_id', uid).execute()
-    if not loan_res.data:
-        raise HTTPException(status_code=404, detail="Loan contract not found.")
-    loan = loan_res.data[0]
-
-    if loan.get('status') != 'ACTIVE':
-        raise HTTPException(status_code=400, detail="This loan is already CLOSED.")
-
-    sched_res = db.table('loan_repayments') \
-        .select('*') \
-        .eq('loan_id', lid) \
-        .eq('status', 'SCHEDULED') \
-        .order('installment_number') \
-        .limit(1) \
-        .execute()
-
-    if not sched_res.data:
-        db.table('loans').update({"status": "CLOSED", "pending_principal": 0.0}).eq('loan_id', lid).execute()
-        return {"status": "SUCCESS", "message": "All EMIs for this loan have been completed."}
-
-    next_installment = sched_res.data[0]
-    inst_num = next_installment['installment_number']
-    emi_amount = float(next_installment['emi_amount'])
-    due_date = date.fromisoformat(str(next_installment['due_date']))
-    today = date.today()
-
-    start_of_month = f"{today.year:04d}-{today.month:02d}-01"
-    end_of_month = (date(today.year, today.month, 1) + relativedelta(months=1, days=-1))
-
-    cur_month_paid = db.table('loan_repayments') \
-        .select('repayment_id') \
-        .eq('loan_id', lid) \
-        .gte('due_date', start_of_month) \
-        .lte('due_date', str(end_of_month)) \
-        .eq('status', 'PAID') \
-        .execute()
-
-    if cur_month_paid.data and not payload.is_advance_confirmed:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"DUPLICATE_CURRENT_MONTH: Installment for {today.strftime('%B %Y')} has ALREADY been paid. Are you sure you want to pay in advance for Installment #{inst_num} (Due: {due_date})?"
-        )
-
-    target_aid = payload.account_id or loan.get('account_id')
-    acc_res = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).execute()
-    if not acc_res.data:
-        raise HTTPException(status_code=404, detail="No active liquidity vault available for EMI deduction.")
-
-    acc = acc_res.data[0]
-    aid = acc['account_id']
-    acc_name = acc['account_name']
-    curr_balance = float(acc['balance'])
-    loan_type = loan.get('loan_type', 'BORROWED')
-
-    if loan_type == 'BORROWED' and curr_balance < emi_amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient balance in {acc_name}. Available: ₹{curr_balance:,.2f}, Required EMI: ₹{emi_amount:,.2f}."
-        )
-
-    new_balance = round(curr_balance - emi_amount if loan_type == 'BORROWED' else curr_balance + emi_amount, 2)
-    tx_type = "DEBIT" if loan_type == 'BORROWED' else "CREDIT"
-    status_label = "DEBITED" if loan_type == 'BORROWED' else "CREDITED"
-
-    db.table('accounts').update({"balance": new_balance}).eq('account_id', aid).execute()
-
-    db.table('transactions').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "account_name": acc_name,
-        "type": tx_type,
-        "category": "Debt & EMI",
-        "amount": emi_amount,
-        "transaction_date": str(today),
-        "status": status_label,
-        "description": f"Loan EMI #{inst_num} ({loan['loan_name']}) - {loan['counterparty']}"
-    }).execute()
-
-    db.table('loan_repayments').update({
-        "status": "PAID",
-        "paid_at": str(today),
-        "account_id": aid
-    }).eq('repayment_id', next_installment['repayment_id']).execute()
-
-    new_pending_principal = round(float(next_installment['remaining_principal_after']), 2)
-    new_pending_tenure = max(0, int(loan.get('pending_tenure_months', 0)) - 1)
-    new_principal_paid = round(
-        float(loan.get('principal_paid') or 0.0) + float(next_installment['principal_component']), 2)
-    new_interest_paid = round(float(loan.get('interest_paid') or 0.0) + float(next_installment['interest_component']),
-                              2)
-    loan_status = "CLOSED" if new_pending_principal <= 0 or new_pending_tenure == 0 else "ACTIVE"
-
-    future_sched = db.table('loan_repayments') \
-        .select('due_date') \
-        .eq('loan_id', lid) \
-        .eq('status', 'SCHEDULED') \
-        .order('installment_number') \
-        .limit(1) \
-        .execute()
-    new_next_date = future_sched.data[0]['due_date'] if future_sched.data else str(today)
-
-    db.table('loans').update({
-        "pending_principal": new_pending_principal,
-        "pending_tenure_months": new_pending_tenure,
-        "principal_paid": new_principal_paid,
-        "interest_paid": new_interest_paid,
-        "next_emi_date": new_next_date,
-        "status": loan_status
-    }).eq('loan_id', lid).execute()
-
-    db.table('account_logs').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "event_type": f"LOAN_EMI_{tx_type}",
-        "amount": -emi_amount if tx_type == 'DEBIT' else emi_amount,
-        "description": f"EMI #{inst_num} cleared for {loan['loan_name']} (Pending Principal: ₹{new_pending_principal:,.2f})."
-    }).execute()
-
-    return {
-        "status": "SUCCESS",
-        "message": f"Installment #{inst_num} of ₹{emi_amount:,.2f} settled from {acc_name}.",
-        "new_pending_principal": new_pending_principal,
-        "new_pending_tenure": new_pending_tenure,
-        "loan_status": loan_status,
-        "next_due_date": new_next_date
-    }
-
-
-@router.post(
-    "/settle-past-emis",
-    dependencies=[Depends(verify_zero_trust_signature)]
-)
-async def settle_past_emis(payload: SettlePastEMIsRequest, db: Client = Depends(get_db)):
-    uid = str(payload.user_id)
-    lid = str(payload.loan_id)
-    today = date.today()
-
-    loan_res = db.table('loans').select('*').eq('loan_id', lid).eq('user_id', uid).execute()
-    if not loan_res.data:
-        raise HTTPException(status_code=404, detail="Loan not found.")
-    loan = loan_res.data[0]
-
-    past_emis_res = db.table('loan_repayments') \
-        .select('*') \
-        .eq('loan_id', lid) \
-        .lte('due_date', str(today)) \
-        .eq('status', 'SCHEDULED') \
-        .order('installment_number') \
-        .execute()
-
-    past_emis = past_emis_res.data or []
-    if not past_emis:
-        return {"status": "SUCCESS", "message": "No pending past EMIs found for this loan."}
-
-    total_settle_amount = sum(float(x['emi_amount']) for x in past_emis)
-    total_principal_component = sum(float(x['principal_component']) for x in past_emis)
-    total_interest_component = sum(float(x['interest_component']) for x in past_emis)
-    last_past_emi = past_emis[-1]
-
-    target_aid = payload.account_id or loan.get('account_id')
-    acc_res = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).execute()
-    if not acc_res.data:
-        raise HTTPException(status_code=404, detail="Disbursement account not found.")
-    acc = acc_res.data[0]
-    aid = acc['account_id']
-    acc_name = acc['account_name']
-    curr_bal = float(acc['balance'])
-    loan_type = loan.get('loan_type', 'BORROWED')
-
-    if loan_type == 'BORROWED' and curr_bal < total_settle_amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient balance in {acc_name} to settle {len(past_emis)} past EMIs. Required: ₹{total_settle_amount:,.2f}, Available: ₹{curr_bal:,.2f}."
-        )
-
-    new_bal = round(curr_bal - total_settle_amount if loan_type == 'BORROWED' else curr_bal + total_settle_amount, 2)
-    tx_type = "DEBIT" if loan_type == 'BORROWED' else "CREDIT"
-    db.table('accounts').update({"balance": new_bal}).eq('account_id', aid).execute()
-
-    for item in past_emis:
-        db.table('loan_repayments').update({
-            "status": "PAID",
-            "paid_at": str(today),
-            "account_id": aid
-        }).eq('repayment_id', item['repayment_id']).execute()
-
-    db.table('transactions').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "account_name": acc_name,
-        "type": tx_type,
-        "category": "Debt & EMI",
-        "amount": round(total_settle_amount, 2),
-        "transaction_date": str(today),
-        "status": "DEBITED" if tx_type == "DEBIT" else "CREDITED",
-        "description": f"Batch Settlement ({len(past_emis)} Past EMIs) - {loan['loan_name']}"
-    }).execute()
-
-    db.table('account_logs').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "event_type": "PAST_EMIS_BATCH_SETTLEMENT",
-        "amount": -total_settle_amount if tx_type == "DEBIT" else total_settle_amount,
-        "description": f"Settled {len(past_emis)} historical EMIs for '{loan['loan_name']}'."
-    }).execute()
-
-    new_pending_p = round(float(last_past_emi['remaining_principal_after']), 2)
-    new_pending_t = max(0, int(loan.get('pending_tenure_months', 0)) - len(past_emis))
-    new_p_paid = round(float(loan.get('principal_paid') or 0.0) + total_principal_component, 2)
-    new_i_paid = round(float(loan.get('interest_paid') or 0.0) + total_interest_component, 2)
-    new_status = "CLOSED" if new_pending_p <= 0 or new_pending_t == 0 else "ACTIVE"
-
-    next_sched = db.table('loan_repayments') \
-        .select('due_date') \
-        .eq('loan_id', lid) \
-        .eq('status', 'SCHEDULED') \
-        .order('installment_number') \
-        .limit(1) \
-        .execute()
-    next_date = next_sched.data[0]['due_date'] if next_sched.data else str(today)
-
-    db.table('loans').update({
-        "pending_principal": new_pending_p,
-        "pending_tenure_months": new_pending_t,
-        "principal_paid": new_p_paid,
-        "interest_paid": new_i_paid,
-        "next_emi_date": next_date,
-        "status": new_status
-    }).eq('loan_id', lid).execute()
-
-    return {
-        "status": "SUCCESS",
-        "message": f"Successfully settled {len(past_emis)} past EMIs (₹{total_settle_amount:,.2f}) for {loan['loan_name']}.",
-        "settled_count": len(past_emis),
-        "total_amount_debited": total_settle_amount,
-        "new_pending_principal": new_pending_p
-    }
-
-
-@router.post(
-    "/repay-flexible",
-    dependencies=[Depends(verify_zero_trust_signature)]
-)
-async def repay_flexible_loan(payload: FlexibleRepaymentRequest, db: Client = Depends(get_db)):
-    uid = str(payload.user_id)
-    lid = str(payload.loan_id)
-    pay_amount = round(float(payload.amount), 2)
-    pay_date = payload.payment_date or date.today()
-
-    loan_res = db.table('loans').select('*').eq('loan_id', lid).eq('user_id', uid).execute()
-    if not loan_res.data:
-        raise HTTPException(status_code=404, detail="Loan contract not found.")
-    loan = loan_res.data[0]
-
-    if loan.get('status') != 'ACTIVE':
-        raise HTTPException(status_code=400, detail="This loan is already fully settled and CLOSED.")
-
-    pending_p = float(loan.get('pending_principal') or 0.0)
-
-    if pay_amount > pending_p:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Repayment amount (₹{pay_amount:,.2f}) exceeds outstanding pending balance (₹{pending_p:,.2f})."
-        )
-
-    target_aid = payload.account_id or loan.get('account_id')
-    acc_res = db.table('accounts').select('*').eq('account_id', target_aid).eq('user_id', uid).execute()
-    if not acc_res.data:
-        raise HTTPException(status_code=404, detail="Repayment vault account not found.")
-
-    acc = acc_res.data[0]
-    aid = acc['account_id']
-    acc_name = acc['account_name']
-    curr_balance = float(acc['balance'])
-    loan_type = loan.get('loan_type', 'BORROWED')
-
-    if loan_type == 'BORROWED' and curr_balance < pay_amount:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Insufficient balance in {acc_name}. Available: ₹{curr_balance:,.2f}, Required: ₹{pay_amount:,.2f}."
-        )
-
-    new_balance = round(curr_balance - pay_amount if loan_type == 'BORROWED' else curr_balance + pay_amount, 2)
-    tx_type = "DEBIT" if loan_type == 'BORROWED' else "CREDIT"
-    status_label = "DEBITED" if loan_type == 'BORROWED' else "CREDITED"
-    new_pending = round(pending_p - pay_amount, 2)
-    new_paid = round(float(loan.get('principal_paid') or 0.0) + pay_amount, 2)
-    loan_status = "CLOSED" if new_pending <= 0 else "ACTIVE"
-
-    db.table('accounts').update({"balance": new_balance}).eq('account_id', aid).execute()
 
     try:
-        db.table('loan_partial_repayments').insert({
-            "loan_id": lid,
-            "user_id": uid,
-            "account_id": aid,
-            "amount": pay_amount,
-            "payment_date": str(pay_date),
-            "note": payload.note or "Ad-hoc repayment",
-            "remaining_balance_after": new_pending
-        }).execute()
-    except Exception:
-        pass
+        rpc_res = db.rpc("register_loan_atomic", {"payload": rpc_payload}).execute()
+        return rpc_res.data
+    except Exception as e:
+        err = str(e)
+        if "Insufficient balance" in err or "already exists" in err:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"RPC Execution Failed: {err}")
 
-    db.table('transactions').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "account_name": acc_name,
-        "type": tx_type,
-        "category": "Debt & EMI",
-        "amount": pay_amount,
-        "transaction_date": str(pay_date),
-        "status": status_label,
-        "description": f"P2P Repayment: {loan['loan_name']} ({loan['counterparty']}) - {payload.note or 'Ad-hoc'}"
-    }).execute()
 
-    db.table('account_logs').insert({
-        "user_id": uid,
-        "account_id": aid,
-        "event_type": f"LOAN_PARTIAL_{tx_type}",
-        "amount": -pay_amount if tx_type == 'DEBIT' else pay_amount,
-        "description": f"Partial repayment of ₹{pay_amount:,.2f} logged for '{loan['loan_name']}' (Pending: ₹{new_pending:,.2f})."
-    }).execute()
+@router.post("/pay-emi", dependencies=[Depends(verify_zero_trust_signature)])
+async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
+    try:
+        rpc_res = db.rpc("pay_loan_emi_atomic", {"payload": payload.model_dump()}).execute()
+        return rpc_res.data
+    except Exception as e:
+        err = str(e)
+        if "DUPLICATE_CURRENT_MONTH" in err:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                detail="Installment for this month has ALREADY been paid. Advance confirmation required.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=err)
 
-    db.table('loans').update({
-        "pending_principal": new_pending,
-        "principal_paid": new_paid,
-        "status": loan_status
-    }).eq('loan_id', lid).execute()
 
-    return {
-        "status": "SUCCESS",
-        "message": f"Logged ₹{pay_amount:,.2f} repayment for {loan['loan_name']}. Remaining pending: ₹{new_pending:,.2f}.",
-        "new_pending_principal": new_pending,
-        "loan_status": loan_status
-    }
+@router.post("/settle-past-emis", dependencies=[Depends(verify_zero_trust_signature)])
+async def settle_past_emis(payload: SettlePastEMIsRequest, db: Client = Depends(get_db)):
+    try:
+        rpc_res = db.rpc("settle_past_emis_atomic", {"payload": payload.model_dump()}).execute()
+        return rpc_res.data
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/repay-flexible", dependencies=[Depends(verify_zero_trust_signature)])
+async def repay_flexible_loan(payload: FlexibleRepaymentRequest, db: Client = Depends(get_db)):
+    rpc_payload = payload.model_dump()
+    if rpc_payload.get('payment_date'):
+        rpc_payload['payment_date'] = str(rpc_payload['payment_date'])
+
+    try:
+        rpc_res = db.rpc("repay_flexible_loan_atomic", {"payload": rpc_payload}).execute()
+        return rpc_res.data
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
