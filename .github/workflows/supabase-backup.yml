@@ -1,0 +1,38 @@
+name: Daily Supabase Database Backup
+
+# This replaces QStash: GitHub will run this automatically every day at 2:00 AM UTC
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allows you to click a button in GitHub to run it manually
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Install PostgreSQL Client Tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql-client
+
+    - name: Run Database Dump (pg_dump)
+      env:
+        # You will add this securely in GitHub Settings -> Secrets and variables -> Actions
+        SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      run: |
+        echo "Starting PocketMunim database backup..."
+        DATE=$(date +'%Y-%m-%d')
+        # Dumps the database schema and data into a compressed SQL file
+        pg_dump "$SUPABASE_DB_URL" -F c -f "pocketmunim_backup_$DATE.dump"
+        echo "Backup completed successfully."
+
+    - name: Upload Backup as GitHub Artifact (Kept for 30 days)
+      uses: actions/upload-artifact@v4
+      with:
+        name: database-backup-${{ github.run_id }}
+        path: pocketmunim_backup_*.dump
+        retention-days: 30
