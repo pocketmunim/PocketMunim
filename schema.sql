@@ -118,3 +118,30 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER trigger_clean_nonces
 AFTER INSERT ON security_nonces
 EXECUTE PROCEDURE clean_expired_nonces();
+
+-- Enable Row Level Security (RLS) on all financial tables
+ALTER TABLE public.accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.loans ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.loan_repayments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.loan_partial_repayments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.account_logs ENABLE ROW LEVEL SECURITY;
+
+-- Backend Service Role Bypass: Gives your FastAPI server unrestricted access
+CREATE POLICY "Allow Service Role Full Access on accounts"
+ON public.accounts FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow Service Role Full Access on transactions"
+ON public.transactions FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow Service Role Full Access on loans"
+ON public.loans FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow Service Role Full Access on loan_repayments"
+ON public.loan_repayments FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow Service Role Full Access on loan_partial_repayments"
+ON public.loan_partial_repayments FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Allow Service Role Full Access on account_logs"
+ON public.account_logs FOR ALL USING (auth.role() = 'service_role');
