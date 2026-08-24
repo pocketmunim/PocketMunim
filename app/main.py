@@ -41,6 +41,9 @@ app.add_middleware(
 # 2. ZERO-TRUST HMAC SIGNATURE MIDDLEWARE
 @app.middleware("http")
 async def zero_trust_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     if request.url.path in ["/", "/webhook", "/docs", "/openapi.json"]:
         return await call_next(request)
 
