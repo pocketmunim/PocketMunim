@@ -156,7 +156,7 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
     }
 
     try:
-        # SECURED: Defers entirety of multi-table updates to the ACID-compliant RPC
+        # Executes the corrected Month-End Sweep RPC
         res = db.rpc("settle_salary_atomic", {"payload": rpc_payload}).execute()
 
         data = res.data
@@ -168,10 +168,15 @@ async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_d
         err_str = str(e)
         user_message = "Your salary settlement request could not be completed."
 
+        # Catch and format the new SQL exceptions nicely for the UI
         if "already settled" in err_str.lower():
             user_message = "This salary cycle has already been settled and accounted for."
         elif "not found" in err_str.lower():
             user_message = "Account vault or salary record could not be found."
+        elif "must be in paid state" in err_str.lower():
+            user_message = "Settlement Blocked: This month has not been disbursed (PAID) yet."
+        elif "exceed" in err_str.lower():
+            user_message = "Settlement Blocked: Total debits exceed total incoming funds for this cycle."
 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
