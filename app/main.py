@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip
+from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip, notifications
 
 # Configure internal secure logging
 logging.basicConfig(level=logging.INFO)
@@ -130,7 +130,7 @@ app.include_router(salary.router)
 app.include_router(loan.router)
 app.include_router(cron.router)
 app.include_router(sip.router)
-
+app.include_router(notifications.router)
 
 # Catch-all Webhook Handler
 @app.post("/webhook")
