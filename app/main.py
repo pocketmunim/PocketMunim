@@ -18,19 +18,17 @@ app = FastAPI(
 )
 
 # 1. SECURE CORS POLICY (Fortune 100 Standard)
-# Strictly limits which domains and mobile protocols can communicate with the backend.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://pocket-munim.vercel.app",
         "capacitor://localhost",
-        "http://localhost"
     ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$", # Allows any local port for development
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],  # Block dangerous HTTP methods (PUT/DELETE/PATCH)
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
 
 # 1. Custom HTTP Exception Formatter
 @app.exception_handler(StarletteHTTPException)
