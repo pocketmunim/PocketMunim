@@ -20,14 +20,17 @@ jobs:
 
     - name: Run Database Dump (pg_dump)
       env:
-        SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        PGHOST: aws-0-ap-northeast-2.pooler.supabase.com
+        PGPORT: 6543
+        PGUSER: postgres.jrhiuiqvxufhrklavhyt
+        PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        PGDATABASE: postgres
       run: |
         echo "Starting PocketMunim database backup..."
         DATE=$(date +'%Y-%m-%d')
         
-        # Explicitly using the URI string with network routing to prevent local socket fallback
-        pg-dump --version
-        pg_dump "$SUPABASE_DB_URL" -F c -f "pocketmunim_backup_$DATE.dump"
+        # Explicitly using environment variables to bypass shell parsing bugs
+        pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -F c -f "pocketmunim_backup_$DATE.dump"
         
         echo "Backup completed successfully."
 
