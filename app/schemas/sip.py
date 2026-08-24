@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional
+from datetime import date
 
 class CreateSIPRequest(BaseModel):
     user_id: str
@@ -7,7 +8,8 @@ class CreateSIPRequest(BaseModel):
     description: Optional[str] = None
     is_flexible: bool = False
     monthly_amount: float = Field(..., gt=0.0)
-    deduction_day: int = Field(..., ge=1, le=31)
+    frequency: str = Field(default="MONTHLY")
+    start_date: date
     duration_months: Optional[int] = Field(default=None, gt=0)
     reminder_preference: str = Field(default="1_DAY_BEFORE")
 
@@ -20,4 +22,4 @@ class PaySIPRequest(BaseModel):
 class SnoozeSIPRequest(BaseModel):
     user_id: str
     sip_id: str
-    snooze_days: int = Field(..., gt=0, le=30)
+    snooze_days: int

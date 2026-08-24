@@ -24,13 +24,28 @@ async def create_sip(payload: CreateSIPRequest, db: Client = Depends(get_db)):
         "description": payload.description.strip() if payload.description else None,
         "is_flexible": payload.is_flexible,
         "monthly_amount": payload.monthly_amount,
-        "deduction_day": payload.deduction_day,
+        "frequency": payload.frequency,
+        "start_date": str(payload.start_date),
+        "next_due_date": str(payload.start_date), # Begins on start date
         "duration_months": payload.duration_months,
         "reminder_preference": payload.reminder_preference,
         "status": "ACTIVE"
     }
     res = db.table("sip_contracts").insert(data).execute()
-    return {"status": "SUCCESS", "message": "SIP Contract Initialized.", "data": res.data[0]}
+    return {"status": "SUCCESS", "data": res.data[0]}
+
+@router.post("/settle-past", dependencies=[Depends(verify_zero_trust_signature)])
+async def settle_past_sips(payload: PaySIPRequest, db: Client = Depends(get_db)):
+    rpc_payload = {
+        "user_id": payload.user_id,
+        "sip_id": payload.sip_id,
+        "account_id": payload.account_id
+    }
+    try:
+        res = db.rpc("settle_past_sips_atomic", {"payload": rpc_payload}).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/pay", dependencies=[Depends(verify_zero_trust_signature)])
