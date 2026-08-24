@@ -230,19 +230,36 @@ async def pay_loan_emi(payload: PayEMIRequest, db: Client = Depends(get_db)):
     dependencies=[Depends(verify_zero_trust_signature)],
 )
 async def settle_past_emis(payload: SettlePastEMIsRequest, db: Client = Depends(get_db)):
+    # Ensure empty string account IDs are explicitly converted to None for PostgreSQL UUID parsing
+    target_aid = None
+    if payload.account_id and str(payload.account_id).strip() != "":
+        target_aid = str(payload.account_id)
+
     rpc_payload = {
         "user_id": str(payload.user_id),
         "loan_id": str(payload.loan_id),
-        "account_id": str(payload.account_id) if payload.account_id else None,
+        "account_id": target_aid,
     }
 
-    res = db.rpc("settle_past_emis_atomic", {"payload": rpc_payload}).execute()
+    try:
+        res = db.rpc("settle_past_emis_atomic", {"payload": rpc_payload}).execute()
+        data = res.data
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+        return {"status": "SUCCESS", "data": data or {"message": "Settlement processed successfully."}}
+    except Exception as e:
+        # Bank-grade polite error formatting
+        err_str = str(e)
+        user_message = "Your batch settlement request could not be completed. Please check your vault balance."
+        if "Insufficient balance" in err_str:
+            user_message = "Transaction Declined: Insufficient funds in your vault to settle historical installments."
+        elif "Loan contract not found" in err_str:
+            user_message = "Error: The specified financial contract could not be located."
 
-    data = res.data
-    if isinstance(data, list) and len(data) > 0:
-        data = data[0]
-
-    return {"status": "SUCCESS", "data": data}
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=user_message
+        )
 
 
 @router.post(
