@@ -13,23 +13,18 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Install PostgreSQL 17 Client Tools
-      run: |
-        sudo install -d /usr/share/postgresql-common/pgdg
-        sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
-        sudo sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-        sudo apt-get update
-        sudo apt-get install -y postgresql-client-17
-
-    - name: Run Database Dump (pg_dump v17)
+    - name: Run Database Dump with PostgreSQL 17 Docker
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       run: |
-        echo "Starting PocketMunim database backup..."
-        DATE=$(date +'%Y-%m-%d')
+        echo "Starting PocketMunim database backup via Postgres 17 container..."
         
-        # Explicitly call the v17 binary to bypass Ubuntu's default pg_wrapper
-        /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL" -F c -f "pocketmunim_backup_$DATE.dump"
+        # Executes pg_dump directly inside official PostgreSQL 17 container
+        docker run --rm \
+          -e SUPABASE_DB_URL="$SUPABASE_DB_URL" \
+          -v "${{ github.workspace }}:/backup" \
+          postgres:17 \
+          sh -c 'pg_dump "$SUPABASE_DB_URL" -F c -f "/backup/pocketmunim_backup_$(date +%Y-%m-%d).dump"'
         
         echo "Backup completed successfully."
 
