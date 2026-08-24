@@ -65,10 +65,23 @@ async def pay_sip(payload: PaySIPRequest, db: Client = Depends(get_db)):
         res = db.rpc("pay_sip_installment_atomic", {"payload": rpc_payload}).execute()
         return res.data
     except Exception as e:
-        err = str(e)
-        if "Insufficient funds" in err or "Solvency Violation" in err:
-            raise HTTPException(status_code=400, detail="Solvency Violation: Not enough funds in selected vault.")
-        raise HTTPException(status_code=400, detail=err)
+        err_str = str(e)
+        user_message = "SIP payment could not be processed."
+
+        if "Insufficient funds" in err_str or "Solvency Violation" in err_str:
+            user_message = "Solvency Violation: Not enough liquid funds in the selected account vault to cover this SIP installment."
+        elif "not active" in err_str.lower():
+            user_message = "Execution Denied: This SIP contract is not currently active."
+        elif "vault not found" in err_str.lower():
+            user_message = "Vault Error: Selected account vault could not be verified."
+        else:
+            # Clean up raw postgres exception wrapper if present
+            user_message = err_str.split("DETAIL:")[0].replace("PQexecute", "").strip()
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=user_message
+        )
 
 
 @router.post("/snooze", dependencies=[Depends(verify_zero_trust_signature)])
