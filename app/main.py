@@ -13,9 +13,9 @@ from app.routers import auth, salary, account, cron, dashboard, transaction, loa
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ZERO_TRUST_KEY = os.getenv("ZERO_TRUST_KEY")
-if not ZERO_TRUST_KEY:
-    raise RuntimeError("CRITICAL: ZERO_TRUST_KEY environment variable missing. System halted.")
+ZERO_TRUST_SECRET = os.getenv("ZERO_TRUST_SECRET")
+if not ZERO_TRUST_SECRET:
+    raise RuntimeError("CRITICAL: ZERO_TRUST_SECRET environment variable missing. System halted.")
 
 app = FastAPI(
     title="PocketMunim Core Engine",
@@ -50,7 +50,7 @@ async def zero_trust_middleware(request: Request, call_next):
                             content={"detail": "Zero-Trust Signature Missing"})
 
     body = await request.body()
-    expected_mac = hmac.new(ZERO_TRUST_KEY.encode('utf-8'), body, hashlib.sha256).hexdigest()
+    expected_mac = hmac.new(ZERO_TRUST_SECRET.encode('utf-8'), body, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_mac, signature):
         return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED,
