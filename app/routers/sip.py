@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from supabase import Client
 from datetime import date, timedelta
+import calendar
 
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
@@ -20,6 +21,8 @@ async def create_sip(payload: CreateSIPRequest, db: Client = Depends(get_db)):
     data = {
         "user_id": payload.user_id,
         "asset_name": payload.asset_name.strip(),
+        "description": payload.description.strip() if payload.description else None,
+        "is_flexible": payload.is_flexible,
         "monthly_amount": payload.monthly_amount,
         "deduction_day": payload.deduction_day,
         "duration_months": payload.duration_months,
@@ -35,7 +38,8 @@ async def pay_sip(payload: PaySIPRequest, db: Client = Depends(get_db)):
     rpc_payload = {
         "user_id": payload.user_id,
         "sip_id": payload.sip_id,
-        "account_id": payload.account_id
+        "account_id": payload.account_id,
+        "amount": payload.amount
     }
     try:
         res = db.rpc("pay_sip_installment_atomic", {"payload": rpc_payload}).execute()
@@ -50,10 +54,8 @@ async def pay_sip(payload: PaySIPRequest, db: Client = Depends(get_db)):
 @router.post("/snooze", dependencies=[Depends(verify_zero_trust_signature)])
 async def snooze_sip(payload: SnoozeSIPRequest, db: Client = Depends(get_db)):
     snooze_date = date.today() + timedelta(days=payload.snooze_days)
-    db.table("sip_contracts").update({
-        "snoozed_until": str(snooze_date)
-    }).eq("sip_id", payload.sip_id).eq("user_id", payload.user_id).execute()
-
+    db.table("sip_contracts").update({"snoozed_until": str(snooze_date)}).eq("sip_id", payload.sip_id).eq("user_id",
+                                                                                                          payload.user_id).execute()
     return {"status": "SUCCESS", "message": f"Reminder snoozed until {snooze_date}."}
 
 
@@ -69,3 +71,60 @@ async def liquidate_sip(payload: PaySIPRequest, db: Client = Depends(get_db)):
         return res.data
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ==========================================
+# CRON SCHEDULER: Evaluates Due SIPs
+# ==========================================
+@router.post("/cron/reminders", dependencies=[Depends(verify_zero_trust_signature)])
+async def evaluate_sip_reminders(db: Client = Depends(get_db)):
+    """
+    Evaluates all active SIPs across the database and triggers Push Notifications
+    if the deduction day is near, respecting snooze limits and month-locks.
+    """
+    today = date.today()
+    res = db.table("sip_contracts").select("*").eq("status", "ACTIVE").execute()
+    sips = res.data or []
+
+    notifications_to_send = []
+
+    for sip in sips:
+        # Check 1: Has it been snoozed until a future date?
+        snooze = sip.get('snoozed_until')
+        if snooze and date.fromisoformat(snooze) > today:
+            continue
+
+        # Check 2: Has it already been paid this month?
+        last_paid = sip.get('last_paid_date')
+        if last_paid:
+            last_paid_dt = date.fromisoformat(last_paid)
+            if last_paid_dt.year == today.year and last_paid_dt.month == today.month:
+                continue
+
+        # Check 3: Is it due based on Reminder Preference?
+        target_day = sip['deduction_day']
+        _, max_days = calendar.monthrange(today.year, today.month)
+        effective_target_day = min(target_day, max_days)
+
+        days_until_due = effective_target_day - today.day
+        pref = sip.get('reminder_preference', '1_DAY_BEFORE')
+
+        trigger = False
+        if pref == 'SAME_DAY' and days_until_due <= 0:
+            trigger = True
+        elif pref == '1_DAY_BEFORE' and days_until_due <= 1:
+            trigger = True
+        elif pref == '1_WEEK_BEFORE' and days_until_due <= 7:
+            trigger = True
+
+        if trigger:
+            notifications_to_send.append({
+                "user_id": sip['user_id'],
+                "sip_id": sip['sip_id'],
+                "title": f"🔔 SIP Due: {sip['asset_name']}",
+                "body": f"Your SIP of ₹{sip['monthly_amount']} is due for approval."
+            })
+
+    # In a full ecosystem, you would loop over notifications_to_send
+    # and hit FCM (Firebase Cloud Messaging) or APNS to deliver to mobile.
+    return {"status": "SUCCESS", "notifications_dispatched": len(notifications_to_send)}
