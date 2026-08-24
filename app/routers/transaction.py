@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from supabase import Client
 from app.core.database import get_db
 from app.core.security import verify_zero_trust_signature
@@ -20,7 +20,18 @@ async def create_transaction(payload: CreateTransactionRequest, db: Client = Dep
         "transaction_date": payload.transaction_date or str(date.today())
     }
 
-    # Defers entirely to the locked, ACID-compliant database RPC
-    res = db.rpc("log_transaction_atomic", {"payload": rpc_payload}).execute()
+    try:
+        # Defers entirely to the locked, ACID-compliant database RPC
+        res = db.rpc("log_transaction_atomic", {"payload": rpc_payload}).execute()
 
-    return {"status": "SUCCESS", "data": res.data}
+        data = res.data
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+
+        return {"status": "SUCCESS", "data": data}
+    except Exception as e:
+        err_str = str(e)
+        if "Transaction Declined" in err_str or "Insufficient liquidity" in err_str:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Solvency Violation: Insufficient funds in the selected vault.")
+        raise
