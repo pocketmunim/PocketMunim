@@ -18,6 +18,9 @@ async def list_sips(user_id: str, db: Client = Depends(get_db)):
 
 @router.post("/create", dependencies=[Depends(verify_zero_trust_signature)])
 async def create_sip(payload: CreateSIPRequest, db: Client = Depends(get_db)):
+    # Safely evaluate deduction_day using getattr to protect against missing attributes
+    deduction_val = getattr(payload, 'deduction_day', None)
+
     data = {
         "user_id": payload.user_id,
         "asset_name": payload.asset_name.strip(),
@@ -26,8 +29,8 @@ async def create_sip(payload: CreateSIPRequest, db: Client = Depends(get_db)):
         "monthly_amount": payload.monthly_amount,
         "frequency": payload.frequency,
         "start_date": str(payload.start_date),
-        "next_due_date": str(payload.start_date), # Begins on start date
-        "deduction_day": payload.deduction_day if payload.deduction_day is not None else payload.start_date.day,
+        "next_due_date": str(payload.start_date),
+        "deduction_day": deduction_val if deduction_val is not None else payload.start_date.day,
         "duration_months": payload.duration_months,
         "reminder_preference": payload.reminder_preference,
         "status": "ACTIVE"
@@ -95,10 +98,6 @@ async def liquidate_sip(payload: PaySIPRequest, db: Client = Depends(get_db)):
 # ==========================================
 @router.post("/cron/reminders", dependencies=[Depends(verify_zero_trust_signature)])
 async def evaluate_sip_reminders(db: Client = Depends(get_db)):
-    """
-    Evaluates all active SIPs across the database and triggers Push Notifications
-    if the deduction day is near, respecting snooze limits and month-locks.
-    """
     today = date.today()
     res = db.table("sip_contracts").select("*").eq("status", "ACTIVE").execute()
     sips = res.data or []
@@ -106,19 +105,16 @@ async def evaluate_sip_reminders(db: Client = Depends(get_db)):
     notifications_to_send = []
 
     for sip in sips:
-        # Check 1: Has it been snoozed until a future date?
         snooze = sip.get('snoozed_until')
         if snooze and date.fromisoformat(snooze) > today:
             continue
 
-        # Check 2: Has it already been paid this month?
         last_paid = sip.get('last_paid_date')
         if last_paid:
             last_paid_dt = date.fromisoformat(last_paid)
             if last_paid_dt.year == today.year and last_paid_dt.month == today.month:
                 continue
 
-        # Check 3: Is it due based on Reminder Preference?
         target_day = sip.get('deduction_day') or 1
         _, max_days = calendar.monthrange(today.year, today.month)
         effective_target_day = min(target_day, max_days)
@@ -142,6 +138,4 @@ async def evaluate_sip_reminders(db: Client = Depends(get_db)):
                 "body": f"Your SIP of ₹{sip['monthly_amount']} is due for approval."
             })
 
-    # In a full ecosystem, you would loop over notifications_to_send
-    # and hit FCM (Firebase Cloud Messaging) or APNS to deliver to mobile.
     return {"status": "SUCCESS", "notifications_dispatched": len(notifications_to_send)}

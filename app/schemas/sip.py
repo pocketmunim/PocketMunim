@@ -10,6 +10,7 @@ class CreateSIPRequest(BaseModel):
     monthly_amount: float = Field(..., gt=0.0)
     frequency: str = Field(default="MONTHLY")
     start_date: date
+    deduction_day: Optional[int] = Field(default=None, ge=1, le=31)
     duration_months: Optional[int] = Field(default=None, gt=0)
     reminder_preference: str = Field(default="1_DAY_BEFORE")
 
@@ -22,4 +23,4 @@ class PaySIPRequest(BaseModel):
 class SnoozeSIPRequest(BaseModel):
     user_id: str
     sip_id: str
-    snooze_days: int
+    snooze_days: int = Field(..., gt=0, le=30)
