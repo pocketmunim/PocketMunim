@@ -27,12 +27,14 @@ async def create_sip(payload: CreateSIPRequest, db: Client = Depends(get_db)):
         "frequency": payload.frequency,
         "start_date": str(payload.start_date),
         "next_due_date": str(payload.start_date), # Begins on start date
+        "deduction_day": payload.deduction_day if payload.deduction_day is not None else payload.start_date.day,
         "duration_months": payload.duration_months,
         "reminder_preference": payload.reminder_preference,
         "status": "ACTIVE"
     }
     res = db.table("sip_contracts").insert(data).execute()
-    return {"status": "SUCCESS", "data": res.data[0]}
+    return {"status": "SUCCESS", "message": "SIP Contract Initialized.", "data": res.data[0]}
+
 
 @router.post("/settle-past", dependencies=[Depends(verify_zero_trust_signature)])
 async def settle_past_sips(payload: PaySIPRequest, db: Client = Depends(get_db)):
@@ -61,7 +63,7 @@ async def pay_sip(payload: PaySIPRequest, db: Client = Depends(get_db)):
         return res.data
     except Exception as e:
         err = str(e)
-        if "Insufficient funds" in err:
+        if "Insufficient funds" in err or "Solvency Violation" in err:
             raise HTTPException(status_code=400, detail="Solvency Violation: Not enough funds in selected vault.")
         raise HTTPException(status_code=400, detail=err)
 
@@ -117,7 +119,7 @@ async def evaluate_sip_reminders(db: Client = Depends(get_db)):
                 continue
 
         # Check 3: Is it due based on Reminder Preference?
-        target_day = sip['deduction_day']
+        target_day = sip.get('deduction_day') or 1
         _, max_days = calendar.monthrange(today.year, today.month)
         effective_target_day = min(target_day, max_days)
 
