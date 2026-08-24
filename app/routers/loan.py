@@ -237,7 +237,12 @@ async def settle_past_emis(payload: SettlePastEMIsRequest, db: Client = Depends(
     }
 
     res = db.rpc("settle_past_emis_atomic", {"payload": rpc_payload}).execute()
-    return {"status": "SUCCESS", "data": res.data}
+
+    data = res.data
+    if isinstance(data, list) and len(data) > 0:
+        data = data[0]
+
+    return {"status": "SUCCESS", "data": data}
 
 
 @router.post(
