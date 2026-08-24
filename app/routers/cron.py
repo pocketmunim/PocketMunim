@@ -109,17 +109,13 @@ async def process_daily_salary_disbursals(
 
 @router.post("/process-sips")
 async def process_qstash_sip_reminders(
-    request: Request,
-    token: Optional[str] = Query(None),
-    authorization: Optional[str] = Header(None),
-    x_qstash_token: Optional[str] = Header(None),
-    upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
-    db: Client = Depends(get_db)
+        request: Request,
+        token: Optional[str] = Query(None),
+        authorization: Optional[str] = Header(None),
+        x_qstash_token: Optional[str] = Header(None),
+        upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
+        db: Client = Depends(get_db)
 ):
-    """
-    QStash cron handler for evaluating active SIP contracts,
-    respecting snooze constraints, and queuing due notifications.
-    """
     is_authenticated = await _verify_qstash_auth(request, token, authorization, x_qstash_token, upstash_signature)
     if not is_authenticated:
         raise HTTPException(
@@ -134,19 +130,35 @@ async def process_qstash_sip_reminders(
     notifications_dispatched = 0
 
     for sip in sips:
-        # Check 1: Respect snooze limits
+        # 1. Respect snooze limits
         snooze = sip.get('snoozed_until')
         if snooze and date.fromisoformat(snooze) > today:
             continue
 
-        # Check 2: Evaluate next due date alignment
+        # 2. Check if installment is due/pending (Next due date has arrived or passed)
         next_due = sip.get('next_due_date')
         if next_due:
             next_due_dt = date.fromisoformat(next_due)
-            # If the next due date is today or in the past, flag/dispatch notification alert
+
+            # If the scheduled date is today or in the past, it's a pending/missed obligation
             if next_due_dt <= today:
-                notifications_dispatched += 1
-                # Optional: log notification or trigger downstream push notification handler here
+                # Check if an unread notification for this specific asset already exists today to prevent duplication
+                existing_alert = db.table("app_notifications") \
+                    .select("notification_id") \
+                    .eq("user_id", sip['user_id']) \
+                    .ilike("body", f"%{sip['asset_name']}%") \
+                    .eq("is_read", False) \
+                    .execute()
+
+                if not existing_alert.data:
+                    # Write notification to database so the Flutter app can fetch it instantly
+                    db.table("app_notifications").insert({
+                        "user_id": sip['user_id'],
+                        "title": f"⚠️ Pending SIP: {sip['asset_name']}",
+                        "body": f"Your installment of ₹{sip['monthly_amount']} ({sip['frequency']}) was due on {next_due} and remains unpaid."
+                    }).execute()
+
+                    notifications_dispatched += 1
 
     return {
         "status": "COMPLETED",
