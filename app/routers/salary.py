@@ -48,9 +48,10 @@ async def get_salary_matrix(user_id: str, year: int, db: Client = Depends(get_db
 
         m_txs = [t for t in txs if int(t['transaction_date'].split('-')[1]) == m]
 
+        # FIXED: Exclude the salary's own transaction to prevent double-counting in the matrix
         m_other_income = sum(
             float(t['amount']) for t in m_txs
-            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
+            if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED' and t.get('salary_id') != s['salary_id']
         )
         total_month_income = actual + m_other_income
         m_debit = sum(float(t['amount']) for t in m_txs if t['type'] in ['DEBIT', 'EXPENSE'])
@@ -94,6 +95,7 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
     uid = str(payload.user_id)
     sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', payload.year).eq('month',
                                                                                               payload.month).execute()
+
     if not sal_res.data:
         raise HTTPException(status_code=404, detail="Salary entry not found for specified cycle.")
 
@@ -142,87 +144,36 @@ async def override_salary(payload: SalaryOverrideRequest, db: Client = Depends(g
     dependencies=[Depends(verify_zero_trust_signature)]
 )
 async def settle_salary(payload: SettleSalaryRequest, db: Client = Depends(get_db)):
-    uid = str(payload.user_id)
-    sid = str(payload.salary_id)
+    # Clean fallback for empty string account IDs to ensure proper UUID casting in Postgres
+    target_aid = None
+    if payload.target_account_id and str(payload.target_account_id).strip() != "":
+        target_aid = str(payload.target_account_id)
 
-    sal_res = db.table('salaries').select('*').eq('salary_id', sid).eq('user_id', uid).execute()
-    if not sal_res.data:
-        raise HTTPException(status_code=404, detail="Salary record not found.")
-
-    sal = sal_res.data[0]
-
-    if sal['status'] != 'PAID':
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Settlement Invalid: Salary must be in PAID state to settle (Current: {sal['status']})."
-        )
-
-    yr = sal['year']
-    m = sal['month']
-    salary_amount = float(sal['actual_amount'])
-
-    start_d = f"{yr:04d}-{m:02d}-01"
-    _, last_day_of_month = calendar.monthrange(yr, m)
-    end_d = f"{yr:04d}-{m:02d}-{last_day_of_month:02d}"
-
-    tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
-        'transaction_date', end_d).execute()
-    txs = tx_res.data or []
-
-    m_other_income = sum(
-        float(t['amount']) for t in txs
-        if t['type'] in ['INCOME', 'CREDIT'] and t['status'] == 'CREDITED'
-    )
-    total_inflow = salary_amount + m_other_income
-    total_debits = sum(float(t['amount']) for t in txs if t['type'] in ['DEBIT', 'EXPENSE'])
-
-    if total_debits > total_inflow:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Settlement Blocked: Total debits (₹{total_debits:,.2f}) exceed total incoming funds (₹{total_inflow:,.2f})."
-        )
-
-    settlement_debit_amount = total_inflow - total_debits
-    target_acc = str(payload.target_account_id) if payload.target_account_id else sal.get('account_id')
-
-    # 1. Deduct amount from accounts balance
-    if settlement_debit_amount > 0 and target_acc:
-        acc_res = db.table('accounts').select('balance').eq('account_id', target_acc).execute()
-        if acc_res.data:
-            curr_bal = float(acc_res.data[0]['balance'])
-            new_bal = curr_bal - settlement_debit_amount
-            db.table('accounts').update({"balance": new_bal}).eq('account_id', target_acc).execute()
-
-        # 2. Make DEBIT entry in transactions table with status = 'DEBITED'
-        db.table('transactions').insert({
-            "user_id": uid,
-            "account_id": target_acc,
-            "salary_id": sid,
-            "type": "DEBIT",
-            "category": "Salary Settlement",
-            "amount": settlement_debit_amount,
-            "transaction_date": str(date.today()),
-            "status": "DEBITED",
-            "description": f"Bulk Month Settlement Sweep - {calendar.month_name[m]} {yr}"
-        }).execute()
-
-        # 3. Make audit entry in account_logs
-        db.table('account_logs').insert({
-            "user_id": uid,
-            "account_id": target_acc,
-            "event_type": "SALARY_MONTH_SETTLED_DEBIT",
-            "amount": -settlement_debit_amount,
-            "description": f"Month closed and balance swept for {calendar.month_name[m]} {yr} (Deducted: ₹{settlement_debit_amount:,.2f})."
-        }).execute()
-
-    # 4. Update salary contract status to SETTLED
-    db.table('salaries').update({
-        "status": "SETTLED",
-        "account_id": target_acc
-    }).eq('salary_id', sid).execute()
-
-    return {
-        "status": "SETTLED",
-        "settled_amount_debited": settlement_debit_amount,
-        "message": f"Month {calendar.month_name[m]} {yr} settled. ₹{settlement_debit_amount:,.2f} debited from vault."
+    rpc_payload = {
+        "user_id": str(payload.user_id),
+        "salary_id": str(payload.salary_id),
+        "target_account_id": target_aid
     }
+
+    try:
+        # SECURED: Defers entirety of multi-table updates to the ACID-compliant RPC
+        res = db.rpc("settle_salary_atomic", {"payload": rpc_payload}).execute()
+
+        data = res.data
+        if isinstance(data, list) and len(data) > 0:
+            data = data[0]
+
+        return {"status": "SUCCESS", "data": data}
+    except Exception as e:
+        err_str = str(e)
+        user_message = "Your salary settlement request could not be completed."
+
+        if "already settled" in err_str.lower():
+            user_message = "This salary cycle has already been settled and accounted for."
+        elif "not found" in err_str.lower():
+            user_message = "Account vault or salary record could not be found."
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=user_message
+        )
