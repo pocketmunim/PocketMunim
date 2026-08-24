@@ -8,6 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip, notifications
+import json
+import re
 
 # Configure internal secure logging
 logging.basicConfig(level=logging.INFO)
@@ -88,30 +90,62 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+import json
+import re
+
 @app.exception_handler(Exception)
 async def global_catch_all_exception_handler(request: Request, exc: Exception):
-    err_str = str(exc).lower()
+    err_str = str(exc)
 
-    if "unique constraint" in err_str or "23505" in err_str:
+    # 1. Extract PostgREST APIError / JSON error messages if present
+    extracted_msg = None
+    if hasattr(exc, "message") and exc.message:
+        extracted_msg = exc.message
+    elif hasattr(exc, "details") and exc.details:
+        extracted_msg = exc.details
+    else:
+        # Check if error string contains a JSON or dict payload like {'message': '...', 'details': '...'}
+        try:
+            dict_match = re.search(r"\{.*\}", err_str)
+            if dict_match:
+                parsed = ast.literal_eval(dict_match.group(0))
+                if isinstance(parsed, dict):
+                    extracted_msg = parsed.get("message") or parsed.get("details")
+        except Exception:
+            pass
+
+    final_msg = extracted_msg or err_str
+
+    # 2. Check for Duplicate Constraint Violations
+    if "unique constraint" in final_msg.lower() or "23505" in final_msg:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
-            content={"status": "ERROR", "error_code": 409,
-                     "detail": "Duplicate record detected. Please use a unique title."}
+            content={"status": "ERROR", "error_code": 409, "detail": "Duplicate record detected."}
         )
 
+    # 3. Whitelist and return custom Postgres RAISE EXCEPTION messages directly to the client
     known_safe_keywords = [
-        "duplicate_current_month", "insufficient balance", "account not found",
-        "solvency violation", "no active liquidity vault"
+        "duplicate_current_month",
+        "insufficient balance",
+        "account not found",
+        "solvency violation",
+        "no active liquidity vault",
+        "settlement blocked",
+        "salary is already settled",
+        "salary record not found",
+        "must be in paid state",
+        "transaction declined"
     ]
 
     for safe_word in known_safe_keywords:
-        if safe_word in err_str:
+        if safe_word in final_msg.lower():
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={"status": "ERROR", "error_code": 400, "detail": str(exc)}
+                content={"status": "ERROR", "error_code": 400, "detail": final_msg}
             )
 
-    logger.error(f"CRITICAL SYSTEM ERROR [{request.method} {request.url.path}]: {err_str}", exc_info=True)
+    # 4. Fallback: Log system error and return sanitized message
+    logger.error(f"SYSTEM ERROR [{request.method} {request.url.path}]: {err_str}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"status": "ERROR", "error_code": 500, "detail": "Internal System Error."}
