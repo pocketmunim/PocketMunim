@@ -1,9 +1,15 @@
+import logging
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
 from app.routers import auth, salary, account, cron, dashboard, transaction, loan
+
+# Configure internal secure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PocketMunim Core Engine",
@@ -11,13 +17,20 @@ app = FastAPI(
     version="2.6.0"
 )
 
+# 1. SECURE CORS POLICY (Fortune 100 Standard)
+# Strictly limits which domains and mobile protocols can communicate with the backend.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://pocket-munim.vercel.app",
+        "capacitor://localhost",
+        "http://localhost"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],  # Block dangerous HTTP methods (PUT/DELETE/PATCH)
     allow_headers=["*"],
 )
+
 
 # 1. Custom HTTP Exception Formatter
 @app.exception_handler(StarletteHTTPException)
@@ -27,6 +40,7 @@ async def custom_http_exception_handler(request: Request, exc: StarletteHTTPExce
         status_code=exc.status_code,
         content={"status": "ERROR", "error_code": exc.status_code, "detail": detail_msg}
     )
+
 
 # 2. Pydantic Request Validation Error Formatter
 @app.exception_handler(RequestValidationError)
@@ -40,7 +54,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content={"status": "ERROR", "error_code": 422, "detail": f"Validation Error in '{field}': {msg}"}
     )
 
-# 3. Global Catch-All Handler (Database constraints & internal crashes)
+
+# 3. Global Catch-All Handler (DATA LEAKAGE PREVENTED)
 @app.exception_handler(Exception)
 async def global_catch_all_exception_handler(request: Request, exc: Exception):
     err_str = str(exc)
@@ -49,10 +64,16 @@ async def global_catch_all_exception_handler(request: Request, exc: Exception):
             status_code=status.HTTP_409_CONFLICT,
             content={"status": "ERROR", "error_code": 409, "detail": "Duplicate record detected. Entry already exists."}
         )
+
+    # CRITICAL: Log the actual error to your internal systems, but DO NOT return it to the client.
+    logger.error(f"CRITICAL SYSTEM ERROR [{request.method} {request.url.path}]: {err_str}", exc_info=True)
+
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"status": "ERROR", "error_code": 500, "detail": f"Internal System Error: {err_str}"}
+        content={"status": "ERROR", "error_code": 500,
+                 "detail": "Internal System Error: An unexpected issue occurred. Secure logs have been updated."}
     )
+
 
 # Route Registrations
 app.include_router(auth.router)
@@ -60,8 +81,9 @@ app.include_router(dashboard.router)
 app.include_router(transaction.router)
 app.include_router(account.router)
 app.include_router(salary.router)
-app.include_router(loan.router)          # Resolves 404 for /api/v1/loans/*
+app.include_router(loan.router)
 app.include_router(cron.router)
+
 
 # Catch-all Webhook Handler (Resolves 404 on /webhook)
 @app.post("/webhook")
@@ -75,9 +97,11 @@ async def webhook_handler(request: Request):
         content={"status": "SUCCESS", "message": "Webhook acknowledged", "payload": payload}
     )
 
+
 @app.get("/webhook")
 async def health_webhook():
     return {"status": "ONLINE", "endpoint": "/webhook"}
+
 
 @app.get("/")
 def health():
