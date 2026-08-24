@@ -1,89 +1,73 @@
-from fastapi import APIRouter, Depends, HTTPException
-from app.core.database import get_db
-from app.core.security import verify_zero_trust_signature
+from fastapi import APIRouter, Depends
 from supabase import Client
 from datetime import date
 import calendar
 
-router = APIRouter(prefix="/api/v1/dashboard", tags=["Command Dashboard Engine"])
+from app.core.database import get_db
+from app.core.security import verify_zero_trust_signature
+
+router = APIRouter(prefix="/api/v1/dashboard", tags=["Dashboard"])
 
 
-@router.post(
-    "/summary/{user_id}",
-    dependencies=[Depends(verify_zero_trust_signature)]
-)
+@router.post("/summary/{user_id}", dependencies=[Depends(verify_zero_trust_signature)])
 async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     uid = str(user_id)
     today = date.today()
-    current_year = today.year
-    current_month = today.month
 
-    # 1. Fetch user profile
-    u_res = db.table('users').select('full_name, currency').eq('user_id', uid).execute()
-    if not u_res.data:
-        raise HTTPException(status_code=404, detail="User identity not provisioned in vault.")
-    user = u_res.data[0]
+    # 1. Fetch User Identity
+    user_res = db.table('users').select('full_name').eq('user_id', uid).execute()
+    user_name = user_res.data[0]['full_name'] if user_res.data else "Commander"
 
-    # 2. Fetch all registered liquidity accounts
-    acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).order('is_default',
-                                                                                              desc=True).execute()
+    # 2. Aggregate Active Liquidity Vaults
+    acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).execute()
     accounts = acc_res.data or []
-    total_liquidity = sum(float(a['balance']) for a in accounts)
-    default_acc = next((a for a in accounts if a['is_default']), accounts[0] if accounts else None)
+    total_liquidity = sum(float(a.get('balance', 0)) for a in accounts)
 
-    # 3. Fetch current month salary status
-    sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', current_year).eq('month',
-                                                                                              current_month).execute()
-    current_salary = sal_res.data[0] if sal_res.data else None
+    default_vault = "N/A"
+    for a in accounts:
+        if a.get('is_default'):
+            default_vault = a['account_name']
+            break
+    if default_vault == "N/A" and accounts:
+        default_vault = accounts[0]['account_name']
 
-    # 4. Fetch transactions for month metrics & recent 5 ledger events
-    start_d = f"{current_year:04d}-{current_month:02d}-01"
-    _, last_day = calendar.monthrange(current_year, current_month)
-    end_d = f"{current_year:04d}-{current_month:02d}-{last_day:02d}"
+    # 3. Aggregate Active Debt Liabilities (FIXES THE DEBT STRESS GAUGE)
+    loans_res = db.table('loans').select('pending_principal').eq('user_id', uid).eq('status', 'ACTIVE').eq('loan_type',
+                                                                                                           'BORROWED').execute()
+    total_liabilities = sum(float(l.get('pending_principal', 0)) for l in (loans_res.data or []))
 
-    # Recent activity feed strictly capped at the last 5 transactions
-    tx_res = db.table('transactions') \
-        .select('*') \
-        .eq('user_id', uid) \
-        .order('created_at', desc=True) \
-        .limit(5) \
-        .execute()
-    recent_txs = tx_res.data or []
+    # 4. Calculate Current Month Inflows
+    start_d = f"{today.year:04d}-{today.month:02d}-01"
+    _, last_day = calendar.monthrange(today.year, today.month)
+    end_d = f"{today.year:04d}-{today.month:02d}-{last_day:02d}"
 
-    # Monthly calculation metrics for income & spend
-    all_tx_month = db.table('transactions') \
-                       .select('amount, type, status, category') \
-                       .eq('user_id', uid) \
-                       .gte('transaction_date', start_d) \
-                       .lte('transaction_date', end_d) \
-                       .execute().data or []
+    tx_res = db.table('transactions').select('*').eq('user_id', uid).gte('transaction_date', start_d).lte(
+        'transaction_date', end_d).execute()
+    txs = tx_res.data or []
+    month_income = sum(float(t.get('amount', 0)) for t in txs if
+                       t.get('type') in ['CREDIT', 'INCOME'] and t.get('status') == 'CREDITED')
 
-    month_spent = sum(
-        float(t['amount']) for t in all_tx_month
-        if t['type'] in ['DEBIT', 'EXPENSE'] and t['category'] != 'Vault Transfer'
-    )
-    month_income = sum(
-        float(t['amount']) for t in all_tx_month
-        if t['type'] in ['CREDIT', 'SALARY', 'INCOME'] and t['category'] != 'Vault Transfer'
-    )
+    # 5. Fetch Current Salary Pulse
+    sal_res = db.table('salaries').select('*').eq('user_id', uid).eq('year', today.year).eq('month',
+                                                                                            today.month).execute()
+    current_salary = sal_res.data[0] if sal_res.data else {}
+
+    # 6. Fetch Recent Ledger Feed
+    recent_res = db.table('transactions').select('*').eq('user_id', uid).order('transaction_date', desc=True).limit(
+        5).execute()
+    recent_activity = recent_res.data or []
 
     return {
         "status": "SUCCESS",
-        "user_name": user.get('full_name', 'Commander'),
-        "currency": user.get('currency', 'INR'),
-        "total_liquidity": total_liquidity,
-        "active_vaults_count": len(accounts),
-        "default_vault": default_acc['account_name'] if default_acc else "None",
-        "current_month_name": calendar.month_name[current_month],
-        "current_salary": {
-            "amount": float(current_salary['actual_amount']) if current_salary else 0.0,
-            "status": current_salary['status'] if current_salary else "UNSCHEDULED",
-            "payout_date": current_salary['payout_date'] if current_salary else str(today)
-        },
-        "month_metrics": {
-            "total_income": month_income,
-            "total_spent": month_spent,
-            "net_surplus": month_income - month_spent
-        },
-        "recent_activity": recent_txs
+        "data": {
+            "user_name": user_name,
+            "total_liquidity": total_liquidity,
+            "total_liabilities": total_liabilities,
+            "default_vault": default_vault,
+            "active_vaults_count": len(accounts),
+            "current_month_name": calendar.month_name[today.month],
+            "month_metrics": {"total_income": month_income},
+            "current_salary": current_salary,
+            "recent_activity": recent_activity
+        }
     }
