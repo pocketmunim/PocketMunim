@@ -135,14 +135,13 @@ async def process_qstash_sip_reminders(
         if snooze and date.fromisoformat(snooze) > today:
             continue
 
-        # 2. Check if installment is due/pending (Next due date has arrived or passed)
         next_due = sip.get('next_due_date')
         if next_due:
             next_due_dt = date.fromisoformat(next_due)
 
-            # If the scheduled date is today or in the past, it's a pending/missed obligation
+            # Trigger if due today or past due
             if next_due_dt <= today:
-                # Check if an unread notification for this specific asset already exists today to prevent duplication
+                # Check if an unread notification for this specific asset exists
                 existing_alert = db.table("app_notifications") \
                     .select("notification_id") \
                     .eq("user_id", sip['user_id']) \
@@ -151,11 +150,10 @@ async def process_qstash_sip_reminders(
                     .execute()
 
                 if not existing_alert.data:
-                    # Write notification to database so the Flutter app can fetch it instantly
                     db.table("app_notifications").insert({
                         "user_id": sip['user_id'],
                         "title": f"⚠️ Pending SIP: {sip['asset_name']}",
-                        "body": f"Your installment of ₹{sip['monthly_amount']} ({sip['frequency']}) was due on {next_due} and remains unpaid."
+                        "body": f"Your installment of ₹{sip['monthly_amount']} ({sip['frequency']}) is due and pending approval."
                     }).execute()
 
                     notifications_dispatched += 1
