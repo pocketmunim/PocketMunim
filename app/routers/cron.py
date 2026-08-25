@@ -57,6 +57,10 @@ async def _verify_qstash_auth(
     return False
 
 
+from firebase_admin import messaging
+import calendar
+
+
 @router.post("/process-salaries")
 async def process_daily_salary_disbursals(
         request: Request,
@@ -66,7 +70,7 @@ async def process_daily_salary_disbursals(
         upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
         db: Client = Depends(get_db)
 ):
-    # 1. Multi-vector Security Verification
+    # 1. Security Verification
     is_authenticated = await _verify_qstash_auth(request, token, authorization, x_qstash_token, upstash_signature)
     if not is_authenticated:
         raise HTTPException(
@@ -75,19 +79,64 @@ async def process_daily_salary_disbursals(
         )
 
     today_str = str(date.today())
+    notifications_dispatched = 0
 
     try:
-        # 2. Execute the entire batch operation in ONE network call
+        # 2. Execute the ACID-compliant batch operation
         rpc_res = db.rpc(
             "process_due_salaries_atomic",
             {"p_target_date": today_str}
         ).execute()
 
-        # 3. Bubble up the JSONB response directly from Postgres
-        return rpc_res.data
+        # 3. If salaries were processed, fetch details to send notifications
+        if rpc_res.data and rpc_res.data.get("processed_count", 0) > 0:
+
+            # Fetch the salaries that were just paid today to get the user tokens
+            disbursed_salaries = db.table('salaries') \
+                .select('*, users(fcm_token)') \
+                .eq('payout_date', today_str) \
+                .eq('status', 'PAID') \
+                .execute()
+
+            for sal in disbursed_salaries.data:
+                user_id = sal['user_id']
+                amount = sal['actual_amount']
+                month_name = calendar.month_name[sal['month']]
+
+                # Insert In-App Notification Log
+                db.table("app_notifications").insert({
+                    "user_id": user_id,
+                    "title": "🎉 Salary Credited!",
+                    "body": f"Your {month_name} salary of ₹{amount} has been securely deposited into your vault."
+                }).execute()
+
+                # Dispatch Native Mobile Push Notification
+                fcm_token = sal.get("users", {}).get("fcm_token")
+                if fcm_token:
+                    try:
+                        message = messaging.Message(
+                            notification=messaging.Notification(
+                                title="🎉 Salary Credited!",
+                                body=f"Your {month_name} salary of ₹{amount} has been securely deposited."
+                            ),
+                            data={
+                                "click_action": "FLUTTER_NOTIFICATION_CLICK",
+                                "route": "/salary_matrix"  # Routes user directly to the Salary screen
+                            },
+                            token=fcm_token,
+                        )
+                        messaging.send(message)
+                        notifications_dispatched += 1
+                    except Exception as e:
+                        print(f"Failed to send FCM Push Notification: {e}")
+
+        # 4. Return combined result
+        response_data = rpc_res.data
+        response_data["notifications_dispatched"] = notifications_dispatched
+        return response_data
 
     except Exception as e:
-        logger.error(f"Salary Cron Failure: {e}")
+        print(f"Salary Cron Failure: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database execution failed during batch processing."
