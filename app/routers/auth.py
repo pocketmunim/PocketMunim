@@ -10,17 +10,14 @@ from uuid import UUID
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Identity & Provisioning"])
 
-
 class NodeStatusRequest(BaseModel):
     user_id: UUID
-
 
 class NodeStatusResponse(BaseModel):
     status: str
     is_registered: bool
     full_name: str = ""
     currency: str = "INR"
-
 
 @router.post(
     "/status",
@@ -31,7 +28,6 @@ async def check_node_clearance(payload: NodeStatusRequest, db: Client = Depends(
     uid_str = str(payload.user_id)
     try:
         user_res = db.table('users').select('user_id, full_name, currency, is_active').eq('user_id', uid_str).execute()
-
         if user_res.data and len(user_res.data) > 0:
             user = user_res.data[0]
             return NodeStatusResponse(
@@ -40,7 +36,6 @@ async def check_node_clearance(payload: NodeStatusRequest, db: Client = Depends(
                 full_name=user.get("full_name", ""),
                 currency=user.get("currency", "INR")
             )
-
         return NodeStatusResponse(
             status="UNREGISTERED",
             is_registered=False,
@@ -52,7 +47,6 @@ async def check_node_clearance(payload: NodeStatusRequest, db: Client = Depends(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Vault Identity Verification Fault: {str(e)}"
         )
-
 
 @router.post(
     "/register",
@@ -86,18 +80,31 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
         }
         db.table('users').insert(user_insert).execute()
 
-        # 2. Insert primary bank account with is_default = True
+        # 2. Insert primary bank account (BANK)
         acc_insert = {
             "user_id": uid_str,
             "account_name": payload.bank_name.upper(),
             "balance": float(payload.current_balance),
             "is_default": True,
-            "is_active": True
+            "is_active": True,
+            "account_type": "BANK"
         }
         acc_res = db.table('accounts').insert(acc_insert).execute()
         account_id = acc_res.data[0]['account_id']
 
-        # 3. Genesis audit log
+        # 3. Insert Physical Wallet account (CASH)
+        cash_insert = {
+            "user_id": uid_str,
+            "account_name": "Physical Wallet",
+            "balance": float(payload.cash_in_hand),
+            "is_default": False,
+            "is_active": True,
+            "account_type": "CASH"
+        }
+        cash_res = db.table('accounts').insert(cash_insert).execute()
+        cash_account_id = cash_res.data[0]['account_id']
+
+        # 4. Genesis audit logs
         db.table('account_logs').insert({
             "user_id": uid_str,
             "account_id": account_id,
@@ -106,22 +113,32 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "description": f"Initial default liquidity vault provisioned for {payload.bank_name.upper()}."
         }).execute()
 
-        # 4. Dynamically seed 12 months with holiday & weekend shifting
-        current_year = date.today().year
-        await SalaryService.seed_annual_salaries(
-            db=db,
-            user_id=uid_str,
-            account_id=account_id,
-            salary_amount=float(payload.salary),
-            salary_date=int(payload.salary_date),
-            year=current_year
-        )
+        if payload.cash_in_hand > 0:
+            db.table('account_logs').insert({
+                "user_id": uid_str,
+                "account_id": cash_account_id,
+                "event_type": "CASH_INITIALIZATION",
+                "amount": float(payload.cash_in_hand),
+                "description": "Initial physical cash wallet provisioned."
+            }).execute()
+
+        # 5. Dynamically seed 12 months salary ONLY IF user has a fixed income (> 0)
+        if payload.salary > 0:
+            current_year = date.today().year
+            await SalaryService.seed_annual_salaries(
+                db=db,
+                user_id=uid_str,
+                account_id=account_id,
+                salary_amount=float(payload.salary),
+                salary_date=int(payload.salary_date),
+                year=current_year
+            )
 
         return RegisterResponse(
             status="PROVISIONED",
             code=201,
             user_id=payload.user_id,
-            message="Node successfully provisioned. Default vault initialized."
+            message="Node successfully provisioned. Bank and Cash vaults initialized."
         )
 
     except HTTPException:

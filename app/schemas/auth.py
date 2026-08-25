@@ -5,10 +5,11 @@ from typing import Optional
 class RegisterRequest(BaseModel):
     user_id: UUID = Field(..., description="Hardware UUID from device")
     full_name: str = Field(..., min_length=2, max_length=150)
-    salary: float = Field(..., ge=0.0)
-    salary_date: int = Field(..., ge=1, le=31, description="Cycle day selection")
+    salary: float = Field(default=0.0, ge=0.0)
+    salary_date: Optional[int] = Field(default=1, ge=1, le=31, description="Cycle day selection")
     bank_name: str = Field(..., min_length=2, max_length=80)
-    current_balance: float = Field(..., ge=0.0)
+    current_balance: float = Field(default=0.0, ge=0.0)
+    cash_in_hand: float = Field(default=0.0, ge=0.0)
     currency: Optional[str] = "INR"
     fcm_token: Optional[str] = None
 
