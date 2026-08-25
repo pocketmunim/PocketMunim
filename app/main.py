@@ -39,8 +39,7 @@ app.add_middleware(
 async def zero_trust_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
-    if request.url.path in ["/", "/webhook", "/docs", "/openapi.json"]:
-        return await call_next(request)
+    if request.url.path in ["/", "/webhook", "/docs", "/openapi.json"] or request.url.path.startswith("/api/v1/cron/"):        return await call_next(request)
 
     signature = request.headers.get("X-Zero-Trust-Signature")
     if not signature:
