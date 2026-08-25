@@ -76,64 +76,22 @@ async def process_daily_salary_disbursals(
 
     today_str = str(date.today())
 
-    # 2. Fetch all scheduled salaries due on or before today that are still 'SCHEDULED'
-    pending_res = db.table('salaries').select('*').eq('status', 'SCHEDULED').lte('payout_date', today_str).execute()
-    pending = pending_res.data or []
+    try:
+        # 2. Execute the entire batch operation in ONE network call
+        rpc_res = db.rpc(
+            "process_due_salaries_atomic",
+            {"p_target_date": today_str}
+        ).execute()
 
-    disbursed_count = 0
-    total_amount = 0.0
+        # 3. Bubble up the JSONB response directly from Postgres
+        return rpc_res.data
 
-    for s in pending:
-        sid = s['salary_id']
-        uid = s['user_id']
-        acc_id = s.get('account_id')
-        amt = float(s['actual_amount'])
-        m = s['month']
-        yr = s['year']
-        payout_date_str = s['payout_date']
-
-        if acc_id:
-            # 1. Credit account balance
-            acc_res = db.table('accounts').select('balance').eq('account_id', acc_id).execute()
-            if acc_res.data:
-                curr_bal = float(acc_res.data[0]['balance'])
-                db.table('accounts').update({"balance": curr_bal + amt}).eq('account_id', acc_id).execute()
-
-            # 2. CREATE the transaction entry ONLY at disbursement time
-            db.table('transactions').insert({
-                "user_id": uid,
-                "account_id": acc_id,
-                "salary_id": sid,
-                "type": "SALARY",
-                "category": "Salary",
-                "amount": amt,
-                "transaction_date": payout_date_str,
-                "status": "CREDITED",
-                "description": f"Automated Salary Credit - {calendar.month_name[m]} {yr}"
-            }).execute()
-
-            # 3. Insert audit log
-            db.table('account_logs').insert({
-                "user_id": uid,
-                "account_id": acc_id,
-                "event_type": "QSTASH_AUTO_SALARY_CREDIT",
-                "amount": amt,
-                "description": f"Automated cron dispersal for {calendar.month_name[m]} {yr} (Payout Date: {payout_date_str})."
-            }).execute()
-
-        # Update salary status to PAID
-        db.table('salaries').update({"status": "PAID", "paid_at": "now()"}).eq('salary_id', sid).execute()
-
-        disbursed_count += 1
-        total_amount += amt
-
-    return {
-        "status": "COMPLETED",
-        "processed_count": disbursed_count,
-        "total_disbursed": total_amount,
-        "date": today_str
-    }
-
+    except Exception as e:
+        logger.error(f"Salary Cron Failure: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database execution failed during batch processing."
+        )
 
 @router.post("/process-sips")
 async def process_qstash_sip_reminders(

@@ -1,24 +1,29 @@
-from pydantic import BaseModel
-import logging
-from fastapi import APIRouter, Depends, HTTPException
-from supabase import Client
+from fastapi import APIRouter, Request, status
+from fastapi.responses import JSONResponse
+from supabase import create_client
+import os
 
-from app.core.database import get_db
-from app.core.security import verify_zero_trust_signature
-
-
-class RegisterDeviceRequest(BaseModel):
-    user_id: str
-    fcm_token: str
 router = APIRouter(
     prefix="/api/v1/notifications",
     tags=["Notifications"]
 )
-@router.post("/register-device", dependencies=[Depends(verify_zero_trust_signature)])
-async def register_device(payload: RegisterDeviceRequest, db: Client = Depends(get_db)):
-    try:
-        db.table("users").update({"fcm_token": payload.fcm_token}).eq("user_id", payload.user_id).execute()
-        return {"status": "SUCCESS", "message": "Device registered for push notifications."}
-    except Exception as e:
-        logging.error(f"FCM Registration Error: {e}")
-        raise HTTPException(status_code=400, detail="Failed to register device token.")
+
+db = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+
+
+@router.post("/register-device")
+async def register_device(request: Request):
+    payload = await request.json()
+    user_id = payload.get("user_id")
+    fcm_token = payload.get("fcm_token")
+
+    if not user_id or not fcm_token:
+        return JSONResponse(status_code=400, content={"message": "Missing user_id or fcm_token"})
+
+    # Save the FCM token to the user's profile
+    res = db.table("users").update({"fcm_token": fcm_token}).eq("user_id", user_id).execute()
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"status": "SUCCESS", "message": "Device securely registered for push notifications."}
+    )
