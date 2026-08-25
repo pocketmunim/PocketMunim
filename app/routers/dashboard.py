@@ -18,7 +18,7 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     user_name = user_res.data[0]['full_name'] if user_res.data else "Commander"
     avatar_url = user_res.data[0].get('avatar_url') if user_res.data else None
 
-    # 2. Aggregate Active Liquidity Vaults
+    # 2. Aggregate Active Accounts (Vaults)
     acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).execute()
     accounts = acc_res.data or []
     total_liquidity = sum(float(a.get('balance', 0)) for a in accounts)
@@ -31,11 +31,11 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     if default_vault == "N/A" and accounts:
         default_vault = accounts[0]['account_name']
 
-    # 3. Aggregate Active Debt Liabilities
+    # 3. Aggregate Liabilities
     loans_res = db.table('loans').select('pending_principal').eq('user_id', uid).eq('status', 'ACTIVE').eq('loan_type', 'BORROWED').execute()
     total_liabilities = sum(float(l.get('pending_principal', 0)) for l in (loans_res.data or []))
 
-    # 4. Calculate Current Month Inflows (Salary & general credits)
+    # 4. Calculate Current Month Inflows
     start_d = f"{today.year:04d}-{today.month:02d}-01"
     _, last_day = calendar.monthrange(today.year, today.month)
     end_d = f"{today.year:04d}-{today.month:02d}-{last_day:02d}"
@@ -43,17 +43,12 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     tx_res = db.table('transactions').select('amount').eq('user_id', uid).eq('type', 'CREDIT').gte('transaction_date', start_d).lte('transaction_date', end_d).execute()
     total_income = sum(float(tx['amount']) for tx in (tx_res.data or []))
 
-    # 5. Fetch Salary Status
-    sal_res = db.table('salaries').select('actual_amount, status, payout_date').eq('user_id', uid).eq('year', today.year).eq('month', today.month).execute()
-    current_salary = sal_res.data[0] if sal_res.data else {"actual_amount": 0.0, "status": "UNREGISTERED", "payout_date": "N/A"}
-
-    # 6. Fetch EXACTLY the last 5 realized transactions (Dashboard Ledger)
+    # 5. Fetch EXACTLY the last 5 realized transactions by created_at DESC (As requested)
     recent_tx_res = (
         db.table('transactions')
         .select('*')
         .eq('user_id', uid)
         .in_('status', ['CREDITED', 'DEBITED'])
-        .order('transaction_date', desc=True)
         .order('created_at', desc=True)
         .limit(5)
         .execute()
@@ -73,7 +68,6 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
             "month_metrics": {
                 "total_income": total_income
             },
-            "current_salary": current_salary,
             "recent_activity": recent_activity
         }
     }
