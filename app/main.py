@@ -3,12 +3,14 @@ import hmac
 import hashlib
 import os
 import ast
+
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip, notifications
+
+from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip, notifications, report
 import json
 import re
 
@@ -34,12 +36,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.middleware("http")
 async def zero_trust_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
-    if request.url.path in ["/", "/webhook", "/docs", "/openapi.json"] or request.url.path.startswith("/api/v1/cron/"):        return await call_next(request)
+    if request.url.path in ["/", "/webhook", "/docs", "/openapi.json"] or request.url.path.startswith("/api/v1/cron/"):
+       return await call_next(request)
 
     signature = request.headers.get("X-Zero-Trust-Signature")
     if not signature:
@@ -48,23 +50,21 @@ async def zero_trust_middleware(request: Request, call_next):
 
     body = await request.body()
     expected_mac = hmac.new(ZERO_TRUST_SECRET.encode('utf-8'), body, hashlib.sha256).hexdigest()
-
     if not hmac.compare_digest(expected_mac, signature):
         return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED,
                             content={"detail": "Zero-Trust Signature Invalid"})
 
     async def receive():
         return {"type": "http.request", "body": body}
-
     request._receive = receive
-    return await call_next(request)
 
+    return await call_next(request)
 
 @app.exception_handler(Exception)
 async def global_catch_all_exception_handler(request: Request, exc: Exception):
     err_str = str(exc)
-
     extracted_msg = None
+
     if hasattr(exc, "message") and exc.message:
         extracted_msg = exc.message
     elif hasattr(exc, "details") and exc.details:
@@ -95,7 +95,6 @@ async def global_catch_all_exception_handler(request: Request, exc: Exception):
         "transaction declined", "loan contract not found", "already closed",
         "exceeds outstanding balance"
     ]
-
     for safe_word in known_safe_keywords:
         if safe_word in final_msg.lower():
             return JSONResponse(
@@ -109,7 +108,6 @@ async def global_catch_all_exception_handler(request: Request, exc: Exception):
         content={"status": "ERROR", "error_code": 500, "detail": "Internal System Error."}
     )
 
-
 app.include_router(auth.router)
 app.include_router(dashboard.router)
 app.include_router(transaction.router)
@@ -119,7 +117,7 @@ app.include_router(loan.router)
 app.include_router(cron.router)
 app.include_router(sip.router)
 app.include_router(notifications.router)
-
+app.include_router(report.router)
 
 @app.get("/")
 def health():
