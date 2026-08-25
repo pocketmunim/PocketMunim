@@ -2,6 +2,7 @@ import logging
 import hmac
 import hashlib
 import os
+import ast
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -11,7 +12,6 @@ from app.routers import auth, salary, account, cron, dashboard, transaction, loa
 import json
 import re
 
-# Configure internal secure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -22,17 +22,12 @@ if not ZERO_TRUST_SECRET:
 app = FastAPI(
     title="PocketMunim Core Engine",
     description="Ishita Financial Intelligence System - Zero-Trust Backend",
-    version="2.6.3"
+    version="2.6.4"
 )
 
-# 1. SECURE CORS POLICY
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://pocket-munim.vercel.app",
-        "capacitor://localhost",
-        "http://localhost"
-    ],
+    allow_origins=["https://pocket-munim.vercel.app", "capacitor://localhost", "http://localhost"],
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
@@ -40,12 +35,10 @@ app.add_middleware(
 )
 
 
-# 2. ZERO-TRUST HMAC SIGNATURE MIDDLEWARE
 @app.middleware("http")
 async def zero_trust_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
-
     if request.url.path in ["/", "/webhook", "/docs", "/openapi.json"]:
         return await call_next(request)
 
@@ -61,7 +54,6 @@ async def zero_trust_middleware(request: Request, call_next):
         return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED,
                             content={"detail": "Zero-Trust Signature Invalid"})
 
-    # Restore body for downstream routers
     async def receive():
         return {"type": "http.request", "body": body}
 
@@ -69,42 +61,16 @@ async def zero_trust_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-@app.exception_handler(StarletteHTTPException)
-async def custom_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    detail_msg = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"status": "ERROR", "error_code": exc.status_code, "detail": detail_msg}
-    )
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    errors = exc.errors()
-    first_error = errors[0] if errors else {}
-    field = " -> ".join([str(loc) for loc in first_error.get("loc", []) if loc != "body"])
-    msg = first_error.get("msg", "Invalid format")
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"status": "ERROR", "error_code": 422, "detail": f"Validation Error in '{field}': {msg}"}
-    )
-
-
-import json
-import re
-
 @app.exception_handler(Exception)
 async def global_catch_all_exception_handler(request: Request, exc: Exception):
     err_str = str(exc)
 
-    # 1. Extract PostgREST APIError / JSON error messages if present
     extracted_msg = None
     if hasattr(exc, "message") and exc.message:
         extracted_msg = exc.message
     elif hasattr(exc, "details") and exc.details:
         extracted_msg = exc.details
     else:
-        # Check if error string contains a JSON or dict payload like {'message': '...', 'details': '...'}
         try:
             dict_match = re.search(r"\{.*\}", err_str)
             if dict_match:
@@ -116,25 +82,19 @@ async def global_catch_all_exception_handler(request: Request, exc: Exception):
 
     final_msg = extracted_msg or err_str
 
-    # 2. Check for Duplicate Constraint Violations
     if "unique constraint" in final_msg.lower() or "23505" in final_msg:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"status": "ERROR", "error_code": 409, "detail": "Duplicate record detected."}
         )
 
-    # 3. Whitelist and return custom Postgres RAISE EXCEPTION messages directly to the client
+    # ADDED LOAN SPECIFIC ERRORS TO WHITELIST
     known_safe_keywords = [
-        "duplicate_current_month",
-        "insufficient balance",
-        "account not found",
-        "solvency violation",
-        "no active liquidity vault",
-        "settlement blocked",
-        "salary is already settled",
-        "salary record not found",
-        "must be in paid state",
-        "transaction declined"
+        "duplicate_current_month", "insufficient balance", "account not found",
+        "solvency violation", "no active liquidity vault", "settlement blocked",
+        "salary is already settled", "salary record not found", "must be in paid state",
+        "transaction declined", "loan contract not found", "already closed",
+        "exceeds outstanding balance"
     ]
 
     for safe_word in known_safe_keywords:
@@ -144,7 +104,6 @@ async def global_catch_all_exception_handler(request: Request, exc: Exception):
                 content={"status": "ERROR", "error_code": 400, "detail": final_msg}
             )
 
-    # 4. Fallback: Log system error and return sanitized message
     logger.error(f"SYSTEM ERROR [{request.method} {request.url.path}]: {err_str}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -163,21 +122,6 @@ app.include_router(sip.router)
 app.include_router(notifications.router)
 
 
-@app.post("/webhook")
-async def webhook_handler(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    return JSONResponse(status_code=status.HTTP_200_OK,
-                        content={"status": "SUCCESS", "message": "Webhook acknowledged", "payload": payload})
-
-
-@app.get("/webhook")
-async def health_webhook():
-    return {"status": "ONLINE", "endpoint": "/webhook"}
-
-
 @app.get("/")
 def health():
-    return {"status": "ONLINE", "system": "PocketMunim", "protocol": "IFIS-ZERO-TRUST-V2.6.3"}
+    return {"status": "ONLINE", "system": "PocketMunim", "protocol": "IFIS-ZERO-TRUST-V2.6.4"}
