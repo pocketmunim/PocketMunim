@@ -52,6 +52,47 @@ async def _verify_qstash_auth(
 
 
 # ---------------------------------------------------------
+# Helper: Dispatch FCM & In-App Notification
+# ---------------------------------------------------------
+def _dispatch_sip_notification(db: Client, sip: dict, title: str, body: str):
+    """Handles double-logging of notifications (In-App Database + Native Firebase Push)"""
+    # 1. Log In-App Notification
+    db.table("app_notifications").insert({
+        "user_id": sip["user_id"],
+        "title": title,
+        "body": body,
+    }).execute()
+
+    # 2. Dispatch Native FCM Mobile Push Notification
+    fcm_token = sip.get("users", {}).get("fcm_token") if sip.get("users") else None
+    if fcm_token:
+        try:
+            message = messaging.Message(
+                notification=messaging.Notification(
+                    title=title,
+                    body=body,
+                ),
+                android=messaging.AndroidConfig(
+                    priority='high',
+                    notification=messaging.AndroidNotification(
+                        channel_id='pocketmunim_alerts',
+                        priority='max',
+                        sound='default'
+                    )
+                ),
+                data={
+                    "click_action": "FLUTTER_NOTIFICATION_CLICK",
+                    "route": "/wealth_sips",
+                    "sip_id": str(sip["sip_id"]),
+                },
+                token=fcm_token,
+            )
+            messaging.send(message)
+        except Exception as e:
+            logger.error(f"Failed to send SIP FCM notification for SIP {sip.get('sip_id')}: {e}")
+
+
+# ---------------------------------------------------------
 # Cron Endpoints
 # ---------------------------------------------------------
 
@@ -66,7 +107,6 @@ async def process_daily_salary_disbursals(
 ) -> Dict[str, Any]:
     """Processes batch salary payouts and dispatches FCM push notifications to employees."""
 
-    # 1. Security Verification
     is_authenticated = await _verify_qstash_auth(request, token, authorization, x_qstash_token, upstash_signature)
     if not is_authenticated:
         raise HTTPException(
@@ -78,13 +118,11 @@ async def process_daily_salary_disbursals(
     notifications_dispatched = 0
 
     try:
-        # 2. Execute ACID-compliant batch stored procedure
         rpc_res = db.rpc(
             "process_due_salaries_atomic",
             {"p_target_date": today_str}
         ).execute()
 
-        # 3. If salaries were processed, dispatch notifications
         if rpc_res.data and rpc_res.data.get("processed_count", 0) > 0:
             disbursed_salaries = (
                 db.table("salaries")
@@ -99,14 +137,12 @@ async def process_daily_salary_disbursals(
                 month_idx = sal.get("month", 1)
                 month_name = calendar.month_name[month_idx]
 
-                # Log In-App Notification
                 db.table("app_notifications").insert({
                     "user_id": user_id,
                     "title": "  Salary Credited!",
                     "body": f"Your {month_name} salary of  {amount} has been securely deposited into your vault.",
                 }).execute()
 
-                # Dispatch Native FCM Mobile Push Notification
                 fcm_token = sal.get("users", {}).get("fcm_token") if sal.get("users") else None
                 if fcm_token:
                     try:
@@ -134,7 +170,6 @@ async def process_daily_salary_disbursals(
                     except Exception as e:
                         logger.error(f"Failed to send salary FCM notification to user {user_id}: {e}")
 
-        # 4. Return combined response
         response_data = rpc_res.data or {}
         response_data["notifications_dispatched"] = notifications_dispatched
         return response_data
@@ -156,9 +191,8 @@ async def process_qstash_sip_reminders(
         upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
         db: Client = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Evaluates active SIP contracts and sends push reminders for pending payments."""
+    """Evaluates active SIP contracts and sends intelligent push reminders for pending payments."""
 
-    # 1. Security Verification
     is_authenticated = await _verify_qstash_auth(request, token, authorization, x_qstash_token, upstash_signature)
     if not is_authenticated:
         raise HTTPException(
@@ -172,61 +206,74 @@ async def process_qstash_sip_reminders(
     notifications_dispatched = 0
 
     for sip in sips:
-        # Check 1: Respect snooze constraints
-        snooze = sip.get("snoozed_until")
-        if snooze and date.fromisoformat(snooze) > today:
+        next_due_str = sip.get("next_due_date")
+        if not next_due_str:
             continue
 
-        # Check 2: Evaluate if payment is due
-        next_due = sip.get("next_due_date")
-        if next_due and date.fromisoformat(next_due) <= today:
+        next_due_date = date.fromisoformat(next_due_str)
+        snoozed_until_str = sip.get("snoozed_until")
 
-            existing_alert = (
-                db.table("app_notifications")
-                .select("notification_id")
-                .eq("user_id", sip["user_id"])
-                .ilike("body", f"%{sip['asset_name']}%")
-                .eq("is_read", False)
-                .execute()
-            )
+        # 1. Self-Healing Snooze Logic:
+        # If marked paid, next_due_date advances to the future. Stop snoozing automatically.
+        if today < next_due_date:
+            if snoozed_until_str:
+                db.table("sip_contracts").update({"snoozed_until": None}).eq("sip_id", sip["sip_id"]).execute()
+            continue
 
-            if not existing_alert.data:
-                # 1. Log In-App Notification
-                db.table("app_notifications").insert({
-                    "user_id": sip["user_id"],
-                    "title": f"  Pending SIP: {sip['asset_name']}",
-                    "body": f"Your installment of  {sip['monthly_amount']} ({sip['frequency']}) is due and pending approval.",
-                }).execute()
-
-                # 2. Dispatch Native FCM Mobile Push Notification
-                fcm_token = sip.get("users", {}).get("fcm_token") if sip.get("users") else None
-                if fcm_token:
-                    try:
-                        message = messaging.Message(
-                            notification=messaging.Notification(
-                                title=f"  Pending SIP: {sip['asset_name']}",
-                                body=f" {sip['monthly_amount']} is due. Tap to authorize payment.",
-                            ),
-                            android=messaging.AndroidConfig(
-                                priority='high',
-                                notification=messaging.AndroidNotification(
-                                    channel_id='pocketmunim_alerts',
-                                    priority='max',
-                                    sound='default'
-                                )
-                            ),
-                            data={
-                                "click_action": "FLUTTER_NOTIFICATION_CLICK",
-                                "route": "/wealth_sips",
-                                "sip_id": str(sip["sip_id"]),
-                            },
-                            token=fcm_token,
-                        )
-                        messaging.send(message)
-                    except Exception as e:
-                        logger.error(f"Failed to send SIP FCM notification for SIP {sip.get('sip_id')}: {e}")
-
+        # 2. Active Snooze Evaluation
+        if snoozed_until_str:
+            snoozed_date = date.fromisoformat(snoozed_until_str)
+            if today < snoozed_date:
+                continue  # Still actively snoozed; do nothing today
+            else:
+                # Snooze expired! Wake up and alert.
+                title = f"  Snooze Expired: {sip['asset_name']}"
+                body = f"Your snoozed SIP of  {sip['monthly_amount']} is due! Tap to pay. (Cycle: {next_due_str})"
+                _dispatch_sip_notification(db, sip, title, body)
                 notifications_dispatched += 1
+
+                # Clear the snooze lock so standard deduplication rules apply tomorrow
+                db.table("sip_contracts").update({"snoozed_until": None}).eq("sip_id", sip["sip_id"]).execute()
+                continue
+
+        # 3. Frequency-Aware Deduplication Rule
+        freq = sip.get("frequency", "MONTHLY").upper()
+        if freq == "DAILY":
+            # Daily requires a prompt every single day, tied to the current calendar date
+            cycle_identifier = f"Date: {today}"
+        else:
+            # Monthly/Yearly triggers once per specific financial cycle due date
+            cycle_identifier = f"Cycle: {next_due_str}"
+
+        # Check if we already alerted the user for this exact cycle
+        existing_alerts = (
+            db.table("app_notifications")
+            .select("is_read")
+            .eq("user_id", sip["user_id"])
+            .ilike("body", f"%{sip['asset_name']}%")
+            .ilike("body", f"%{cycle_identifier}%")
+            .execute()
+        )
+
+        if not existing_alerts.data:
+            # 4. Business Value Addition: Gamification & Escalation
+            is_weekend = today.weekday() >= 5
+            days_overdue = (today - next_due_date).days
+
+            if days_overdue > 2:
+                title = f"  OVERDUE SIP: {sip['asset_name']}"
+                body = f"Your SIP of  {sip['monthly_amount']} is overdue by {days_overdue} days. Keep your wealth growing! ({cycle_identifier})"
+            elif is_weekend:
+                title = f"  Weekend SIP: {sip['asset_name']}"
+                body = f"Markets are closed. Authorize your  {sip['monthly_amount']} SIP now for Monday execution. ({cycle_identifier})"
+            else:
+                invested = sip.get("total_invested", 0)
+                milestone = f" You've invested  {invested} so far!" if invested > 0 else ""
+                title = f"  Pending SIP: {sip['asset_name']}"
+                body = f" {sip['monthly_amount']} is due. {milestone} ({cycle_identifier})"
+
+            _dispatch_sip_notification(db, sip, title, body)
+            notifications_dispatched += 1
 
     return {
         "status": "COMPLETED",
