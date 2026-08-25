@@ -5,6 +5,8 @@ from typing import Optional
 class RegisterRequest(BaseModel):
     user_id: UUID = Field(..., description="Hardware UUID from device")
     full_name: str = Field(..., min_length=2, max_length=150)
+    email: str = Field(..., description="User Email ID")
+    mobile_number: str = Field(..., description="User Mobile Number")
     salary: float = Field(default=0.0, ge=0.0)
     salary_date: Optional[int] = Field(default=1, ge=1, le=31, description="Cycle day selection")
     bank_name: str = Field(..., min_length=2, max_length=80)
@@ -13,7 +15,7 @@ class RegisterRequest(BaseModel):
     currency: Optional[str] = "INR"
     fcm_token: Optional[str] = None
 
-    @field_validator('full_name', 'bank_name')
+    @field_validator('full_name', 'bank_name', 'email', 'mobile_number')
     @classmethod
     def sanitize(cls, v: str) -> str:
         return v.strip()

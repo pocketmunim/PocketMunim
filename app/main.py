@@ -10,7 +10,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip, notifications, report
+# ADDED 'user' to imports
+from app.routers import auth, salary, account, cron, dashboard, transaction, loan, sip, notifications, report, user
 import json
 import re
 
@@ -24,7 +25,7 @@ if not ZERO_TRUST_SECRET:
 app = FastAPI(
     title="PocketMunim Core Engine",
     description="Ishita Financial Intelligence System - Zero-Trust Backend",
-    version="2.6.4"
+    version="2.6.5"
 )
 
 app.add_middleware(
@@ -87,7 +88,6 @@ async def global_catch_all_exception_handler(request: Request, exc: Exception):
             content={"status": "ERROR", "error_code": 409, "detail": "Duplicate record detected."}
         )
 
-    # ADDED LOAN SPECIFIC ERRORS TO WHITELIST
     known_safe_keywords = [
         "duplicate_current_month", "insufficient balance", "account not found",
         "solvency violation", "no active liquidity vault", "settlement blocked",
@@ -118,7 +118,8 @@ app.include_router(cron.router)
 app.include_router(sip.router)
 app.include_router(notifications.router)
 app.include_router(report.router)
+app.include_router(user.router) # INCLUDED USER ROUTER
 
 @app.get("/")
 def health():
-    return {"status": "ONLINE", "system": "PocketMunim", "protocol": "IFIS-ZERO-TRUST-V2.6.4"}
+    return {"status": "ONLINE", "system": "PocketMunim", "protocol": "IFIS-ZERO-TRUST-V2.6.5"}

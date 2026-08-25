@@ -72,6 +72,8 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "user_id": uid_str,
             "telegram_id": uid_str,
             "full_name": payload.full_name,
+            "email": payload.email,
+            "mobile_number": payload.mobile_number,
             "currency": payload.currency or "INR",
             "security_strikes": 0,
             "role": "user",

@@ -13,9 +13,10 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
     uid = str(user_id)
     today = date.today()
 
-    # 1. Fetch User Identity
-    user_res = db.table('users').select('full_name').eq('user_id', uid).execute()
+    # 1. Fetch User Identity & Avatar
+    user_res = db.table('users').select('full_name, avatar_url').eq('user_id', uid).execute()
     user_name = user_res.data[0]['full_name'] if user_res.data else "Commander"
+    avatar_url = user_res.data[0].get('avatar_url') if user_res.data else None
 
     # 2. Aggregate Active Liquidity Vaults
     acc_res = db.table('accounts').select('*').eq('user_id', uid).eq('is_active', True).execute()
@@ -63,6 +64,7 @@ async def get_dashboard_summary(user_id: str, db: Client = Depends(get_db)):
         "success": True,
         "data": {
             "user_name": user_name,
+            "avatar_url": avatar_url,
             "total_liquidity": total_liquidity,
             "total_liabilities": total_liabilities,
             "default_vault": default_vault,
