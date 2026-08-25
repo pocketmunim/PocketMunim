@@ -1,27 +1,37 @@
 import os
+import json
+import base64
 import logging
 import firebase_admin
 from firebase_admin import credentials, messaging
 
 logger = logging.getLogger(__name__)
 
-
 class NotificationService:
     _initialized = False
 
     @classmethod
     def initialize(cls):
-        if not cls._initialized:
+        if not cls._initialized and not firebase_admin._apps:
             try:
-                # Target the JSON file in the root of your backend
-                cred_path = "firebase-adminsdk.json"
-                if os.path.exists(cred_path):
-                    cred = credentials.Certificate(cred_path)
+                base64_cred = os.getenv("FIREBASE_SERVICE_ACCOUNT_BASE64")
+                if base64_cred:
+                    decoded_cred_json = base64.b64decode(base64_cred).decode("utf-8")
+                    cred_dict = json.loads(decoded_cred_json)
+                    cred = credentials.Certificate(cred_dict)
                     firebase_admin.initialize_app(cred)
                     cls._initialized = True
-                    logger.info("Firebase Admin SDK initialized successfully.")
+                    logger.info("Firebase Admin SDK initialized from Base64 env successfully.")
                 else:
-                    logger.warning(f"CRITICAL: Firebase credentials not found at {cred_path}")
+                    # Target the JSON file in the root of your backend
+                    cred_path = "firebase-adminsdk.json"
+                    if os.path.exists(cred_path):
+                        cred = credentials.Certificate(cred_path)
+                        firebase_admin.initialize_app(cred)
+                        cls._initialized = True
+                        logger.info("Firebase Admin SDK initialized from JSON successfully.")
+                    else:
+                        logger.warning(f"CRITICAL: Firebase credentials not found.")
             except ValueError:
                 # App already initialized
                 cls._initialized = True
@@ -33,12 +43,19 @@ class NotificationService:
         cls.initialize()
         if not cls._initialized or not token:
             return False
-
         try:
             message = messaging.Message(
                 notification=messaging.Notification(
                     title=title,
                     body=body,
+                ),
+                android=messaging.AndroidConfig(
+                    priority='high',
+                    notification=messaging.AndroidNotification(
+                        channel_id='pocketmunim_alerts',
+                        priority='max',
+                        sound='default'
+                    )
                 ),
                 # This matches the frontend logic you set up in main.dart _handleNotificationRoute
                 data={"route": route} if route else {},

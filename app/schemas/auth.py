@@ -10,6 +10,7 @@ class RegisterRequest(BaseModel):
     bank_name: str = Field(..., min_length=2, max_length=80)
     current_balance: float = Field(..., ge=0.0)
     currency: Optional[str] = "INR"
+    fcm_token: Optional[str] = None
 
     @field_validator('full_name', 'bank_name')
     @classmethod

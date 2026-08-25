@@ -8,43 +8,30 @@ from typing import Optional, Any, Dict
 
 from fastapi import APIRouter, HTTPException, Header, Query, Request, status, Depends
 from supabase import Client
-import firebase_admin
-from firebase_admin import credentials, messaging
+from firebase_admin import messaging
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.services.notification_service import NotificationService
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/v1/cron", tags=["QStash Automated Schedulers"])
 
 # ---------------------------------------------------------
 # Firebase Admin SDK Initialization
 # ---------------------------------------------------------
-if not firebase_admin._apps:
-    try:
-        base64_cred = os.getenv("FIREBASE_SERVICE_ACCOUNT_BASE64")
-        if base64_cred:
-            decoded_cred_json = base64.b64decode(base64_cred).decode("utf-8")
-            cred_dict = json.loads(decoded_cred_json)
-            cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred)
-            logger.info("Firebase Admin SDK initialized successfully.")
-        else:
-            logger.warning("CRITICAL: FIREBASE_SERVICE_ACCOUNT_BASE64 environment variable is missing.")
-    except Exception as e:
-        logger.error(f"Firebase initialization failed: {e}", exc_info=True)
+NotificationService.initialize()
 
 
 # ---------------------------------------------------------
 # Authentication Helper
 # ---------------------------------------------------------
 async def _verify_qstash_auth(
-    request: Request,
-    token: Optional[str] = Query(None),
-    authorization: Optional[str] = Header(None),
-    x_qstash_token: Optional[str] = Header(None),
-    upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
+        request: Request,
+        token: Optional[str] = Query(None),
+        authorization: Optional[str] = Header(None),
+        x_qstash_token: Optional[str] = Header(None),
+        upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
 ) -> bool:
     """Helper for multi-vector security verification on QStash endpoints."""
     valid_tokens = {getattr(settings, "QSTASH_TOKEN", None), getattr(settings, "MASTER_PEPPER", None)}
@@ -67,16 +54,18 @@ async def _verify_qstash_auth(
 # ---------------------------------------------------------
 # Cron Endpoints
 # ---------------------------------------------------------
+
 @router.post("/process-salaries")
 async def process_daily_salary_disbursals(
-    request: Request,
-    token: Optional[str] = Query(None, description="Secret token passed via QStash URL query param"),
-    authorization: Optional[str] = Header(None),
-    x_qstash_token: Optional[str] = Header(None),
-    upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
-    db: Client = Depends(get_db),
+        request: Request,
+        token: Optional[str] = Query(None, description="Secret token passed via QStash URL query param"),
+        authorization: Optional[str] = Header(None),
+        x_qstash_token: Optional[str] = Header(None),
+        upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
+        db: Client = Depends(get_db),
 ) -> Dict[str, Any]:
     """Processes batch salary payouts and dispatches FCM push notifications to employees."""
+
     # 1. Security Verification
     is_authenticated = await _verify_qstash_auth(request, token, authorization, x_qstash_token, upstash_signature)
     if not is_authenticated:
@@ -104,7 +93,6 @@ async def process_daily_salary_disbursals(
                 .eq("status", "PAID")
                 .execute()
             )
-
             for sal in (disbursed_salaries.data or []):
                 user_id = sal.get("user_id")
                 amount = sal.get("actual_amount")
@@ -114,8 +102,8 @@ async def process_daily_salary_disbursals(
                 # Log In-App Notification
                 db.table("app_notifications").insert({
                     "user_id": user_id,
-                    "title": "🎉 Salary Credited!",
-                    "body": f"Your {month_name} salary of ₹{amount} has been securely deposited into your vault.",
+                    "title": "  Salary Credited!",
+                    "body": f"Your {month_name} salary of  {amount} has been securely deposited into your vault.",
                 }).execute()
 
                 # Dispatch Native FCM Mobile Push Notification
@@ -124,8 +112,16 @@ async def process_daily_salary_disbursals(
                     try:
                         message = messaging.Message(
                             notification=messaging.Notification(
-                                title="🎉 Salary Credited!",
-                                body=f"Your {month_name} salary of ₹{amount} has been securely deposited.",
+                                title="  Salary Credited!",
+                                body=f"Your {month_name} salary of  {amount} has been securely deposited.",
+                            ),
+                            android=messaging.AndroidConfig(
+                                priority='high',
+                                notification=messaging.AndroidNotification(
+                                    channel_id='pocketmunim_alerts',
+                                    priority='max',
+                                    sound='default'
+                                )
                             ),
                             data={
                                 "click_action": "FLUTTER_NOTIFICATION_CLICK",
@@ -153,14 +149,15 @@ async def process_daily_salary_disbursals(
 
 @router.post("/process-sips")
 async def process_qstash_sip_reminders(
-    request: Request,
-    token: Optional[str] = Query(None),
-    authorization: Optional[str] = Header(None),
-    x_qstash_token: Optional[str] = Header(None),
-    upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
-    db: Client = Depends(get_db),
+        request: Request,
+        token: Optional[str] = Query(None),
+        authorization: Optional[str] = Header(None),
+        x_qstash_token: Optional[str] = Header(None),
+        upstash_signature: Optional[str] = Header(None, alias="Upstash-Signature"),
+        db: Client = Depends(get_db),
 ) -> Dict[str, Any]:
     """Evaluates active SIP contracts and sends push reminders for pending payments."""
+
     # 1. Security Verification
     is_authenticated = await _verify_qstash_auth(request, token, authorization, x_qstash_token, upstash_signature)
     if not is_authenticated:
@@ -172,7 +169,6 @@ async def process_qstash_sip_reminders(
     today = date.today()
     res = db.table("sip_contracts").select("*, users(fcm_token)").eq("status", "ACTIVE").execute()
     sips = res.data or []
-
     notifications_dispatched = 0
 
     for sip in sips:
@@ -184,6 +180,7 @@ async def process_qstash_sip_reminders(
         # Check 2: Evaluate if payment is due
         next_due = sip.get("next_due_date")
         if next_due and date.fromisoformat(next_due) <= today:
+
             existing_alert = (
                 db.table("app_notifications")
                 .select("notification_id")
@@ -197,8 +194,8 @@ async def process_qstash_sip_reminders(
                 # 1. Log In-App Notification
                 db.table("app_notifications").insert({
                     "user_id": sip["user_id"],
-                    "title": f"⚠️ Pending SIP: {sip['asset_name']}",
-                    "body": f"Your installment of ₹{sip['monthly_amount']} ({sip['frequency']}) is due and pending approval.",
+                    "title": f"  Pending SIP: {sip['asset_name']}",
+                    "body": f"Your installment of  {sip['monthly_amount']} ({sip['frequency']}) is due and pending approval.",
                 }).execute()
 
                 # 2. Dispatch Native FCM Mobile Push Notification
@@ -207,8 +204,16 @@ async def process_qstash_sip_reminders(
                     try:
                         message = messaging.Message(
                             notification=messaging.Notification(
-                                title=f"⚠️ Pending SIP: {sip['asset_name']}",
-                                body=f"₹{sip['monthly_amount']} is due. Tap to authorize payment.",
+                                title=f"  Pending SIP: {sip['asset_name']}",
+                                body=f" {sip['monthly_amount']} is due. Tap to authorize payment.",
+                            ),
+                            android=messaging.AndroidConfig(
+                                priority='high',
+                                notification=messaging.AndroidNotification(
+                                    channel_id='pocketmunim_alerts',
+                                    priority='max',
+                                    sound='default'
+                                )
                             ),
                             data={
                                 "click_action": "FLUTTER_NOTIFICATION_CLICK",

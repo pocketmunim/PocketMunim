@@ -81,7 +81,8 @@ async def register_node(payload: RegisterRequest, db: Client = Depends(get_db)):
             "currency": payload.currency or "INR",
             "security_strikes": 0,
             "role": "user",
-            "is_active": True
+            "is_active": True,
+            "fcm_token": payload.fcm_token
         }
         db.table('users').insert(user_insert).execute()
 
